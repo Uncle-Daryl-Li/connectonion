@@ -400,7 +400,67 @@ Stable remains 1.8.3; this does not authorize final 1.8.4 or cloud provisioning.
 See [1.8.4a2 notes](docs/releases/1.8.4a2.md) and the
 [local acceptance record](docs/acceptance/1.8.4-live-followup/README.md).
 
-## Current Version: 1.9.0a42
+## Current Version: 1.9.1b1
+
+1.9.1b1 is the first 1.9.1 beta; stable remains 1.9.0. After the 1.9.1a2 real
+180-day first run (84 of 84 people, 14 of 20 projects, every project refusal one
+citation), a project page's untraceable citation drops its lines after repairs,
+init ends by drawing decisions and principles, a page lists the documents it
+cites, init runs 16 pages at a time with one mail pool per mailbox, and the
+synthesis round keeps every thread and searches for missing outcomes. See
+[1.9.1b1 notes](docs/releases/1.9.1b1.md).
+
+- 1.9.1b1 (One citation is not a page; decisions and principles from init; Documents; 16 workers).
+
+## Previous preview: 1.9.1a2
+
+1.9.1a2 is a preview; stable remains 1.9.0. co rem investigations read a large
+page's whole evidence in rounds, each editing the page the last left, with a
+reporter's Skill that follows leads and finds how threads ended; a final round
+writes one line per thread. Pages are edited, not rewritten. Organisations are
+enriched from their own site; project and skill pages are repaired instead of
+refused for run citations; attachments are fetched once. The reader shows a
+person's contact facts first and opens a cited mail as a message. See
+[1.9.1a2 notes](docs/releases/1.9.1a2.md).
+
+- 1.9.1a2 (Investigations in rounds, edited in place, reporter's Skill; contact facts first; mail as a message).
+
+## Previous preview: 1.9.1a1
+
+1.9.1a1 is a preview; stable remains 1.9.0. co rem's first map covers the last
+180 days instead of 90, and the reader names its generated files honestly: the
+people, project and organisation maps and the skill run reports move from Notes
+to a new Run logs category, and `notes/` is shown as AI notes. Existing
+notebooks move those files on their next command, and skill pages keep their
+links. See [1.9.1a1 notes](docs/releases/1.9.1a1.md).
+
+- 1.9.1a1 (180-day first map; Run logs and AI notes in the reader).
+
+## Previous stable: 1.9.0
+
+Stable 1.9.0 promotes co rem after the 90-day installed-package first-run,
+reader, and scheduled-upkeep acceptance recorded in
+[the release notes](docs/releases/1.9.0.md). Init investigates every eligible
+mapped page without a REM quota cap, reports progress by category, checks model
+access before dispatch, and leaves failed work visible. Rewritten coding-session
+prefixes remain protected while unaffected sessions continue. Remaining quality
+and recovery work is tracked for 1.9.1.
+
+- 1.9.0 (Complete the mapped first run, make progress and upkeep health visible).
+
+## Previous preview: 1.9.0a43
+
+1.9.0a43 makes failed investigations visible on Home, with classified reasons
+and a keyboard-accessible route to the run record. Init's overview now explains
+that it offers nightly upkeep after source/schedule approval. Public a42 real
+init confirmed scheduling, but the five-page writing sample failed with four
+timeouts and one model authentication refusal. This preview fixes reporting;
+it does not restore model access or establish full historical memory quality.
+Stable remains 1.8.10. See [1.9.0a43 notes](docs/releases/1.9.0a43.md).
+
+- 1.9.0a43 (Show failed memory writing on Home and explain init nightly upkeep).
+
+## Previous preview: 1.9.0a42
 
 1.9.0a42 brings the historical contact directory ahead of a long mapped
 People roster. On the owner's local real-data reader, its collapsed entrance

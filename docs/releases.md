@@ -13,15 +13,38 @@ no `AsyncClient`, and every remote agent call crashed.
 
 ## Current release
 
-Stable **1.8.10** is the default production channel. It adds `co linear`,
-`co canny`, Slack reads, and `environment.setting()` to 1.8.9. See the
-[1.8.10 GitHub release](https://github.com/openonion/connectonion/releases/tag/v1.8.10).
+Stable **1.9.0** is the default production channel. It brings co rem's
+complete mapped first run, category progress, model-access preflight and
+visible nightly health. See [1.9.0 notes](releases/1.9.0.md) and the
+[GitHub release](https://github.com/openonion/connectonion/releases/tag/v1.9.0).
 
 ```bash
-python -m pip install --upgrade 'connectonion==1.8.10'
+python -m pip install --upgrade 'connectonion==1.9.0'
 ```
 
 ## Current preview
+
+Beta **1.9.1b1** keeps a project page when only one citation is wrong, draws
+decisions and principles from the first run, lists a page's documents, and runs
+init 16 pages at a time. See [1.9.1b1 notes](releases/1.9.1b1.md).
+
+```bash
+python -m pip install --upgrade 'connectonion==1.9.1b1'
+```
+
+## Previous previews
+
+Alpha **1.9.1a2** reads a large page's whole evidence in rounds, edits pages in
+place with a lead-following investigation Skill, enriches organisations from
+their own site, shows a person's contact facts first and opens a cited mail as
+a message. See [1.9.1a2 notes](releases/1.9.1a2.md).
+
+Alpha **1.9.1a1** maps the last 180 days on the first run and moves co rem's
+generated maps and skill run reports from Notes to a Run logs category. See
+[1.9.1a1 notes](releases/1.9.1a1.md).
+
+Alpha **1.9.0a43** shows failed investigations on Home and explains the nightly
+upkeep offer in init's overview. See [1.9.0a43 notes](releases/1.9.0a43.md).
 
 Alpha **1.9.0a42** keeps completed People discovery after a later mail
 connection failure and puts the historical contact directory before the mapped
