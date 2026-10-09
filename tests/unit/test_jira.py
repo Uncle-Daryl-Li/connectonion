@@ -1,6 +1,8 @@
 """Jira tool unit tests — F13FCAKE-9, F13FCAKE-10, F13FCAKE-18."""
 
+import datetime
 import httpx
+import yaml
 import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -313,3 +315,245 @@ def test_rate_limit_returns_recoverable_error_or_bounded_retry():
     assert call_count[0] <= 5
     msg = str(exc_info.value)
     assert '429' in msg or 'rate limit' in msg.lower() or 'rate-limit' in msg.lower()
+
+# ── STEP 4 TESTS (10-1, 10-5 through 10-15) ──
+
+def test_project_items_return_type_is_list_of_dict():
+    """10-1: project_items() returns list[dict]; each dict contains 'key' and 'name'."""
+    get, _ = _mock_get(
+        {"/rest/api/3/project/search": (200, {"values": [_P1, _P2], "isLast": True})}
+    )
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().project_items()
+    assert isinstance(result, list)
+    for item in result:
+        assert isinstance(item, dict)
+        assert "key" in item
+        assert "name" in item
+
+
+def test_project_items_valid_empty_result_returns_empty_list():
+    """10-5: values=[] + isLast=true -> returns []; no exception raised."""
+    get, _ = _mock_get(
+        {"/rest/api/3/project/search": (200, {"values": [], "isLast": True})}
+    )
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().project_items()
+    assert result == []
+
+
+def test_issue_items_raises_before_network_when_no_issue_keys_selected():
+    """10-6: empty selected_issue_keys -> ValueError before any HTTP request (count == 0)."""
+    call_count = [0]
+
+    def get(url, **kwargs):
+        call_count[0] += 1
+        raise AssertionError("HTTP should not be called for empty key set")
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(ValueError, match="non-empty"):
+            Jira().issue_items("ALPHA", set())
+    assert call_count[0] == 0
+
+
+def test_issue_items_rejects_unknown_project_key_before_collection():
+    """10-6b: project not in accessible_keys -> ValueError, 0 HTTP requests."""
+    call_count = [0]
+
+    def get(url, **kwargs):
+        call_count[0] += 1
+        raise AssertionError("HTTP should not be called when project not accessible")
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(ValueError):
+            Jira().issue_items(
+                "GAMMA", {"GAMMA-1"},
+                accessible_keys={"ALPHA", "BETA"},
+            )
+    assert call_count[0] == 0
+
+
+def test_issue_items_jql_query_is_scoped_server_side_not_post_filtered():
+    """10-6c: JQL sent to Jira scopes server-side: 'project = ALPHA AND key IN (...)'."""
+    received_params: list[dict] = []
+
+    def get(url, auth=None, params=None, timeout=None):
+        received_params.append(dict(params or {}))
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"issues": [_I1, _I2]})
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().issue_items("ALPHA", {"ALPHA-1", "ALPHA-2"})
+
+    assert len(received_params) == 1
+    jql = received_params[0].get("jql", "")
+    assert "project = ALPHA" in jql
+    assert "ALPHA-1" in jql
+    assert "ALPHA-2" in jql
+    assert result == [_I1, _I2]
+
+
+def test_issue_items_rejects_key_from_wrong_project_before_network():
+    """10-6d: BETA-1 passed to ALPHA project -> ValueError, 0 HTTP; message names the key."""
+    call_count = [0]
+
+    def get(url, **kwargs):
+        call_count[0] += 1
+        raise AssertionError("HTTP should not be called for mismatched project key")
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(ValueError) as exc_info:
+            Jira().issue_items("ALPHA", {"BETA-1"})
+    assert call_count[0] == 0
+    assert "BETA-1" in str(exc_info.value)
+
+
+def test_issue_items_rejects_malicious_key_to_prevent_jql_injection():
+    """10-6e: keys with quotes/spaces/AND -> ValueError, 0 HTTP requests each."""
+    malicious = [
+        {"ALPHA-1' OR project = EVIL"},
+        {"ALPHA 1"},
+        {"ALPHA-1 AND project=EVIL"},
+    ]
+    for key_set in malicious:
+        count = [0]
+
+        def _track(url, **kwargs):
+            count[0] += 1
+            raise AssertionError(f"HTTP called for malicious key {key_set!r}")
+
+        with patch("connectonion.useful_tools.jira.httpx.get", _track):
+            with pytest.raises(ValueError):
+                Jira().issue_items("ALPHA", key_set)
+        assert count[0] == 0, f"HTTP was called for {key_set!r}"
+
+
+def test_issue_items_raises_permission_error_on_403_with_safe_message():
+    """10-7: HTTP 403 -> JiraPermissionError; message contains project key; no server body."""
+    get, _ = _mock_get(
+        {"/rest/api/3/search/jql": (403, {"errorMessages": ["Access denied"]})}
+    )
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(JiraPermissionError) as exc_info:
+            Jira().issue_items("ALPHA", {"ALPHA-1"})
+    msg = str(exc_info.value)
+    assert "ALPHA" in msg
+    assert "Access denied" not in msg
+    assert "errorMessages" not in msg
+
+
+def test_issue_items_pagination_collects_all_pages_via_confirmed_cursor():
+    """10-8: two-page nextPageToken cursor -> all issues combined; 2 HTTP requests."""
+    call_seq = [0]
+
+    def get(url, auth=None, params=None, timeout=None):
+        call_seq[0] += 1
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        if call_seq[0] == 1:
+            resp.json = MagicMock(return_value={
+                "issues": [_I1, _I2],
+                "nextPageToken": "page-2-token",
+            })
+        else:
+            resp.json = MagicMock(return_value={"issues": [_I3]})
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().issue_items("ALPHA", {"ALPHA-1", "ALPHA-2", "ALPHA-3"})
+
+    assert result == [_I1, _I2, _I3]
+    assert call_seq[0] == 2
+
+
+def test_issue_items_empty_result_returns_empty_list():
+    """10-9: issues=[] + no nextPageToken -> returns []; no exception."""
+    get, _ = _mock_get(
+        {"/rest/api/3/search/jql": (200, {"issues": []})}
+    )
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().issue_items("ALPHA", {"ALPHA-1"})
+    assert result == []
+
+
+def test_write_source_yaml_creates_file_at_correct_path(tmp_path):
+    """10-10: source.yaml created at correct path; parses as valid YAML."""
+    dest = tmp_path / ".co" / "rem" / "docs" / "jira"
+    Jira().write_source_yaml(dest, ["ALPHA"], {"ALPHA-1"})
+    yaml_file = dest / "source.yaml"
+    assert yaml_file.exists()
+    content = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
+    assert isinstance(content, dict)
+
+
+def test_write_source_yaml_required_fields_present(tmp_path):
+    """10-11: all required YAML fields; media_policy=metadata_only; no 'all' in scope.issues."""
+    dest = tmp_path / ".co" / "rem" / "docs" / "jira"
+    Jira().write_source_yaml(dest, ["ALPHA"], {"ALPHA-1", "ALPHA-2"})
+    content = yaml.safe_load((dest / "source.yaml").read_text(encoding="utf-8"))
+    assert content["driver"] == "jira"
+    assert content["account"] == JIRA_URL
+    assert content["retention"] == "90d"
+    assert content["media_policy"] == "metadata_only"
+    assert content["scope"]["projects"] == ["ALPHA"]
+    assert sorted(content["scope"]["issues"]) == ["ALPHA-1", "ALPHA-2"]
+    assert "all" not in content["scope"]["issues"]
+    assert "validated_with" in content
+
+
+def test_write_source_yaml_validated_with_fields(tmp_path):
+    """10-12: validated_with: connectonion_version mocked to 9.9.9; command/path/timestamp present."""
+    dest = tmp_path / ".co" / "rem" / "docs" / "jira"
+    with patch("connectonion.useful_tools.jira.importlib.metadata.version", return_value="9.9.9"):
+        Jira().write_source_yaml(dest, ["ALPHA"], {"ALPHA-1"})
+    vw = yaml.safe_load((dest / "source.yaml").read_text(encoding="utf-8"))["validated_with"]
+    assert vw["connectonion_version"] == "9.9.9"
+    assert vw["command"].startswith("co ")
+    assert "path" in vw
+    datetime.datetime.fromisoformat(vw["timestamp"])
+
+
+def test_write_source_yaml_excludes_secrets_from_yaml_and_fixture_directory(tmp_path, monkeypatch):
+    """10-13: JIRA_API_TOKEN and JIRA_EMAIL absent from all files written under tmp_path."""
+    _TOKEN = "ultra-secret-token-xyzzy"
+    _EMAIL = "secretuser@example.org"
+    monkeypatch.setenv("JIRA_API_TOKEN", _TOKEN)
+    monkeypatch.setenv("JIRA_EMAIL", _EMAIL)
+    dest = tmp_path / ".co" / "rem" / "docs" / "jira"
+    Jira().write_source_yaml(dest, ["ALPHA"], {"ALPHA-1"})
+    for f in tmp_path.rglob("*"):
+        if f.is_file():
+            text = f.read_text(encoding="utf-8", errors="ignore")
+            assert _TOKEN not in text, f"Token found in {f}"
+            assert _EMAIL not in text, f"Email found in {f}"
+
+
+def test_project_items_pagination_stable_keys_across_pages():
+    """10-14: multi-page result; all returned project dicts have distinct 'key' values."""
+    call_seq = [0]
+
+    def get(url, auth=None, params=None, timeout=None):
+        call_seq[0] += 1
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        if call_seq[0] == 1:
+            resp.json = MagicMock(return_value={"values": [_P1, _P2], "isLast": False})
+        else:
+            resp.json = MagicMock(return_value={"values": [_P3], "isLast": True})
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().project_items()
+
+    keys = [item["key"] for item in result]
+    assert len(keys) == len(set(keys))
+
+
+def test_write_source_yaml_rejects_issue_keys_not_belonging_to_project(tmp_path):
+    """10-15: BETA-2 not in project ALPHA -> ValueError; no source.yaml written."""
+    dest = tmp_path / ".co" / "rem" / "docs" / "jira"
+    with pytest.raises(ValueError):
+        Jira().write_source_yaml(dest, ["ALPHA"], {"ALPHA-1", "BETA-2"})
+    assert not (dest / "source.yaml").exists()
