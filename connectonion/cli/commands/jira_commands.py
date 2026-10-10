@@ -52,8 +52,6 @@ def handle_jira_verify(*, as_json: bool = False) -> None:
         return
     print(f"Connected to: {info.get('site_url', '')} ({info.get('displayName', '')})")
     print("Example:  co jira projects")
-
-
 def handle_jira_projects(*, as_json: bool = False) -> None:
     """List all accessible Jira projects.
 

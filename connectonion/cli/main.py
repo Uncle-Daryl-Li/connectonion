@@ -2478,8 +2478,6 @@ def _jira_verify(
     """Verify Jira credentials and display the authorised account. Read-only."""
     from .commands.jira_commands import handle_jira_verify
     handle_jira_verify(as_json=as_json)
-
-
 @jira_app.command("projects", epilog="Example:  co jira projects --json")
 def _jira_projects(
     as_json: bool = typer.Option(False, "--json", help="Output project list as JSON"),
@@ -2540,11 +2538,14 @@ def _onenote_default(ctx: typer.Context):
         handle_onenote_pages()
 
 
-@onenote_app.command("ls", epilog="Example:  co onenote ls")
-def _onenote_ls(show_ids: bool = typer.Option(False, "--ids", help="Also show full section IDs for scripts")):
+@onenote_app.command("ls", epilog="Example:  co onenote ls && co onenote ls --json")
+def _onenote_ls(
+    show_ids: bool = typer.Option(False, "--ids", help="Also show full section IDs for scripts"),
+    as_json: bool = typer.Option(False, "--json", help="Output notebooks as JSON"),
+):
     """List notebooks with numbered sections for pages/create. Read-only."""
     from .commands.onenote_commands import handle_onenote_ls
-    handle_onenote_ls(show_ids=show_ids)
+    handle_onenote_ls(show_ids=show_ids, as_json=as_json)
 
 
 @onenote_app.command("pages", epilog='Example:  co onenote pages')

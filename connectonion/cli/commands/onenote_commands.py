@@ -7,6 +7,7 @@ LLM-Note:
   Errors: ValueError, credential and HTTP transport errors print a short recovery hint, exit 1; a failed create never suggests blind retry because the page may already exist
 """
 
+import json
 import os
 import re
 import shlex
@@ -156,7 +157,18 @@ def _run(call, next_command: str, retry_command: str, *, write: bool = False,
     print_tip(next_command)
 
 
-def handle_onenote_ls(*, show_ids: bool = False) -> None:
+def handle_onenote_ls(*, show_ids: bool = False, as_json: bool = False) -> None:
+    if as_json:
+        try:
+            notebooks = _onenote().notebook_items()
+        except Exception:
+            print(json.dumps({
+                "error": "OneNote request failed. Check the configured account and try again.",
+                "exit_code": 1,
+            }))
+            sys.exit(1)
+        print(json.dumps({"notebooks": notebooks}))
+        return
     _run(lambda n: _listed_notebooks(n, show_ids), "Next: co onenote pages", "co onenote ls")
 
 
