@@ -838,3 +838,177 @@ def test_onenote_ls_json_error_is_safe():
     assert "secret-token" not in result.output
     assert "raw server body" not in result.output
     assert "OneNote request failed" in payload["error"]
+
+# ── STEP 6 TESTS (CLI-1 through CLI-8) ──
+
+def test_jira_cli_exits_zero_on_success():
+    """CLI-1: successful project_items() → exit 0; no credential in stdout."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.project_items.return_value = [_P1, _P2]
+        result = runner.invoke(app, ["jira", "projects"])
+    assert result.exit_code == 0, result.output
+    assert JIRA_TOKEN not in result.stdout
+
+
+def test_jira_cli_exits_nonzero_on_config_missing():
+    """CLI-2: JiraConfigError → non-zero exit; no traceback; no token in output."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.side_effect = JiraConfigError(
+            "JIRA_URL is not set. Run: co env set JIRA_URL https://your-domain.atlassian.net"
+        )
+        result = runner.invoke(app, ["jira", "projects"])
+    assert result.exit_code != 0
+    assert "Traceback" not in result.stderr
+    assert JIRA_TOKEN not in result.stdout
+    assert JIRA_TOKEN not in result.stderr
+
+
+def test_jira_cli_exits_nonzero_on_401():
+    """CLI-3: JiraAuthError → non-zero exit; 'authentication failed' on stderr; no token."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.project_items.side_effect = JiraAuthError(
+            "Jira authentication failed. Run: co env set JIRA_API_TOKEN <token>"
+        )
+        result = runner.invoke(app, ["jira", "projects"])
+    assert result.exit_code != 0
+    assert "Jira authentication failed" in result.stderr
+    assert JIRA_TOKEN not in result.stderr
+
+
+def test_jira_cli_exits_nonzero_on_403():
+    """CLI-4: issue_items() 403 path via co jira issues -> non-zero exit;
+    project key on stderr; no token; no raw server body."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.issue_items.side_effect = JiraPermissionError(
+            "Permission denied for project ALPHA"
+        )
+        result = runner.invoke(app, ["jira", "issues", "ALPHA", "ALPHA-1"])
+    assert result.exit_code != 0
+    assert "ALPHA" in result.stderr
+    assert JIRA_TOKEN not in result.stderr
+    assert "errorMessages" not in result.stderr  # no raw server body
+
+
+def test_jira_cli_exits_nonzero_on_timeout_and_429():
+    """CLI-5: timeout ValueError → non-zero exit, retry hint on stderr, no token;
+    429 ValueError → non-zero exit, rate-limit hint on stderr, no token."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    # timeout
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.project_items.side_effect = ValueError(
+            "Network timeout contacting Jira — please retry"
+        )
+        result_timeout = runner.invoke(app, ["jira", "projects"])
+    assert result_timeout.exit_code != 0
+    assert "retry" in result_timeout.stderr.lower()
+    assert JIRA_TOKEN not in result_timeout.stderr
+    # 429 rate limit
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.project_items.side_effect = ValueError(
+            "Rate limited (429) — wait and retry"
+        )
+        result_429 = runner.invoke(app, ["jira", "projects"])
+    assert result_429.exit_code != 0
+    assert "429" in result_429.stderr or "rate" in result_429.stderr.lower()
+    assert JIRA_TOKEN not in result_429.stderr
+
+
+def test_jira_cli_human_mode_error_to_stderr_not_stdout_no_traceback():
+    """CLI-6: human mode error path — error to stderr only; stdout clean; no traceback; no token."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.project_items.side_effect = JiraAuthError(
+            "Jira authentication failed"
+        )
+        result = runner.invoke(app, ["jira", "projects"])
+    assert result.exit_code != 0
+    assert result.stdout == ""
+    assert "Jira authentication failed" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert JIRA_TOKEN not in result.stderr
+
+
+def test_jira_cli_json_mode_produces_pure_json_on_success():
+    """CLI-7: --json success → stdout is valid JSON with 'projects'; no traceback; no tip text."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.project_items.return_value = [_P1, _P2]
+        result = runner.invoke(app, ["jira", "projects", "--json"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert "projects" in data
+    assert len(data["projects"]) == 2
+    assert "Traceback" not in result.stdout
+
+
+def test_jira_cli_json_mode_produces_machine_readable_error_on_failure():
+    """CLI-8: --json failure → stdout is valid JSON with 'error'; no token; non-zero exit."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.project_items.side_effect = JiraAuthError(
+            "Jira authentication failed"
+        )
+        result = runner.invoke(app, ["jira", "projects", "--json"])
+    assert result.exit_code != 0
+    data = json.loads(result.stdout)
+    assert "error" in data
+    assert data.get("exit_code") == 1
+    assert JIRA_TOKEN not in data.get("error", "")
+    assert JIRA_TOKEN not in result.stdout
+
+def test_jira_verify_json_returns_safe_account_info():
+    """CLI-9 (verify --json): returns account/account_id/display_name; token absent."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.verify_connection.return_value = {
+            "accountId": "abc123",
+            "displayName": "Alice",
+            "site_url": JIRA_URL,
+        }
+        result = runner.invoke(app, ["jira", "verify", "--json"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["account"] == JIRA_URL
+    assert data["account_id"] == "abc123"
+    assert data["display_name"] == "Alice"
+    assert JIRA_TOKEN not in result.stdout
+
+
+def test_jira_issues_json_passes_project_and_keys_to_tool_layer():
+    """CLI-10 (issues --json): tool layer called with correct project key and issue key set."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.issue_items.return_value = [_I1, _I2]
+        result = runner.invoke(app, ["jira", "issues", "ALPHA", "ALPHA-1", "ALPHA-2", "--json"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert "issues" in data
+    assert len(data["issues"]) == 2
+    # verify the tool layer was called with project_key="ALPHA" and set of keys
+    call_args = mock_jira.return_value.issue_items.call_args
+    assert call_args[0][0] == "ALPHA"
+    assert call_args[0][1] == {"ALPHA-1", "ALPHA-2"}
