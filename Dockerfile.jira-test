@@ -1,0 +1,36 @@
+# Jira unit-test runner (Step 7 — Docker verification)
+#
+# Build:  docker build -f Dockerfile.jira-test -t connectonion-jira-test .
+# Run:    docker run --rm connectonion-jira-test
+# Pass:   exit code 0; "57 passed" in output
+#
+# Security guarantees
+# -------------------
+# * No JIRA_URL / JIRA_EMAIL / JIRA_API_TOKEN is set in any layer.
+# * conftest.py _no_network fixture blocks every non-loopback socket;
+#   no HTTP request reaches a real Jira instance.
+# * All HTTP inside the tests is mocked via unittest.mock / pytest-mock.
+
+FROM python:3.11-slim
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1
+
+# Layer 1: package metadata + source (cache-friendly; rebuilt only on source changes)
+COPY pyproject.toml README.md MANIFEST.in ./
+COPY connectonion/ ./connectonion/
+
+# Install the package with dev extras.
+# No credentials are passed; dependency installation may access the package
+# index during image build, but the test run itself makes no real Jira
+# requests — conftest.py blocks every non-loopback socket at that stage.
+# No JIRA_* variable is set at any stage.
+RUN pip install --no-cache-dir -e ".[dev]"
+
+# Layer 2: tests and pytest configuration
+COPY tests/ ./tests/
+COPY pytest.ini ./
+
+# Run only the Jira unit tests.
+# -p no:cacheprovider  — avoids writing .pytest_cache inside the container
+# --tb=short           — concise tracebacks if anything fails
+CMD ["pytest", "tests/unit/test_jira.py", "-v", "--tb=short", "-p", "no:cacheprovider"]
