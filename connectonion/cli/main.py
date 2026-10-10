@@ -2463,6 +2463,23 @@ from .commands.canny_commands import canny_app
 app.add_typer(canny_app, name="canny")
 
 
+# Jira (F13FCAKE-9/10/18): read-only project and issue listing.
+jira_app = _typer_app(
+    help="List Jira projects. Requires JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN from co env set.",
+    epilog="Example:  co jira projects && co jira projects --json",
+)
+app.add_typer(jira_app, name="jira")
+
+
+@jira_app.command("projects", epilog="Example:  co jira projects --json")
+def _jira_projects(
+    as_json: bool = typer.Option(False, "--json", help="Output project list as JSON"),
+):
+    """List all accessible Jira projects. Read-only."""
+    from .commands.jira_commands import handle_jira_projects
+    handle_jira_projects(as_json=as_json)
+
+
 # OneNote (#1887): the notebooks `co auth microsoft` grants since 1.8.9.
 onenote_app = _typer_app(
     help="Your OneNote pages. Bare co onenote shows recent pages; ls shows notebooks. Reading is Read-only.",
@@ -2480,11 +2497,14 @@ def _onenote_default(ctx: typer.Context):
         handle_onenote_pages()
 
 
-@onenote_app.command("ls", epilog="Example:  co onenote ls")
-def _onenote_ls(show_ids: bool = typer.Option(False, "--ids", help="Also show full section IDs for scripts")):
+@onenote_app.command("ls", epilog="Example:  co onenote ls && co onenote ls --json")
+def _onenote_ls(
+    show_ids: bool = typer.Option(False, "--ids", help="Also show full section IDs for scripts"),
+    as_json: bool = typer.Option(False, "--json", help="Output notebooks as JSON"),
+):
     """List notebooks with numbered sections for pages/create. Read-only."""
     from .commands.onenote_commands import handle_onenote_ls
-    handle_onenote_ls(show_ids=show_ids)
+    handle_onenote_ls(show_ids=show_ids, as_json=as_json)
 
 
 @onenote_app.command("pages", epilog='Example:  co onenote pages')

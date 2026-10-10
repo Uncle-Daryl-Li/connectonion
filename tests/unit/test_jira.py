@@ -2,6 +2,7 @@
 
 import datetime
 import httpx
+import json
 import yaml
 import logging
 from pathlib import Path
@@ -557,3 +558,283 @@ def test_write_source_yaml_rejects_issue_keys_not_belonging_to_project(tmp_path)
     with pytest.raises(ValueError):
         Jira().write_source_yaml(dest, ["ALPHA"], {"ALPHA-1", "BETA-2"})
     assert not (dest / "source.yaml").exists()
+
+
+# ── STEP 5 TESTS (18-1 through 18-10, 18-6b, 18-6c, 18-7b, 18-8b, 18-8c) ──
+
+_ONENOTE_ACCOUNT = "https://graph.microsoft.com/v1.0"
+_ON1 = {"id": "page-1", "lastModifiedDateTime": "2024-01-01T00:00:00Z", "title": "Page One"}
+_ON2 = {"id": "page-2", "lastModifiedDateTime": "2024-01-02T00:00:00Z", "title": "Page Two"}
+_JIRA_URL_2 = "https://other.atlassian.net"
+
+
+def test_adapter_result_has_records_and_errors_fields():
+    """18-1: AdapterResult has records: list[dict] and errors: dict[str, str]."""
+    from connectonion.useful_tools.adapter import AdapterResult
+    result = AdapterResult()
+    assert isinstance(result.records, list)
+    assert isinstance(result.errors, dict)
+    result2 = AdapterResult(records=[{"id": "x"}], errors={"k": "v"})
+    assert result2.records == [{"id": "x"}]
+    assert result2.errors == {"k": "v"}
+
+
+def test_jira_adapter_returns_contract_shape_with_provenance():
+    """18-2: jira_issues_to_records produces AdapterResult with source/account/id/url/date."""
+    from connectonion.useful_tools.adapter import AdapterResult, jira_issues_to_records
+    result = jira_issues_to_records([_I1, _I2], JIRA_URL)
+    assert isinstance(result, AdapterResult)
+    assert len(result.records) == 2
+    for record in result.records:
+        assert record["source"] == "jira"
+        assert record["account"] == JIRA_URL
+        assert "id" in record
+        assert "url" in record
+        assert "date" in record
+
+
+def test_onenote_adapter_returns_same_contract_shape_with_provenance():
+    """18-3: onenote_pages_to_records has identical provenance contract to jira_issues_to_records."""
+    from connectonion.useful_tools.adapter import AdapterResult, onenote_pages_to_records
+    result = onenote_pages_to_records([_ON1, _ON2], _ONENOTE_ACCOUNT)
+    assert isinstance(result, AdapterResult)
+    assert len(result.records) == 2
+    for record in result.records:
+        assert record["source"] == "onenote"
+        assert record["account"] == _ONENOTE_ACCOUNT
+        assert "id" in record
+        assert "url" in record
+        assert "date" in record
+
+
+def test_common_consumer_reads_jira_without_source_specific_branching():
+    """18-4: consume_records() is source-agnostic; works with Jira AdapterResult."""
+    from connectonion.useful_tools.adapter import consume_records, jira_issues_to_records
+    result = jira_issues_to_records([_I1, _I2], JIRA_URL)
+    records = consume_records(result)
+    assert isinstance(records, list)
+    assert len(records) == 2
+    assert all(r["source"] == "jira" for r in records)
+
+
+def test_common_consumer_reads_onenote_without_source_specific_branching():
+    """18-5: same consume_records() function accepts OneNote AdapterResult."""
+    from connectonion.useful_tools.adapter import consume_records, onenote_pages_to_records
+    result = onenote_pages_to_records([_ON1, _ON2], _ONENOTE_ACCOUNT)
+    records = consume_records(result)
+    assert isinstance(records, list)
+    assert len(records) == 2
+    assert all(r["source"] == "onenote" for r in records)
+
+
+def test_jira_failure_does_not_corrupt_onenote_records():
+    """18-6: Jira failure (errors dict non-empty) leaves OneNote records intact and readable."""
+    from connectonion.useful_tools.adapter import AdapterResult, consume_records, onenote_pages_to_records
+    jira_result = AdapterResult(records=[], errors={"ALPHA": "Permission denied"})
+    onenote_result = onenote_pages_to_records([_ON1], _ONENOTE_ACCOUNT)
+    onenote_records = consume_records(onenote_result)
+    assert len(onenote_records) == 1
+    assert onenote_records[0]["source"] == "onenote"
+    assert "ALPHA" in jira_result.errors
+    assert len(consume_records(jira_result)) == 0
+
+
+def test_jira_onenote_same_remote_id_no_collision():
+    """18-6b: id=ABC-123 from Jira and OneNote -> two distinct records differing by source field."""
+    from connectonion.useful_tools.adapter import consume_records, jira_issues_to_records, onenote_pages_to_records
+    _issue = {"id": "99999", "key": "ABC-123", "fields": {"summary": "Shared ID"}}
+    _page = {"id": "ABC-123", "lastModifiedDateTime": "2024-01-01", "title": "Same ID"}
+    jira_result = jira_issues_to_records([_issue], JIRA_URL)
+    onenote_result = onenote_pages_to_records([_page], _ONENOTE_ACCOUNT)
+    all_records = consume_records(jira_result) + consume_records(onenote_result)
+    assert len(all_records) == 2
+    sources = {r["source"] for r in all_records}
+    assert sources == {"jira", "onenote"}
+    assert sum(1 for r in all_records if r["id"] == "ABC-123") == 2
+
+
+def test_two_jira_accounts_same_issue_key_no_collision():
+    """18-6c: id=ABC-123 from two Jira instances (different account) -> distinct by account field."""
+    from connectonion.useful_tools.adapter import consume_records, jira_issues_to_records
+    _issue = {"id": "99999", "key": "ABC-123", "fields": {"summary": "Multi-site"}}
+    result1 = jira_issues_to_records([_issue], JIRA_URL)
+    result2 = jira_issues_to_records([_issue], _JIRA_URL_2)
+    all_records = consume_records(result1) + consume_records(result2)
+    assert len(all_records) == 2
+    accounts = {r["account"] for r in all_records}
+    assert accounts == {JIRA_URL, _JIRA_URL_2}
+    assert all(r["id"] == "ABC-123" for r in all_records)
+
+
+def test_onenote_failure_does_not_corrupt_jira_records():
+    """18-7: OneNote failure leaves Jira records intact and readable."""
+    from connectonion.useful_tools.adapter import AdapterResult, consume_records, jira_issues_to_records
+    jira_result = jira_issues_to_records([_I1, _I2], JIRA_URL)
+    onenote_result = AdapterResult(records=[], errors={"notebook-1": "Token expired"})
+    jira_records = consume_records(jira_result)
+    assert len(jira_records) == 2
+    assert all(r["source"] == "jira" for r in jira_records)
+    assert "notebook-1" in onenote_result.errors
+    assert len(consume_records(onenote_result)) == 0
+
+
+def test_jira_safe_errors_do_not_leak_secrets_into_adapter_result():
+    """18-7b: Jira 401/403 error messages in AdapterResult.errors contain no token or server body.
+
+    NOTE: OneNote authentication and transport error mapping is owned by the
+    OneNote integration and is not implemented or verified in this Jira-led
+    shared-adapter change.
+    """
+    from connectonion.useful_tools.adapter import AdapterResult
+    # Jira 401: JiraAuthError message must not contain JIRA_API_TOKEN or JIRA_EMAIL
+    get, _ = _mock_get({"/rest/api/3/project/search": (401, {})})
+    jira_result = AdapterResult()
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        try:
+            Jira().project_items()
+        except Exception as exc:
+            jira_result.errors["jira"] = str(exc)
+    assert JIRA_TOKEN not in jira_result.errors.get("jira", "")
+    assert JIRA_EMAIL not in jira_result.errors.get("jira", "")
+    # Jira 403: JiraPermissionError message must not contain raw server response body
+    get403, _ = _mock_get({"/rest/api/3/search/jql": (403, {"errorMessages": ["raw server body"]})})
+    jira_403 = AdapterResult()
+    with patch("connectonion.useful_tools.jira.httpx.get", get403):
+        try:
+            Jira().issue_items("ALPHA", {"ALPHA-1"})
+        except Exception as exc:
+            jira_403.errors["jira"] = str(exc)
+    assert "raw server body" not in jira_403.errors.get("jira", "")
+    assert "errorMessages" not in jira_403.errors.get("jira", "")
+    assert JIRA_TOKEN not in jira_403.errors.get("jira", "")
+
+
+def test_end_to_end_jira_fixture_written_in_daily_jsonl_layout(tmp_path):
+    """18-8: write_daily_jsonl places Jira records at daily/YYYY/MM/DD.jsonl; each line has provenance."""
+    from connectonion.useful_tools.adapter import consume_records, write_daily_jsonl, jira_issues_to_records
+    dest = tmp_path / ".co" / "rem" / "docs" / "jira"
+    result = jira_issues_to_records([_I1, _I2], JIRA_URL)
+    jsonl_path = write_daily_jsonl(result.records, dest)
+    today = datetime.date.today()
+    expected = dest / "daily" / str(today.year) / f"{today.month:02d}" / f"{today.day:02d}.jsonl"
+    assert jsonl_path == expected
+    assert jsonl_path.exists()
+    lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    for line in lines:
+        rec = json.loads(line)
+        assert rec["source"] == "jira"
+        assert rec["account"] == JIRA_URL
+        assert "id" in rec
+        assert "url" in rec
+        assert "date" in rec
+    assert consume_records(result) == result.records
+
+
+def test_end_to_end_onenote_fixture_written_in_daily_jsonl_layout(tmp_path):
+    """18-8b: write_daily_jsonl places OneNote records at daily/YYYY/MM/DD.jsonl."""
+    from connectonion.useful_tools.adapter import consume_records, write_daily_jsonl, onenote_pages_to_records
+    dest = tmp_path / ".co" / "rem" / "docs" / "onenote"
+    result = onenote_pages_to_records([_ON1, _ON2], _ONENOTE_ACCOUNT)
+    jsonl_path = write_daily_jsonl(result.records, dest)
+    today = datetime.date.today()
+    expected = dest / "daily" / str(today.year) / f"{today.month:02d}" / f"{today.day:02d}.jsonl"
+    assert jsonl_path == expected
+    assert jsonl_path.exists()
+    lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    for line in lines:
+        rec = json.loads(line)
+        assert rec["source"] == "onenote"
+        assert rec["account"] == _ONENOTE_ACCOUNT
+        assert "id" in rec
+        assert "url" in rec
+        assert "date" in rec
+    assert consume_records(result) == result.records
+
+
+def test_jira_issue_text_follows_blobs_derived_or_metadata_only_convention(tmp_path):
+    """18-8c: media_policy=metadata_only; summary inline in JSONL; no blob files; no token in files."""
+    from connectonion.useful_tools.adapter import write_daily_jsonl, jira_issues_to_records
+    dest = tmp_path / ".co" / "rem" / "docs" / "jira"
+    with patch("connectonion.useful_tools.jira.importlib.metadata.version", return_value="9.9.9"):
+        Jira().write_source_yaml(dest, ["ALPHA"], {"ALPHA-1"})
+    source_yaml = yaml.safe_load((dest / "source.yaml").read_text(encoding="utf-8"))
+    assert source_yaml["media_policy"] == "metadata_only"
+    issues = [{"id": "10001", "key": "ALPHA-1", "fields": {"summary": "Inline summary text", "created": "2024-01-01"}}]
+    result = jira_issues_to_records(issues, JIRA_URL)
+    jsonl_path = write_daily_jsonl(result.records, dest)
+    line = json.loads(jsonl_path.read_text(encoding="utf-8").strip())
+    assert "summary" in line
+    assert "blob_hash" not in line
+    assert "blob_ref" not in line
+    assert JIRA_TOKEN not in jsonl_path.read_text(encoding="utf-8")
+    written = [f for f in dest.rglob("*") if f.is_file()]
+    assert not any("blob" in f.name or "attachment" in f.name for f in written)
+
+
+def test_cli_help_exits_zero_and_contains_example_both_sources():
+    """18-9: co jira --help and co onenote --help exit 0 with usage examples."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    result_jira = runner.invoke(app, ["jira", "--help"])
+    assert result_jira.exit_code == 0, result_jira.output
+    assert "example" in result_jira.output.lower() or "co jira" in result_jira.output.lower()
+    result_onenote = runner.invoke(app, ["onenote", "--help"])
+    assert result_onenote.exit_code == 0, result_onenote.output
+    assert "example" in result_onenote.output.lower() or "onenote" in result_onenote.output.lower()
+
+
+def test_cli_json_output_for_success_and_valid_empty_both_sources():
+    """18-10: co jira projects --json and co onenote ls --json produce valid JSON."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    # co jira projects --json: non-empty
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.project_items.return_value = [_P1, _P2]
+        result = runner.invoke(app, ["jira", "projects", "--json"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert "projects" in data
+    assert len(data["projects"]) == 2
+    # co jira projects --json: valid empty
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.project_items.return_value = []
+        result = runner.invoke(app, ["jira", "projects", "--json"])
+    assert result.exit_code == 0, result.output
+    data_empty = json.loads(result.output)
+    assert data_empty.get("projects") == []
+    # co onenote ls --json: non-empty
+    with patch("connectonion.cli.commands.onenote_commands._onenote") as mock_onenote:
+        mock_onenote.return_value.notebook_items.return_value = [{"displayName": "NB1", "sections": []}]
+        result = runner.invoke(app, ["onenote", "ls", "--json"])
+    assert result.exit_code == 0, result.output
+    data_on = json.loads(result.output)
+    assert "notebooks" in data_on
+    assert len(data_on["notebooks"]) == 1
+    # co onenote ls --json: valid empty
+    with patch("connectonion.cli.commands.onenote_commands._onenote") as mock_onenote:
+        mock_onenote.return_value.notebook_items.return_value = []
+        result = runner.invoke(app, ["onenote", "ls", "--json"])
+    assert result.exit_code == 0, result.output
+    data_on_empty = json.loads(result.output)
+    assert data_on_empty.get("notebooks") == []
+
+def test_onenote_ls_json_error_is_safe():
+    """18-10b: co onenote ls --json wraps exceptions in a safe generic message; no raw content leaks."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.onenote_commands._onenote") as mock_onenote:
+        mock_onenote.return_value.notebook_items.side_effect = ValueError(
+            "raw server body: secret-token"
+        )
+        result = runner.invoke(app, ["onenote", "ls", "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["exit_code"] == 1
+    assert "secret-token" not in result.output
+    assert "raw server body" not in result.output
+    assert "OneNote request failed" in payload["error"]
