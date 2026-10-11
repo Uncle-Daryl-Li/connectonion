@@ -3,7 +3,7 @@ Purpose: `co jira` — verify connection, list projects, read scoped issues (F13
 LLM-Note:
   Dependencies: imports from [sys, json, rich, useful_tools/jira.Jira] | imported by [cli/main.py] | tested by [tests/unit/test_jira.py]
   Data flow: CLI flags -> _jira() factory -> Jira.verify_connection()/project_items()/issue_items() -> formatted output or JSON
-  State/Effects: sync writes source.yaml under the output dir; Jira itself is always read-only; all auth/scope validation in tool layer
+  State/Effects: sync writes source.yaml and daily JSONL under the output dir; Jira itself is always read-only; all auth/scope validation in tool layer
   Errors: JiraConfigError/JiraAuthError/JiraPermissionError/ValueError -> stderr + exit 1; never exposes token
 """
 
@@ -112,22 +112,23 @@ def handle_jira_sync(
     output_dir: Path | None = None,
     as_json: bool = False,
 ) -> None:
-    """Validate credentials, collect selected issues, and write source.yaml.
+    """Validate credentials, collect selected issues, write source.yaml and daily JSONL.
 
-    Full workflow: verify → issue_items → write_source_yaml.
-    Daily JSONL conversion and shared-record persistence are provided by the
-    F13FCAKE-18 adapter layer, not this scoped-selection command.
+    Full workflow: verify → issue_items → write_source_yaml → jira_issues_to_records → write_daily_jsonl.
     Writes to output_dir (default: ~/.co/rem/docs/jira).
-    JSON output: {"written": source_yaml_path, "issues": count, "project": key}.
+    JSON output: {"written": source_yaml_path, "jsonl": jsonl_path, "issues": count, "project": key}.
     """
     from ...useful_tools.jira import JiraConfigError, JiraAuthError, JiraPermissionError
+    from ...useful_tools.adapter import jira_issues_to_records, write_daily_jsonl
     if output_dir is None:
         output_dir = Path.home() / ".co" / "rem" / "docs" / "jira"
     try:
         jira = _jira()
-        jira.verify_connection()
+        info = jira.verify_connection()
         issues = jira.issue_items(project_key, set(issue_keys))
         jira.write_source_yaml(output_dir, [project_key], set(issue_keys))
+        adapter_result = jira_issues_to_records(issues, info["site_url"])
+        jsonl_path = write_daily_jsonl(adapter_result.records, output_dir)
     except (JiraConfigError, JiraAuthError, JiraPermissionError, ValueError) as exc:
         _handle_error(exc, as_json)
         return
@@ -135,10 +136,12 @@ def handle_jira_sync(
     if as_json:
         print(json.dumps({
             "written": source_yaml,
+            "jsonl": str(jsonl_path),
             "project": project_key,
             "issues": len(issues),
         }))
         return
     print(f"Wrote {source_yaml}")
+    print(f"Wrote {jsonl_path}")
     print(f"Project: {project_key}  Issues collected: {len(issues)}")
     print("Example: co rem sources")
