@@ -197,6 +197,8 @@ class Jira:
 
         Repeated nextPageToken → raises ValueError (non-progressing cursor guard).
         HTTP 403 → raises JiraPermissionError containing the project key, never the server body.
+        After all pages: raises ValueError listing any requested keys absent from the response
+        so callers can detect silently-missing issues before writing any files.
         """
         if not selected_issue_keys:
             raise ValueError(
@@ -242,6 +244,14 @@ class Jira:
             results.extend(page.get("issues", []))
             next_token = page.get("nextPageToken")
             if next_token is None:
+                returned_keys = {issue.get("key", "") for issue in results}
+                missing_keys = selected_issue_keys - returned_keys
+                if missing_keys:
+                    raise ValueError(
+                        f"Jira did not return the following requested issue keys: {sorted(missing_keys)}. "
+                        "These keys may not exist, may have been deleted, or your account "
+                        "may lack read access to them."
+                    )
                 return results
             if next_token in seen_tokens:
                 raise ValueError(

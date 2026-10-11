@@ -469,14 +469,14 @@ def test_issue_items_pagination_collects_all_pages_via_confirmed_cursor():
     assert call_seq[0] == 2
 
 
-def test_issue_items_empty_result_returns_empty_list():
-    """10-9: issues=[] + no nextPageToken -> returns []; no exception."""
+def test_issue_items_raises_when_all_requested_keys_missing():
+    """10-9: issues=[] when keys are requested -> ValueError naming missing keys."""
     get, _ = _mock_get(
         {"/rest/api/3/search/jql": (200, {"issues": []})}
     )
     with patch("connectonion.useful_tools.jira.httpx.get", get):
-        result = Jira().issue_items("ALPHA", {"ALPHA-1"})
-    assert result == []
+        with pytest.raises(ValueError, match="ALPHA-1"):
+            Jira().issue_items("ALPHA", {"ALPHA-1"})
 
 
 def test_write_source_yaml_creates_file_at_correct_path(tmp_path):
