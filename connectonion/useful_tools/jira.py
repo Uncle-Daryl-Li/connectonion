@@ -1,9 +1,9 @@
 """
 Purpose: Jira Cloud integration — projects, issues, source.yaml for co rem (F13FCAKE-9/10/18).
 LLM-Note:
-  Dependencies: imports from [re, pathlib, datetime, importlib.metadata, httpx, yaml, connectonion.environment.setting] | imported by [useful_tools/__init__.py, cli/commands/jira_commands.py] | tested by [tests/unit/test_jira.py]
+  Dependencies: imports from [os, re, pathlib, datetime, importlib.metadata, httpx, yaml, connectonion.environment.setting] | imported by [useful_tools/__init__.py, cli/commands/jira_commands.py] | tested by [tests/unit/test_jira.py]
   Data flow: Jira methods → HTTP Basic Auth (JIRA_EMAIL:JIRA_API_TOKEN) httpx requests to JIRA_URL → raw Jira REST API v3 JSON → returned as plain dicts/lists
-  State/Effects: reads JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN from environment | write_source_yaml() creates source.yaml under source_dir | no blobs or derived files (metadata_only, v1)
+  State/Effects: JIRA_URL and JIRA_EMAIL are read via setting() (may fall back to secret store) | JIRA_API_TOKEN is read ONLY from os.environ (never the secret store — must be a temporary shell export, never persisted) | write_source_yaml() creates source.yaml under source_dir | no blobs or derived files (metadata_only, v1)
   Integration: exposes Jira with verify_connection(), project_items(), issue_items(), write_source_yaml() | CLI via cli/commands/jira_commands.py
   Errors: JiraConfigError (missing env var) | JiraAuthError (HTTP 401) | JiraPermissionError (HTTP 403) — all ValueError subclasses; never swallow; never put token in messages
 
@@ -18,6 +18,7 @@ Usage:
 
 import datetime
 import importlib.metadata
+import os
 import re
 import urllib.parse
 from pathlib import Path
@@ -46,7 +47,7 @@ class Jira:
     def __init__(self):
         url = (setting("JIRA_URL") or "").rstrip("/")
         email = (setting("JIRA_EMAIL") or "")
-        token = (setting("JIRA_API_TOKEN") or "")
+        token = os.environ.get("JIRA_API_TOKEN", "")
         if not url:
             raise JiraConfigError(
                 "JIRA_URL is not set.\n"
@@ -73,8 +74,10 @@ class Jira:
         if not token:
             raise JiraConfigError(
                 "JIRA_API_TOKEN is not set.\n"
-                "Repair (no-echo — keeps token out of shell history):\n"
-                "  read -rsp \"Jira API token: \" T && echo && co env set JIRA_API_TOKEN \"$T\" --secret && unset T"
+                "Set it temporarily (never saved to disk):\n"
+                "  Bash/Git Bash: read -rsp \"Jira API token: \" JIRA_API_TOKEN; echo; export JIRA_API_TOKEN\n"
+                "  zsh:           read -rs \"JIRA_API_TOKEN?Jira API token: \"; echo; export JIRA_API_TOKEN\n"
+                "Then run your co jira command, then: unset JIRA_API_TOKEN"
             )
         self._base = url
         self._auth = (email, token)
@@ -96,8 +99,11 @@ class Jira:
         if response.status_code == 401:
             raise JiraAuthError(
                 "Jira authentication failed.\n"
-                "Repair (no-echo — keeps token out of shell history):\n"
-                "  read -rsp \"Jira API token: \" T && echo && co env set JIRA_API_TOKEN \"$T\" --secret && unset T"
+                "Re-generate your token at https://id.atlassian.com/manage-profile/security/api-tokens, "
+                "then set it temporarily (never saved to disk):\n"
+                "  Bash/Git Bash: read -rsp \"Jira API token: \" JIRA_API_TOKEN; echo; export JIRA_API_TOKEN\n"
+                "  zsh:           read -rs \"JIRA_API_TOKEN?Jira API token: \"; echo; export JIRA_API_TOKEN\n"
+                "Then run your co jira command, then: unset JIRA_API_TOKEN"
             )
         if response.status_code == 403:
             raise JiraPermissionError(

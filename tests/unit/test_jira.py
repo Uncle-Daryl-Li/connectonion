@@ -218,7 +218,7 @@ def test_401_message_does_not_speculate_about_cause():
     msg = str(exc_info.value)
     assert "expired" not in msg
     assert "invalid token" not in msg
-    assert "co env set JIRA_API_TOKEN" in msg
+    assert "export JIRA_API_TOKEN" in msg
 
 
 def test_no_records_written_when_auth_fails(caplog):
