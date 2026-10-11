@@ -19,6 +19,7 @@ Usage:
 import datetime
 import importlib.metadata
 import re
+import urllib.parse
 from pathlib import Path
 
 import httpx
@@ -51,6 +52,19 @@ class Jira:
                 "JIRA_URL is not set.\n"
                 "Repair: co env set JIRA_URL https://your-domain.atlassian.net"
             )
+        _parsed = urllib.parse.urlparse(url)
+        if _parsed.scheme != "https" or not _parsed.netloc:
+            raise JiraConfigError(
+                "JIRA_URL must use https:// with a valid host.\n"
+                "Basic Auth credentials must not travel over plain HTTP or non-HTTPS schemes.\n"
+                "Repair: co env set JIRA_URL https://your-domain.atlassian.net"
+            )
+        if _parsed.username or _parsed.password:
+            raise JiraConfigError(
+                "JIRA_URL must not contain credentials (username or password in the URL). "
+                "Provide them via JIRA_EMAIL and JIRA_API_TOKEN instead.\n"
+                "Repair: co env set JIRA_URL https://your-domain.atlassian.net"
+            )
         if not email:
             raise JiraConfigError(
                 "JIRA_EMAIL is not set.\n"
@@ -59,25 +73,31 @@ class Jira:
         if not token:
             raise JiraConfigError(
                 "JIRA_API_TOKEN is not set.\n"
-                "Repair: co env set JIRA_API_TOKEN <your-api-token>"
+                "Repair (no-echo — keeps token out of shell history):\n"
+                "  read -rsp \"Jira API token: \" T && echo && co env set JIRA_API_TOKEN \"$T\" --secret && unset T"
             )
         self._base = url
         self._auth = (email, token)
 
     def _get(self, path: str, **params) -> dict:
-        """Authenticated GET to /rest/api/3/<path>; raises typed errors for 401/403/429."""
+        """Authenticated GET to /rest/api/3/<path>; raises typed errors for auth/rate/network/5xx."""
         url = f"{self._base}/rest/api/3/{path.lstrip('/')}"
         try:
             response = httpx.get(url, auth=self._auth, params=params, timeout=30)
         except httpx.TimeoutException as exc:
             raise ValueError(
-                f"Request to Jira timed out. "
+                "Request to Jira timed out. "
                 "Check your network connection and try again."
+            ) from exc
+        except httpx.RequestError as exc:
+            raise ValueError(
+                "Could not reach Jira — check your network connection and try again."
             ) from exc
         if response.status_code == 401:
             raise JiraAuthError(
-                "Jira authentication failed. "
-                "Repair: co env set JIRA_API_TOKEN <your-api-token>"
+                "Jira authentication failed.\n"
+                "Repair (no-echo — keeps token out of shell history):\n"
+                "  read -rsp \"Jira API token: \" T && echo && co env set JIRA_API_TOKEN \"$T\" --secret && unset T"
             )
         if response.status_code == 403:
             raise JiraPermissionError(
@@ -89,8 +109,24 @@ class Jira:
                 "Jira rate limit exceeded (HTTP 429). "
                 "Wait a moment and try again."
             )
-        response.raise_for_status()
-        return response.json()
+        if response.status_code >= 500:
+            raise ValueError(
+                f"Jira is temporarily unavailable (HTTP {response.status_code}). "
+                "Try again in a few minutes."
+            )
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            raise ValueError(
+                f"Jira returned an unexpected HTTP {response.status_code} response."
+            ) from exc
+        try:
+            return response.json()
+        except Exception as exc:
+            raise ValueError(
+                "Jira returned a response that could not be parsed as JSON. "
+                "Try again or contact your Jira administrator."
+            ) from exc
 
     def verify_connection(self) -> dict:
         """GET /rest/api/3/myself — confirms credentials; returns accountId, displayName, site_url.
