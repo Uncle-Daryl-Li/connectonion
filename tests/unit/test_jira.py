@@ -585,11 +585,10 @@ def test_jira_cli_sync_writes_selected_scope_to_source_yaml(tmp_path):
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload == {
-        "written": str(tmp_path / "source.yaml"),
-        "project": "ALPHA",
-        "issues": 1,
-    }
+    assert payload["written"] == str(tmp_path / "source.yaml")
+    assert payload["project"] == "ALPHA"
+    assert payload["issues"] == 1
+    assert Path(payload["jsonl"]).exists()
     source = yaml.safe_load((tmp_path / "source.yaml").read_text(encoding="utf-8"))
     assert source["scope"] == {"projects": ["ALPHA"], "issues": ["ALPHA-1"]}
 # ── STEP 5 TESTS (18-1 through 18-10, 18-6b, 18-6c, 18-7b, 18-8b, 18-8c) ──
