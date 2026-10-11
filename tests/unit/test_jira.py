@@ -1044,3 +1044,372 @@ def test_jira_issues_json_passes_project_and_keys_to_tool_layer():
     call_args = mock_jira.return_value.issue_items.call_args
     assert call_args[0][0] == "ALPHA"
     assert call_args[0][1] == {"ALPHA-1", "ALPHA-2"}
+
+
+# ── FIX 1: https enforcement ──
+
+def test_http_url_raises_config_error_with_https_hint(monkeypatch):
+    """Fix-1: http:// JIRA_URL → JiraConfigError with https:// guidance and Repair hint."""
+    monkeypatch.setenv("JIRA_URL", "http://test.atlassian.net")
+    with pytest.raises(JiraConfigError) as exc_info:
+        Jira()
+    msg = str(exc_info.value)
+    assert "https://" in msg
+    assert "Repair:" in msg
+
+
+def test_ftp_url_raises_config_error(monkeypatch):
+    """Fix-1b: ftp:// JIRA_URL → JiraConfigError; not just http:// is blocked."""
+    monkeypatch.setenv("JIRA_URL", "ftp://test.atlassian.net")
+    with pytest.raises(JiraConfigError) as exc_info:
+        Jira()
+    msg = str(exc_info.value)
+    assert "https://" in msg
+
+
+def test_no_scheme_url_raises_config_error(monkeypatch):
+    """Fix-1c: scheme-less URL (e.g. example.com) → JiraConfigError; urlparse required."""
+    monkeypatch.setenv("JIRA_URL", "example.com")
+    with pytest.raises(JiraConfigError) as exc_info:
+        Jira()
+    msg = str(exc_info.value)
+    assert "https://" in msg
+
+
+def test_url_with_embedded_credentials_raises_config_error_without_leaking_secret(monkeypatch):
+    """Fix-1d: https://secret-token@host → JiraConfigError; message does not contain secret."""
+    monkeypatch.setenv("JIRA_URL", "https://secret-token@example.atlassian.net")
+    with pytest.raises(JiraConfigError) as exc_info:
+        Jira()
+    msg = str(exc_info.value)
+    assert "secret-token" not in msg
+    assert "Repair:" in msg
+
+
+# ── FIX 2: Network errors, 5xx, JSON decode errors ──
+
+def test_network_request_error_raises_recoverable_value_error():
+    """Fix-2a: non-timeout RequestError (e.g. DNS failure) → ValueError; not JiraAuthError."""
+    import httpx as _httpx
+
+    def get(url, auth=None, params=None, timeout=None):
+        raise _httpx.ConnectError("Name or service not known", request=None)
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(ValueError) as exc_info:
+            Jira().project_items()
+
+    assert not isinstance(exc_info.value, JiraAuthError)
+    assert not isinstance(exc_info.value, JiraPermissionError)
+    msg = str(exc_info.value)
+    assert "reach" in msg.lower() or "network" in msg.lower()
+
+
+def test_5xx_raises_recoverable_value_error_with_unavailable_hint():
+    """Fix-2b: HTTP 503 → ValueError; message says 'unavailable'; no traceback from raise_for_status."""
+    get, _ = _mock_get({"/rest/api/3/project/search": (503, {})})
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(ValueError) as exc_info:
+            Jira().project_items()
+
+    assert not isinstance(exc_info.value, JiraAuthError)
+    assert not isinstance(exc_info.value, JiraPermissionError)
+    msg = str(exc_info.value)
+    assert "unavailable" in msg.lower() or "503" in msg
+
+
+def test_json_decode_error_raises_value_error():
+    """Fix-2c: 200 response with malformed JSON body → ValueError; not raw exception."""
+    def get(url, auth=None, params=None, timeout=None):
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(side_effect=ValueError("No JSON object could be decoded"))
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(ValueError) as exc_info:
+            Jira().project_items()
+
+    msg = str(exc_info.value)
+    assert "JSON" in msg or "parsed" in msg.lower()
+
+
+# ── FIX 3: --secret guidance ──
+
+def test_missing_token_repair_hint_includes_secret_flag(monkeypatch):
+    """Fix-3a: JIRA_API_TOKEN missing → repair hint contains --secret."""
+    monkeypatch.delenv("JIRA_API_TOKEN")
+    with pytest.raises(JiraConfigError) as exc_info:
+        Jira()
+    assert "--secret" in str(exc_info.value)
+
+
+def test_401_repair_hint_includes_secret_flag():
+    """Fix-3b: 401 → JiraAuthError repair hint contains --secret."""
+    get, _ = _mock_get({"/rest/api/3/myself": (401, {})})
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(JiraAuthError) as exc_info:
+            Jira().verify_connection()
+
+    assert "--secret" in str(exc_info.value)
+
+
+# ── FIX 4: co jira sync CLI workflow ──
+
+def test_jira_cli_sync_creates_source_yaml(tmp_path):
+    """Fix-4a: co jira sync PROJECT KEY... --output DIR → exit 0; source.yaml written."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.verify_connection.return_value = {
+            "accountId": "abc", "displayName": "Alice", "site_url": JIRA_URL,
+        }
+        mock_jira.return_value.issue_items.return_value = [_I1]
+        mock_jira.return_value.write_source_yaml = MagicMock()
+        result = runner.invoke(
+            app, ["jira", "sync", "ALPHA", "ALPHA-1", "--output", str(tmp_path)]
+        )
+    assert result.exit_code == 0, result.output
+    mock_jira.return_value.verify_connection.assert_called_once()
+    mock_jira.return_value.issue_items.assert_called_once_with("ALPHA", {"ALPHA-1"})
+    mock_jira.return_value.write_source_yaml.assert_called_once()
+
+
+def test_jira_cli_sync_json_output(tmp_path):
+    """Fix-4b: co jira sync --json → valid JSON with written/jsonl/project/issues fields."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.verify_connection.return_value = {
+            "accountId": "abc", "displayName": "Alice", "site_url": JIRA_URL,
+        }
+        mock_jira.return_value.issue_items.return_value = [_I1, _I2]
+        mock_jira.return_value.write_source_yaml = MagicMock()
+        result = runner.invoke(
+            app, ["jira", "sync", "ALPHA", "ALPHA-1", "ALPHA-2",
+                  "--output", str(tmp_path), "--json"]
+        )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert "written" in data
+    assert "jsonl" in data
+    assert data["project"] == "ALPHA"
+    assert data["issues"] == 2
+    assert JIRA_TOKEN not in result.stdout
+
+
+def test_jira_cli_sync_end_to_end_writes_both_source_yaml_and_jsonl(tmp_path):
+    """Fix-4d: sync without mocking Jira internals → source.yaml and JSONL actually written."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+
+    call_seq = [0]
+
+    def mock_get(url, auth=None, params=None, timeout=None):
+        call_seq[0] += 1
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        if "myself" in url:
+            resp.json = MagicMock(return_value={
+                "accountId": "abc123",
+                "displayName": "Alice",
+            })
+        else:
+            resp.json = MagicMock(return_value={"issues": [_I1]})
+        return resp
+
+    runner = CliRunner()
+    with patch("connectonion.useful_tools.jira.httpx.get", mock_get):
+        with patch("connectonion.useful_tools.jira.importlib.metadata.version", return_value="9.9.9"):
+            result = runner.invoke(
+                app, ["jira", "sync", "ALPHA", "ALPHA-1", "--output", str(tmp_path)]
+            )
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "source.yaml").exists()
+    today = datetime.date.today()
+    jsonl_path = (
+        tmp_path / "daily" / str(today.year)
+        / f"{today.month:02d}" / f"{today.day:02d}.jsonl"
+    )
+    assert jsonl_path.exists()
+    rec = json.loads(jsonl_path.read_text(encoding="utf-8").strip())
+    assert rec["source"] == "jira"
+    assert rec["id"] == "ALPHA-1"
+    assert rec["account"] == JIRA_URL
+
+
+def test_jira_cli_sync_exits_nonzero_on_auth_error():
+    """Fix-4c: sync with JiraAuthError → non-zero exit; message on stderr; no token."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.verify_connection.side_effect = JiraAuthError(
+            "Jira authentication failed."
+        )
+        result = runner.invoke(app, ["jira", "sync", "ALPHA", "ALPHA-1"])
+    assert result.exit_code != 0
+    assert JIRA_TOKEN not in result.stderr
+    assert JIRA_TOKEN not in result.stdout
+
+
+# ── FIX 5: JSONL append + dedup ──
+
+def test_write_daily_jsonl_second_write_same_day_appends_not_overwrites(tmp_path):
+    """Fix-5a: two sequential writes on the same day → both batches present in the file."""
+    from connectonion.useful_tools.adapter import write_daily_jsonl, jira_issues_to_records
+    dest = tmp_path / "jira"
+    result1 = jira_issues_to_records([_I1], JIRA_URL)
+    write_daily_jsonl(result1.records, dest)
+    result2 = jira_issues_to_records([_I2], JIRA_URL)
+    write_daily_jsonl(result2.records, dest)
+
+    today = datetime.date.today()
+    jsonl_path = dest / "daily" / str(today.year) / f"{today.month:02d}" / f"{today.day:02d}.jsonl"
+    lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    ids = {json.loads(l)["id"] for l in lines}
+    assert ids == {"ALPHA-1", "ALPHA-2"}
+
+
+def test_write_daily_jsonl_deduplicates_same_record_within_day(tmp_path):
+    """Fix-5b: writing the same (source, account, id) twice → only one line in the file."""
+    from connectonion.useful_tools.adapter import write_daily_jsonl, jira_issues_to_records
+    dest = tmp_path / "jira"
+    result = jira_issues_to_records([_I1], JIRA_URL)
+    write_daily_jsonl(result.records, dest)
+    write_daily_jsonl(result.records, dest)  # same records again
+
+    today = datetime.date.today()
+    jsonl_path = dest / "daily" / str(today.year) / f"{today.month:02d}" / f"{today.day:02d}.jsonl"
+    lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+
+
+def test_write_daily_jsonl_deduplicates_within_single_batch(tmp_path):
+    """Fix-5c: two records with same (source, account, id) in one batch → only one written."""
+    from connectonion.useful_tools.adapter import write_daily_jsonl
+    dest = tmp_path / "jira"
+    dup_records = [
+        {"source": "jira", "account": JIRA_URL, "id": "ALPHA-1", "url": "u", "date": "2024"},
+        {"source": "jira", "account": JIRA_URL, "id": "ALPHA-1", "url": "u", "date": "2024"},
+    ]
+    write_daily_jsonl(dup_records, dest)
+    today = datetime.date.today()
+    jsonl_path = dest / "daily" / str(today.year) / f"{today.month:02d}" / f"{today.day:02d}.jsonl"
+    lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+
+
+def test_write_daily_jsonl_raises_on_corrupted_existing_file(tmp_path):
+    """Fix-3: existing JSONL with corrupt line → ValueError; no new data appended."""
+    from connectonion.useful_tools.adapter import write_daily_jsonl, jira_issues_to_records
+    dest = tmp_path / "jira"
+    today = datetime.date.today()
+    daily_dir = dest / "daily" / str(today.year) / f"{today.month:02d}"
+    daily_dir.mkdir(parents=True)
+    jsonl_path = daily_dir / f"{today.day:02d}.jsonl"
+    jsonl_path.write_text(
+        '{"source": "jira", "id": "ALPHA-1"}\nNOT_JSON\n', encoding="utf-8"
+    )
+    result = jira_issues_to_records([_I2], JIRA_URL)
+    with pytest.raises(ValueError) as exc_info:
+        write_daily_jsonl(result.records, dest)
+    assert "corrupted" in str(exc_info.value).lower()
+    # no new data appended — file still contains the original 2 lines
+    lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+
+
+# ── FIX 6: consume_jsonl_records disk reader ──
+
+def test_consume_jsonl_records_reads_from_two_source_dirs(tmp_path):
+    """Fix-6: consume_jsonl_records returns AdapterResult; reads Jira + OneNote from separate dirs."""
+    from connectonion.useful_tools.adapter import (
+        consume_jsonl_records, write_daily_jsonl,
+        jira_issues_to_records, onenote_pages_to_records,
+    )
+    jira_dir = tmp_path / "jira"
+    onenote_dir = tmp_path / "onenote"
+
+    jira_result = jira_issues_to_records([_I1, _I2], JIRA_URL)
+    onenote_result = onenote_pages_to_records([_ON1, _ON2], _ONENOTE_ACCOUNT)
+    write_daily_jsonl(jira_result.records, jira_dir)
+    write_daily_jsonl(onenote_result.records, onenote_dir)
+
+    result = consume_jsonl_records(jira_dir, onenote_dir)
+    assert len(result.records) == 4
+    sources = {r["source"] for r in result.records}
+    assert sources == {"jira", "onenote"}
+    assert result.errors == {}
+
+
+def test_consume_jsonl_records_missing_dir_is_silently_skipped(tmp_path):
+    """Fix-6b: a source_dir with no JSONL file for today → 0 records; no errors."""
+    from connectonion.useful_tools.adapter import consume_jsonl_records
+    nonexistent = tmp_path / "ghost"
+    result = consume_jsonl_records(nonexistent)
+    assert result.records == []
+    assert result.errors == {}
+
+
+def test_consume_jsonl_records_malformed_lines_reported_in_errors(tmp_path):
+    """Fix-6c: malformed JSON line → reported in result.errors; valid lines still returned."""
+    from connectonion.useful_tools.adapter import consume_jsonl_records
+    dest = tmp_path / "jira"
+    today = datetime.date.today()
+    daily_dir = dest / "daily" / str(today.year) / f"{today.month:02d}"
+    daily_dir.mkdir(parents=True)
+    jsonl_path = daily_dir / f"{today.day:02d}.jsonl"
+    jsonl_path.write_text(
+        '{"source": "jira", "id": "ALPHA-1"}\nNOT_VALID_JSON\n',
+        encoding="utf-8",
+    )
+    result = consume_jsonl_records(dest)
+    assert len(result.records) == 1
+    assert result.records[0]["id"] == "ALPHA-1"
+    assert len(result.errors) == 1
+    error_key = list(result.errors.keys())[0]
+    assert str(jsonl_path) in error_key
+
+
+# ── CLI JSON error-contract tests ──
+
+def test_jira_cli_projects_json_with_503_produces_valid_json_no_traceback():
+    """CLI-JSON-1: projects --json with 503 error → stdout is valid JSON; no traceback; no token."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.project_items.side_effect = ValueError(
+            "Jira is temporarily unavailable (HTTP 503). Try again in a few minutes."
+        )
+        result = runner.invoke(app, ["jira", "projects", "--json"])
+    assert result.exit_code != 0
+    payload = json.loads(result.stdout)
+    assert "error" in payload
+    assert "503" in payload["error"] or "unavailable" in payload["error"].lower()
+    assert "Traceback" not in result.stdout
+    assert JIRA_TOKEN not in result.stdout
+
+
+def test_jira_cli_sync_json_with_network_error_produces_valid_json_no_traceback():
+    """CLI-JSON-2: sync --json with network error → stdout is valid JSON; no traceback; no token."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    runner = CliRunner()
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.verify_connection.side_effect = ValueError(
+            "Could not reach Jira — check your network connection and try again."
+        )
+        result = runner.invoke(app, ["jira", "sync", "ALPHA", "ALPHA-1", "--json"])
+    assert result.exit_code != 0
+    payload = json.loads(result.stdout)
+    assert "error" in payload
+    assert "reach" in payload["error"].lower() or "network" in payload["error"].lower()
+    assert "Traceback" not in result.stdout
+    assert JIRA_TOKEN not in result.stdout

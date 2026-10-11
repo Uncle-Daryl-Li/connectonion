@@ -51,7 +51,9 @@ co onenote read "Sprint retro"            # read by exact title
 - **This integration is read-only.** Do not create, edit, or delete any
   OneNote page. If the user asks for a write operation, explain that the
   current `co rem` OneNote integration uses `Notes.Read` scope and cannot
-  write to OneNote.
+  write to OneNote. `co onenote create` may exist elsewhere in ConnectOnion,
+  but it is outside this integration's scope and must not be used for co rem
+  source collection.
 - **An unknown section number exits 1** and prints the listing token. Re-run
   `co onenote ls` to refresh section numbers.
 - **Pagination**: `pages` defaults to 20 results. Pass a specific section
