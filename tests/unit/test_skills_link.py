@@ -23,11 +23,12 @@ from connectonion.cli.commands.skills_commands import (
 
 
 @pytest.fixture
-def targets(tmp_path, monkeypatch):
-    """Point the link targets at a scratch home."""
-    roots = [("claude", tmp_path / ".claude" / "skills"), ("codex", tmp_path / ".codex" / "skills")]
-    monkeypatch.setattr(skills_commands, "LINK_TARGETS", roots)
-    return [root for _, root in roots]
+def targets():
+    """Both tools installed in the per-test HOME conftest provides."""
+    roots = [root for _, root in skills_commands.link_targets()]
+    for root in roots:
+        root.parent.mkdir()
+    return roots
 
 
 def bundled_names():
@@ -63,6 +64,16 @@ class TestSkillsLink:
                 linked = root / name
                 assert linked.exists(), f"{name} missing from {root}"
                 assert (linked / "SKILL.md").exists()
+
+    def test_brief_is_one_line_per_coding_agent_naming_what_it_kept(self, targets, capsys):
+        """co init uses brief: a row per skill pushed the useful lines off the screen."""
+        (targets[1] / bundled_names()[0]).mkdir(parents=True)          # one the user owns in codex
+        handle_skills_link(brief=True)
+        out = " ".join(capsys.readouterr().out.split())                  # rich wraps long paths
+        n = len(bundled_names())
+        assert out.startswith(f"✓ claude: {n} co skills in ")
+        assert f"✓ codex: {n - 1} co skills in " in out and f"1 of your own kept: {bundled_names()[0]}" in out
+        assert out.count("✓") == 2 and "Linking" not in out              # no per-skill table
 
     def test_is_idempotent(self, targets, capsys):
         handle_skills_link()
@@ -140,3 +151,13 @@ class TestCoBrowserSkillMatchesBehaviour:
     def test_points_agents_at_the_board_before_they_act(self):
         text = self._skill()
         assert "tab ls" in text
+
+
+def test_a_tool_that_is_not_installed_is_never_created(capsys):
+    """co init runs this; creating ~/.codex would make Codex look installed."""
+    claude = Path.home() / ".claude"
+    claude.mkdir()
+    handle_skills_link()
+    assert (claude / "skills" / "co-browser" / "SKILL.md").exists()
+    assert not (Path.home() / ".codex").exists()
+    assert "no .codex, skipped" in capsys.readouterr().out

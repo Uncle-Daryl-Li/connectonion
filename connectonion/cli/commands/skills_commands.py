@@ -455,10 +455,11 @@ def handle_skills_list():
 # Write direction: publish the skills bundled with ConnectOnion into the
 # agent tools that read them. SOURCES above is the read side; these are the
 # two targets that use the same <name>/SKILL.md layout.
-LINK_TARGETS = [
-    ("claude", Path.home() / ".claude" / "skills"),
-    ("codex", Path.home() / ".codex" / "skills"),
-]
+def link_targets():
+    """Resolved per call, not at import: a module-level Path.home() is whatever
+    HOME was when the module was first imported — under pytest, the real one."""
+    home = Path.home()
+    return [("claude", home / ".claude" / "skills"), ("codex", home / ".codex" / "skills")]
 
 BUNDLED_SKILLS = Path(__file__).parent.parent.parent / "useful_skills"
 
@@ -489,8 +490,11 @@ def _link_one(source: Path, target: Path, force: bool) -> str:
     return "linked"
 
 
-def handle_skills_link(force: bool = False):
-    """Link the bundled ConnectOnion skills into ~/.claude/skills and ~/.codex/skills."""
+def handle_skills_link(force: bool = False, brief: bool = False):
+    """Link the bundled ConnectOnion skills into ~/.claude/skills and ~/.codex/skills.
+
+    `brief` (co init) prints one line per coding agent instead of a row per skill.
+    """
     skills = sorted(d for d in BUNDLED_SKILLS.iterdir() if d.is_dir() and (d / "SKILL.md").exists())
     if not skills:
         console.print("[dim]No bundled skills found.[/dim]")
@@ -498,15 +502,30 @@ def handle_skills_link(force: bool = False):
 
     table = Table(title=f"Linking {len(skills)} bundled skill(s)")
     table.add_column("Skill", style="cyan")
-    for name, _ in LINK_TARGETS:
+    roots = link_targets()
+    for name, _ in roots:
         table.add_column(name)
 
+    skipped = {name: [] for name, _ in roots}
     for skill in skills:
         row = [skill.name]
-        for _, root in LINK_TARGETS:
+        for name, root in roots:
+            # A tool that is not installed gets nothing: creating ~/.codex
+            # would make every later check believe Codex is here.
+            if not root.parent.is_dir():
+                row.append(f"no {root.parent.name}, skipped")
+                continue
             row.append(_link_one(skill, root / skill.name, force))
+            if row[-1].endswith("skipped"):
+                skipped[name].append(skill.name)
         table.add_row(*row)
 
+    if brief:
+        for name, root in roots:
+            if root.parent.is_dir():
+                own = f" ({len(skipped[name])} of your own kept: {', '.join(skipped[name])})" if skipped[name] else ""
+                console.print(f"[green]✓[/green] {name}: {len(skills) - len(skipped[name])} co skills in {root}{own}")
+        return
     console.print()
     console.print(table)
     console.print(

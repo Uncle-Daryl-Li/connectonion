@@ -39,11 +39,25 @@ def test_plist_runs_scheduled_daily_with_a_path_that_can_find_codex(tmp_path, mo
     config["schedule"]["timezone"] = "Australia/Sydney"
     plist = plistlib.loads(scheduler.render(root, config).encode())
     assert plist["Label"] == label_for(root)
-    assert plist["ProgramArguments"] == ["/venv/bin/co",
+    assert plist["ProgramArguments"] == ["/usr/bin/caffeinate", "-i", "/venv/bin/co",
                                          "rem", "--root", str(root), "sync", "--scheduled"]
     assert "/opt/codex/bin" in plist["EnvironmentVariables"]["PATH"]
     assert "/venv/bin" in plist["EnvironmentVariables"]["PATH"]
     assert plist["StandardErrorPath"].startswith(str(root / ".state"))
+
+
+def test_the_job_holds_the_mac_awake_while_it_runs(tmp_path, monkeypatch):
+    """2026-10-10: a one-page investigation started at 22:19 on a Mac that went
+    to 'Maintenance Sleep' at 22:31; it advanced only in the 45-second dark
+    wakes each hour, the monotonic deadlines (co ai --timeout, subprocess
+    timeout) paused with the clock, and the run read 'running' 80 minutes
+    later with three stages done. A 03:00 slot on a sleeping laptop is the
+    same run. `caffeinate -i` keeps idle sleep off for exactly as long as the
+    job's process lives, and nothing longer."""
+    scheduler, _ = make(tmp_path, monkeypatch)
+    plist = plistlib.loads(scheduler.render(tmp_path / "rem", default_config()).encode())
+    assert plist["ProgramArguments"][:2] == ["/usr/bin/caffeinate", "-i"]
+    assert "--scheduled" in plist["ProgramArguments"]
 
 
 def test_install_writes_a_private_plist_and_bootstraps_it_once(tmp_path, monkeypatch):
@@ -131,14 +145,20 @@ def test_unsupported_platform_says_how_to_run_by_hand(tmp_path):
         Unsupported().install(tmp_path, default_config())
 
 
-def test_job_ticks_on_an_interval_and_never_relies_on_calendar_triggers(tmp_path, monkeypatch):
-    """Measured 2026-09-07 on macOS 26: StartCalendarInterval (array or dict form) never fired
-    in three experiments; StartInterval fired every time to the second. The clock is ours."""
+def test_job_ticks_on_an_interval_and_on_the_clock(tmp_path, monkeypatch):
+    """Each trigger was measured dead on one macOS. 2026-09-07, macOS 26:
+    StartCalendarInterval never fired in three experiments, StartInterval to
+    the second. 2026-10-11, macOS 14.1: the installed job showed runs = 0 a day
+    after install, and a 60 s StartInterval test job ran 0 times in 4 minutes,
+    while a calendar job bootstrapped the same way ran every minute. The job
+    carries both; a tick that finds nothing due exits at once."""
     from connectonion.rem.schedule import TICK_SECONDS
     scheduler, _ = make(tmp_path, monkeypatch)
     plist = plistlib.loads(scheduler.render(tmp_path / "rem", default_config()).encode())
     assert plist["StartInterval"] == TICK_SECONDS and 60 <= TICK_SECONDS <= 600
-    assert "StartCalendarInterval" not in plist
+    minutes = [entry["Minute"] for entry in plist["StartCalendarInterval"]]
+    assert minutes == list(range(0, 60, TICK_SECONDS // 60))
+    assert all(set(entry) == {"Minute"} for entry in plist["StartCalendarInterval"])
     assert plist["RunAtLoad"] is False  # the first tick catches up; no batch races the foreground one
     assert plist["ProgramArguments"][-2:] == ["sync", "--scheduled"]
 
@@ -152,8 +172,8 @@ def test_the_job_runs_the_installation_that_installed_it_not_the_first_co_on_pat
     scheduler = Launchd(agents_dir=tmp_path / "LaunchAgents", uid=501, run=Calls())
     root = tmp_path / "rem"
     plist = plistlib.loads(scheduler.render(root, default_config()).encode())
-    assert plist["ProgramArguments"] == ["/work/venv/bin/python", "-m", "connectonion.cli.main",
-                                         "rem", "--root", str(root), "sync", "--scheduled"]
+    assert plist["ProgramArguments"] == ["/usr/bin/caffeinate", "-i", "/work/venv/bin/python", "-m",
+                                         "connectonion.cli.main", "rem", "--root", str(root), "sync", "--scheduled"]
     assert plist["EnvironmentVariables"]["PATH"].startswith("/work/venv/bin:")
 
 

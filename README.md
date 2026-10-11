@@ -135,8 +135,10 @@ requires **macOS**. Then run:
 
 ```bash
 pip install --upgrade 'connectonion==1.9.1'
-co rem init                # build your map and first pages; approve nightly upkeep when prompted
-co rem open                # read the local notebook
+# build your map and first pages; approve nightly upkeep when prompted
+co rem init
+# read the local notebook
+co rem open
 ```
 
 Pages stay in `~/.co/rem`. Selected source content is sent to the configured
@@ -146,13 +148,34 @@ For access from another device, `co rem open --live` opens your online
 
 ## Install and start
 
+One line installs `co` and sets it up: your agent identity, an OpenOnion key
+with starter credit, and the skills and command index that tell Codex and
+Claude Code about `co`.
+
 ```bash
-pip install connectonion   # Python 3.10+
-co init                    # your identity and ~/.co/keys.env
-co auth microsoft          # or: co auth google
-co outlook                 # or: co gmail
-co commands                # everything else; add --help to any
+curl -fsSL https://raw.githubusercontent.com/openonion/connectonion/main/install.sh | sh
 ```
+
+It uses [uv](https://docs.astral.sh/uv/) (installing it if needed) to keep `co`
+out of your system Python, so you need no Python of your own. Then connect what
+you use:
+
+```bash
+co auth google      # Gmail and Google Calendar
+co auth microsoft   # Outlook
+co commands         # everything else; add --help to any
+```
+
+<details>
+<summary>With pip instead</summary>
+
+```bash
+# Python 3.10+
+pip install connectonion
+co init
+```
+
+</details>
 
 The [Quick start guide](docs/quickstart.md) covers Google, the browser, chat
 apps and project settings.
@@ -195,8 +218,10 @@ a line in its shell, and the output of one is the input of the next.
   the agent did, and run it yourself.
 
 ```console
-$ co                       # every command group
-$ co linear --help         # what it does, what it changes, an example
+# every command group
+$ co
+# what it does, what it changes, an example
+$ co linear --help
 $ co linear issues -n 3
 3 open issues
 CON-3  Todo  No priority  -  2026-10-01  Import your data

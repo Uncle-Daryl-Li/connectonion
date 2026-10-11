@@ -256,10 +256,12 @@ Back:     co rem --help
 ```
 Print one page as Markdown. Read-only.
 
-Usage:    co rem show PAGE
+Usage:    co rem show PAGE | PERSON
 Example:  co rem show people/tamara-berryman-324b6af6e8.md
           co rem show me   (your own page)
+          co rem show "Tamara Berryman"   (a person's name, alias or email)
 Inputs:   PAGE comes from list, search, or the Next line of investigate.
+          A PERSON naming several pages lists them and shows none.
 Next:     co rem investigate PAGE   (if it still says Unknown)
 Back:     co rem --help
 ```
@@ -391,8 +393,8 @@ starts a run on your mail or sessions.
 
 Usage:    co rem config
           co rem config set KEY VALUE [KEY VALUE]... [--no-check]
-Keys:     model                          claude-sonnet-5-5 (default); a new one is checked on a fixture page
-          runner                         claude-code (default) | codex | coai
+Keys:     model                          gpt-6-luna (default); a new one is checked on a fixture page
+          runner                         codex (default; claude-code when Codex cannot run) | claude-code | coai
           schedule.times                 "03:00,17:00"
           schedule.timezone              Australia/Sydney
           limits.runner_calls_per_day    6

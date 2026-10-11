@@ -400,14 +400,27 @@ Stable remains 1.8.3; this does not authorize final 1.8.4 or cloud provisioning.
 See [1.8.4a2 notes](docs/releases/1.8.4a2.md) and the
 [local acceptance record](docs/acceptance/1.8.4-live-followup/README.md).
 
-## Current Version: 1.9.2b1
+## Current Version: 1.9.2b10
 
-1.9.2b1 is a 1.9.2 beta; stable remains 1.9.1. Each investigation pass may
-delete as well as add: the round, final-round and edit prompts treat the page
-like code, the final round keeps at most five Uncertainties, and a number the
-source gives as someone else's stays out of a Person's Facts. See
-[1.9.2b1 notes](docs/releases/1.9.2b1.md).
+1.9.2b10 is a 1.9.2 beta; stable remains 1.9.1. The `co handoff` mail reads
+like a mail on any screen: who handed you what, the task, where it stands and
+the open questions first, then the block for Codex or Claude Code in a box that
+wraps. Its install step asks for a version that exists (1.9.2b10 or newer, never
+the sender's own build) and installs co in its own environment, never the
+global Python. `co email send` keeps a plain-text body's paragraphs. One
+line installs co (`curl … install.sh | sh`), and an accepted handoff makes
+each side the other's agent contact. See
+[1.9.2b10 notes](docs/releases/1.9.2b10.md).
 
+- 1.9.2b10 (A handoff mail you can read on a phone).
+- 1.9.2b9 (Use the connectors Codex already has).
+- 1.9.2b8 (Paste one prompt to take over a handoff).
+- 1.9.2b7 (A first run that does not trip over itself).
+- 1.9.2b6 (The second pass goes deeper).
+- 1.9.2b5 (Hand a session to someone else's agent).
+- 1.9.2b4 (Hand work to someone else).
+- 1.9.2b3 (A first run you can read straight away).
+- 1.9.2b2 (A first run that loses fewer pages; built, not published).
 - 1.9.2b1 (Each pass improves the page, not only grows it).
 
 ## Stable release: 1.9.1

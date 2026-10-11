@@ -230,7 +230,7 @@ def init(
     description: Optional[str] = typer.Option(None, "--description", help="Description for custom template"),
     force: bool = typer.Option(False, "--force", help="Overwrite existing files"),
 ):
-    """Initialize global ~/.co/keys.env, or use co init ./ for a project. Creates your keypair and writes keys.env."""
+    """Initialize global ~/.co/keys.env, or use co init ./ for a project. Creates your keypair and writes keys.env; the global run also links co's skills and writes its command index into ~/.codex/AGENTS.md and ~/.claude/CLAUDE.md (see co skills index)."""
     from .commands.init import handle_global_init, handle_init
     if path is None:
         from ..environment import explicit_env_file
@@ -1274,7 +1274,7 @@ def wiki_renamed(ctx: typer.Context):
 # Skills command group
 skills_app = _typer_app(help=(
     "Your own SKILL.md files: discover them in ~/.claude, ~/.codex, ~/.cursor and ~/.kiro, copy, list "
-    "and link them. Another person's published skills come from co sub instead. "
+    "and link them, and index co's commands for Codex and Claude Code. Another person's published skills come from co sub instead. "
     "This group does not author or benchmark them.\n\n"
     "Project skills live in .co/skills/<name>/SKILL.md. Creating or improving a skill? "
     "Define its test cases first: co benchmark --help. Then write SKILL.md and score it: co eval --help.\n\n"
@@ -1341,6 +1341,15 @@ def skills_link(
     """Link ConnectOnion's bundled skills into Claude Code and Codex. Creates symlinks in ~/.claude/skills and ~/.codex/skills."""
     from .commands.skills_commands import handle_skills_link
     handle_skills_link(force=force)
+
+
+@skills_app.command("index", epilog="Example:  co skills index  |  co skills index --remove")
+def skills_index(
+    remove: bool = typer.Option(False, "--remove", help="Take the block out instead of writing it"),
+):
+    """Tell Codex and Claude Code that co exists: a generated list of every co command. Writes it into ~/.codex/AGENTS.md and ~/.claude/CLAUDE.md, between <!-- co:begin --> and <!-- co:end --> only, and only for a tool whose directory exists; --remove Removes it. co init and every agent start keep it current."""
+    from .commands.agent_index import handle_skills_index
+    handle_skills_index(remove_block=remove)
 
 
 # Trust command group
@@ -1510,6 +1519,12 @@ email_app = _typer_app(
     epilog="Example:  co email inbox --unread",
 )
 app.add_typer(email_app, name="email")
+
+# Experimental (#2351): hand a coding-agent task to another person's agent.
+from .commands.handoff_commands import make_handoff_app
+
+app.add_typer(make_handoff_app(_typer_app), name="handoff",
+              short_help="Experimental: hand a task from your Codex/Claude Code session to another person's agent.")
 
 
 @email_app.callback(invoke_without_command=True)
@@ -2461,6 +2476,9 @@ app.add_typer(linear_app, name="linear")
 # Canny feedback boards (#2050): our own commands on Canny's REST API.
 from .commands.canny_commands import canny_app
 app.add_typer(canny_app, name="canny")
+# MCP (#2048): the servers and account connectors Codex already has, called without a model turn.
+from .commands.mcp_commands import mcp_app
+app.add_typer(mcp_app, name="mcp")
 
 
 # OneNote (#1887): the notebooks `co auth microsoft` grants since 1.8.9.

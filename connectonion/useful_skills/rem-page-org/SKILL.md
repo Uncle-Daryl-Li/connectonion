@@ -5,8 +5,6 @@ description: What an organisation's page in the notebook is made of — the fixe
 
 # An organisation's page
 
-Why these rules: docs/rem-skills/rem-page-org.md
-
 Facts of the entity (programme, agreement, fees, legal entity, who the user
 deals with) go here, not on the sender's page.
 
@@ -23,9 +21,8 @@ Create one only when **either** is true:
 Otherwise the company stays a `Company:` field on the person's page. A mailbox
 provider (`gmail.com`) is never an organisation.
 
-`co rem scan orgs --days 180` lists domains passing the first test, with
-`people`, `two_way`, `notices` and `mails` per row. It proposes; you judge.
-`two_way` (people there who both wrote to the user and were written back to)
+`co rem scan orgs --days 180` proposes domains passing the first test; you
+judge. Its `two_way` (people who wrote to the user and were answered)
 separates a counterparty from a vendor; read it against the names.
 
 - **Brand names that only ever send are a vendor**, whatever the headcount
@@ -87,6 +84,10 @@ Unknown — historical requests alone do not establish a current obligation. [2]
 
 ## Rules
 
+- **The heading is the organisation's name.** A page mapped under its domain
+  (`# rmit.edu.au`) is renamed to the name the material uses
+  (`# RMIT University`); the domain stays under `Domains`.
+- **One voice**: the owner is `the user`, never their name, `you` or `we`.
 - **`Facts` is data**: those seven labels, one line each, every one present,
   a missing value exactly `Unknown`, every value cited, dates `YYYY-MM-DD`.
 - **`People here` is links, never copies.** A sentence true of the person and

@@ -223,6 +223,15 @@ NEXT = {
     "co email share": HANDLER,
     "co email unshare": "See remaining grants:  co email share --list",
     "co email upgrade": "See the new balance:  co status",
+    "co handoff send": HANDLER,
+    "co handoff status": HANDLER,
+    "co handoff contact": HANDLER,
+    "co handoff inbox": HANDLER,
+    "co handoff show": HANDLER,
+    "co handoff open": HANDLER,
+    "co handoff accept": HANDLER,
+    "co handoff ask": HANDLER,
+    "co handoff answer": HANDLER,
     "co env *": HANDLER,  # path/get intentionally remain bare values
     "co schedule list": "co schedule run <name>",
     "co schedule check": "co schedule list",
@@ -238,6 +247,9 @@ NEXT = {
     "co gdrive *": HANDLER,
     "co gmail *": HANDLER,
     # Each co linear handler names the next command from what it found (#2049).
+    "co mcp ls": HANDLER,            # names co mcp tools <server>
+    "co mcp tools": HANDLER,         # names co mcp call <server> <tool>
+    "co mcp call": HANDLER,          # the tool's data is the output; a preview names --yes
     "co linear issues": HANDLER,
     "co linear issue": HANDLER,
     "co linear search": HANDLER,
@@ -279,6 +291,7 @@ NEXT = {
     "co skills manifest": "Preview what would be published:  co announce --dry-run",
     "co skills list": "Link them into Claude Code and Codex:  co skills link",
     "co skills link": "What is linked now:  co skills list",
+    "co skills index": HANDLER,   # Next: co doctor, or co skills index after --remove
     "co sms pair": "Read what the phone uploads:  co sms inbox",
     "co sms inbox": "See paired phones:  co sms devices",
     "co sms devices revoke": "See remaining phones:  co sms devices",
