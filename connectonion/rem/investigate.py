@@ -19,15 +19,15 @@ from pathlib import Path
 
 from .config import read_config
 from ..provider_credentials import ProviderCredentialError
-from .files import SECRET_SHAPES, Notebook, RemError, is_address, maintenance_lock, read_json, state_path, write_json
+from .files import WRITE_WAIT_SECONDS, SECRET_SHAPES, Notebook, RemError, is_address, maintenance_lock, read_json, state_path, write_json
 from .mail import _address, _list_all, correspondent, on_domains, participants, RELATED_ORG_SCOPE, strip_noise, strip_quoted
 from .source import KINDS, collect, timestamp
 
 MAIL_KINDS = ("outlook", "gmail")
 # Shared by every page in flight, one pool per mailbox: Gmail takes many
-# concurrent reads; Microsoft Graph throttles a mailbox much sooner. One shared
+# concurrent reads; Microsoft Graph allows four per mailbox (8 drew HTTP 429). One shared
 # 10 left half of a 10-page init waiting on mail (2026-10-08).
-MAIL_FETCH_SLOTS = {"gmail": threading.BoundedSemaphore(20), "outlook": threading.BoundedSemaphore(8)}
+MAIL_FETCH_SLOTS = {"gmail": threading.BoundedSemaphore(20), "outlook": threading.BoundedSemaphore(4)}
 
 
 def _fetch_slot(kind: str):
@@ -388,7 +388,7 @@ def _newest_session(root: Path, record: str, page: str) -> str:
     return max([*seen, str(page_state(root, record).get("last_activity") or "")[:10]])
 
 
-def _patient(call, *args, attempts: int = 4):
+def _patient(call, *args, attempts: int = 5):
     """One transient timeout must not end a ten-minute gather.
 
     The owner's first investigation died on the 300th body fetch with a
@@ -402,14 +402,24 @@ def _patient(call, *args, attempts: int = 4):
             return call(*args)
         except Exception as error:  # noqa: BLE001 -- the providers raise their own timeout types
             name = type(error).__name__.lower()
-            transient = any(part in name for part in ("timeout", "connecterror", "connectionerror")) \
+            # Graph's HTTP 429 lost UNSW's page on a 16-worker init (2026-10-08): throttling waits, it does not fail.
+            throttled = getattr(error, "status", None) == 429 or "HTTP 429" in str(error)
+            transient = throttled or any(part in name for part in ("timeout", "connecterror", "connectionerror")) \
                 or "timed out" in str(error).lower()
             if not transient or attempt == attempts - 1:
                 raise
-            time.sleep(2 ** attempt)
+            time.sleep(2 ** attempt * (5 if throttled else 1))
 
 
-def _mail_body(client, message_id: str, kind: str = "") -> str:
+def _mail_body(client, message_id: str, kind: str = "", root: Path | None = None) -> str:
+    if root is not None:
+        # Already kept (the first-run archive, or a background backfill): read
+        # it from disk instead of asking the provider again.
+        from .mail_archive import message_path, observed_message_path
+        for path in (message_path(root, kind, message_id), observed_message_path(root, kind, message_id)):
+            body = read_json(path, {}).get("body") if path.is_file() else None
+            if isinstance(body, str):
+                return body
     with _fetch_slot(kind):
         return _patient(client.get_email_body, message_id)
 
@@ -646,7 +656,8 @@ def gather(subject: str, handles: list[str], *, days: int, clients: dict, subscr
             searched += ", kept the owner's own sent mail"
         mail_to_read = sorted(hit, key=lambda r: str(r["date"]))
         with ThreadPoolExecutor(max_workers=min(len(mail_to_read) or 1, 20)) as pool:
-            bodies = pool.map(partial(_mail_body, client, kind=kind), (row["id"] for row in mail_to_read))
+            bodies = pool.map(partial(_mail_body, client, kind=kind, root=archive_root),
+                              (row["id"] for row in mail_to_read))
             for number, (r, body) in enumerate(zip(mail_to_read, bodies), 1):
                 provenance = {}
                 if archive_root is not None:
@@ -821,12 +832,33 @@ def _window_items(read, scoped: dict, label: str, stage_progress=None,
 
 
 SESSION_WINDOW_VERSION = 1  # Bump when source.collect changes which messages it accepts.
+# A first run is hours long; re-verifying every rollout each ten minutes held all
+# its workers behind one three-minute scan. Half an hour stale is fine for it.
+SESSION_MEMO_SECONDS = 1800
+SESSION_WIDEST_DAYS = 730  # the longest window a first run asks of coding sessions
 
 
 def _session_window(scoped: dict, label: str, stage_progress, root: Path) -> tuple[list[dict], int]:
-    """Reuse typed session messages across CLI runs; collect reads only changed files."""
+    """Reuse typed session messages across CLI runs; collect reads only changed files.
+
+    Within one run the window is kept in memory for SESSION_MEMO_SECONDS: even
+    unchanged, collect re-hashes every rollout's prefix to catch a rewrite, about
+    three minutes on the owner's Mac, and each of a 16-worker init's people paid
+    it in turn under the lock (1.9.1b3: 350 of a 363-second gather).
+    """
     identity = json.dumps({key: value for key, value in scoped.items() if key != "since"},
                           sort_keys=True, default=str)
+    memo = ("session-window", str(root), identity)
+    kept = _WINDOWS.get(memo)
+    if kept and time.monotonic() - kept[0] < SESSION_MEMO_SECONDS and kept[1] <= timestamp(scoped["since"]):
+        since = timestamp(scoped["since"])
+        return [item for item in kept[2] if timestamp(item["timestamp"]) >= since], kept[3]
+    # Built once over the widest window any page asks for: a 180-day person and a
+    # 730-day org alternating each threw the other's window away and re-scanned
+    # behind the lock (1.9.1b4 first run, people stuck 400+ seconds).
+    requested = timestamp(scoped["since"])
+    widest = min(requested, datetime.now(timezone.utc) - timedelta(days=SESSION_WIDEST_DAYS))
+    scoped = {**scoped, "since": widest.isoformat()}
     cache_path = state_path(root, f"session-windows/{hashlib.sha256(identity.encode()).hexdigest()[:16]}.json")
     saved = read_json(cache_path, {})
     since = timestamp(scoped["since"])
@@ -849,8 +881,9 @@ def _session_window(scoped: dict, label: str, stage_progress, root: Path) -> tup
         cursor = batch.progress
     if saved["progress"] != cursor or not cache_path.is_file():
         write_json(cache_path, {**saved, "items": items, "progress": cursor, "unfamiliar": unfamiliar})
-    if timestamp(saved["since"]) < since:
-        items = [item for item in items if timestamp(item["timestamp"]) >= since]
+    _WINDOWS[memo] = (time.monotonic(), timestamp(saved["since"]), items, unfamiliar)
+    if timestamp(saved["since"]) < requested:
+        items = [item for item in items if timestamp(item["timestamp"]) >= requested]
     return items, unfamiliar
 
 
@@ -1005,16 +1038,17 @@ def evidence_rounds(items: list[dict], room_bytes: int) -> list[list[dict]]:
 
 
 ROUND_NOTE = ("Round {number} of {total}: part {number} of the material, dated {first} to {last}, every item "
-              "in full. Read all of it. Edit the page with what this part adds: new facts, how threads ended, "
-              "decisions, corrections. Keep what earlier rounds established unless this part contradicts it. "
-              "Then follow the leads it raises.")
+              "in full. Read all of it. Improve the page with it, as you would improve code: add new facts, how "
+              "threads ended and decisions; change what it corrects; delete what it supersedes, repeats or settles. "
+              "The page should get better, not only longer. Then follow the leads it raises.")
 SYNTHESIS_NOTE = ("Final round: all {total} parts of the material have been read in earlier rounds; nothing new "
-                  "is supplied. Re-read the page whole and make it one account: Insight says what matters now; "
-                  "History has one line per thread -- date, what it was about, how it ended; Open threads keeps "
-                  "only what is still open; decisions name what was chosen and why. Keep every thread the "
-                  "rounds recorded in History; fold only the oldest by year. For a thread whose outcome is "
-                  "not established, request a mail search for the reply before writing so. Keep every cited "
-                  "fact you keep with its citation; add no claim without a citation on the page or from a search.")
+                  "is supplied. Edit the page whole into one account, as an editor would: delete repetition, "
+                  "superseded statements and doubts that do not change what the user does next; merge what "
+                  "is said twice. Insight says what matters now; History has one line per thread -- date, what "
+                  "it was about, how it ended; Open threads keeps only what is still open; Uncertainties keeps at "
+                  "most five, each one that would change the next step. For a thread whose outcome is not "
+                  "established, request a mail search for the reply before writing so. Keep each cited fact you "
+                  "keep with its citation; add no claim without a citation on the page or from a search.")
 
 
 def _round_room(record: str, owner: bool, fixed: list[dict]) -> int:
@@ -1255,7 +1289,8 @@ def _mail_comparison(root, record, handles, items, fresh, cited, subscriptions, 
 def investigate(root: Path, record: str, subject: str, handles: list[str], *, days: int,
                 clients: dict, subscriptions: dict, runner=None, extractor=None, progress=None, max_calls=None,
                 sent_only: bool = False, mail_skipped: str = "", stage_progress=None,
-                quick: bool = False, retry_refused: bool = False, website=None) -> dict:
+                quick: bool = False, retry_refused: bool = False, website=None,
+                fetch_attachments: bool = True) -> dict:
     """Fill the page's gaps from everything gathered; the page itself is the first input."""
     notebook = Notebook(root)
     if not notebook.path(record).is_file():
@@ -1271,7 +1306,7 @@ def investigate(root: Path, record: str, subject: str, handles: list[str], *, da
     own_domains = (related["domains"] or org_domains(notebook.read(record))) if record.startswith("orgs/") else []
     search_handles = list(dict.fromkeys([*handles, *own_domains, *related["addresses"]]))
     items, coverage = gather(subject, search_handles, days=days, clients=clients, subscriptions=subscriptions,
-                             progress=progress, attachments_dir=root / ".state" / "attachments",
+                             progress=progress, attachments_dir=root / ".state" / "attachments" if fetch_attachments else None,
                              sent_only=sent_only, mail_skipped=mail_skipped, stage_progress=stage_progress,
                              quick=quick, archive_root=root, record=record)
     if own_domains and not quick:
@@ -1612,7 +1647,7 @@ def record_result(root, notebook, record: str, review_candidates: list, searched
     It waits for the lock: the model turn is already paid for, and with several
     pages in flight (the first run writes four at once) two finish together.
     """
-    with maintenance_lock(root, wait=60):
+    with maintenance_lock(root, wait=WRITE_WAIT_SECONDS):
         from .reviews import ingest
         ingest(root, review_candidates)
         if changed:

@@ -400,7 +400,78 @@ Stable remains 1.8.3; this does not authorize final 1.8.4 or cloud provisioning.
 See [1.8.4a2 notes](docs/releases/1.8.4a2.md) and the
 [local acceptance record](docs/acceptance/1.8.4-live-followup/README.md).
 
-## Current Version: 1.9.1b1
+## Current Version: 1.9.2b1
+
+1.9.2b1 is a 1.9.2 beta; stable remains 1.9.1. Each investigation pass may
+delete as well as add: the round, final-round and edit prompts treat the page
+like code, the final round keeps at most five Uncertainties, and a number the
+source gives as someone else's stays out of a Person's Facts. See
+[1.9.2b1 notes](docs/releases/1.9.2b1.md).
+
+- 1.9.2b1 (Each pass improves the page, not only grows it).
+
+## Stable release: 1.9.1
+
+Stable 1.9.1 makes co rem's first run investigate rather than skim. It reads
+180 days of mail sixteen pages at a time, fetches two years in the background
+and deepens every person with older material, works through large evidence in
+rounds that edit the page in place, and ends with decisions and principles.
+Person pages lead with contact facts, cited mail opens as a message, and cited
+documents open from the page. The public 1.9.1rc1 wheel ran a full 180-day
+first run on the owner's real mail in 133 minutes with no lock-wait failures;
+six of 338 investigations did not land (five review refusals, one network
+timeout). See [1.9.1 notes](docs/releases/1.9.1.md).
+
+- 1.9.1 (A first run that investigates, deepens and edits in place).
+
+## Previous preview: 1.9.1rc1
+
+1.9.1rc1 is the 1.9.1 release candidate; stable remains 1.9.0. After the 1.9.1b5
+real first run (all 280 pages in 82 minutes, 55 people deepened, 5 decisions and
+a principle), writes of finished work wait up to ten minutes for the notebook
+lock and token refreshes two minutes for the credential file. See
+[1.9.1rc1 notes](docs/releases/1.9.1rc1.md).
+
+- 1.9.1rc1 (Locks that wait long enough for sixteen workers).
+
+## Previous preview: 1.9.1b5
+
+1.9.1b5 is a 1.9.1 beta; stable remains 1.9.0. A first run builds its coding-
+session window once over two years and every page filters it by date, instead
+of rescanning whenever a wider window is asked for; the background backfill
+reads mail only. See [1.9.1b5 notes](docs/releases/1.9.1b5.md).
+
+- 1.9.1b5 (One session scan per run, whatever the window).
+
+## Previous preview: 1.9.1b4
+
+1.9.1b4 is a 1.9.1 beta; stable remains 1.9.0. A first run scans the local
+coding-session window once and shares it across people for half an hour,
+instead of re-hashing every transcript for each person behind a lock. See
+[1.9.1b4 notes](docs/releases/1.9.1b4.md).
+
+- 1.9.1b4 (Coding sessions scanned once per run).
+
+## Previous preview: 1.9.1b3
+
+1.9.1b3 is a 1.9.1 beta; stable remains 1.9.0. The first pass reads no
+attachments (the background backfill fetches and counts them for the deepening
+pass), HTTP 429 backs off and retries, and Outlook is read four messages at a
+time. See [1.9.1b3 notes](docs/releases/1.9.1b3.md).
+
+- 1.9.1b3 (No network for people in the first pass; throttling waits).
+
+## Previous preview: 1.9.1b2
+
+1.9.1b2 is a 1.9.1 beta; stable remains 1.9.0. The first run's first pass reads
+each person's mapped window from disk while four background workers fetch the
+rest of two years into the archive; people with older mail are then deepened
+from disk. The project writer drops an untraceable citation's lines instead of
+refusing the page. See [1.9.1b2 notes](docs/releases/1.9.1b2.md).
+
+- 1.9.1b2 (Local-first first pass, background two-year backfill, deepening; project writer keeps pages).
+
+## Previous preview: 1.9.1b1
 
 1.9.1b1 is the first 1.9.1 beta; stable remains 1.9.0. After the 1.9.1a2 real
 180-day first run (84 of 84 people, 14 of 20 projects, every project refusal one

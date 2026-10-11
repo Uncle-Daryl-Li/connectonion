@@ -1615,6 +1615,7 @@ def test_scoped_sessions_reuse_disk_window_and_find_new_input(tmp_path, monkeypa
     assert {item["text"] for item in first} == {"Vern's earlier decision", "Vern's current decision"}
     assert len(reads) == 2
 
+    inv._WINDOWS.clear()  # each gather below is a later CLI run; the in-run memo is per process
     recent, _ = inv.gather("Vern", ["Vern"], days=1, clients={}, subscriptions=subs,
                            archive_root=notebook)
     assert [item["text"] for item in recent] == ["Vern's current decision"]
@@ -1623,6 +1624,7 @@ def test_scoped_sessions_reuse_disk_window_and_find_new_input(tmp_path, monkeypa
     with current.open("a") as output:
         output.write(json.dumps({"type": "response_item", "timestamp": now.isoformat(), "payload": {
             "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Vern's new input"}]}}) + "\n")
+    inv._WINDOWS.clear()
     updated, _ = inv.gather("Vern", ["Vern"], days=1, clients={}, subscriptions=subs,
                             archive_root=notebook)
     assert {item["text"] for item in updated} == {"Vern's current decision", "Vern's new input"}
@@ -1631,6 +1633,7 @@ def test_scoped_sessions_reuse_disk_window_and_find_new_input(tmp_path, monkeypa
 
     added = sessions / "rollout-added.jsonl"
     rollout(added, now, "Vern's separate new session")
+    inv._WINDOWS.clear()
     with_new_file, _ = inv.gather("Vern", ["Vern"], days=1, clients={}, subscriptions=subs,
                                   archive_root=notebook)
     assert {item["text"] for item in with_new_file} == {
@@ -1638,6 +1641,7 @@ def test_scoped_sessions_reuse_disk_window_and_find_new_input(tmp_path, monkeypa
     assert reads == [old, current, current, added]
 
     old.unlink()
+    inv._WINDOWS.clear()
     after_deletion, _ = inv.gather("Vern", ["Vern"], days=10, clients={}, subscriptions=subs,
                                    archive_root=notebook)
     assert {item["text"] for item in after_deletion} == {item["text"] for item in with_new_file}
@@ -1916,3 +1920,86 @@ def test_an_organisation_is_enriched_from_its_own_site_and_a_dead_site_is_a_note
     assert [i["source"] for i in items] == ["https://fernhill.io/", "https://fernhill.io/about"]
     assert "Founded in Wellington" in items[1]["text"] and items[0]["role"] == "website"
     assert any("gone.example" in line and "could not be read" in line for line in coverage)
+
+
+def test_a_kept_mail_body_is_read_from_disk_not_fetched_again(tmp_path):
+    """A background backfill keeps older mail; the deepening pass must not ask
+    the provider for the same bodies again (2026-10-08)."""
+    from connectonion.rem.mail_archive import retain_message
+
+    class Mail:
+        calls = 0
+
+        def get_email_body(self, message_id):
+            Mail.calls += 1
+            return "--- Email Body ---\nfresh"
+
+    retain_message(tmp_path, "gmail", {"id": "m1", "date": "2025-01-02", "from": "a@x.y"},
+                   "--- Email Body ---\nkept", fetched_at="2026-10-08T00:00:00Z")
+    assert "kept" in inv._mail_body(Mail(), "m1", kind="gmail", root=tmp_path) and Mail.calls == 0
+    assert "fresh" in inv._mail_body(Mail(), "m2", kind="gmail", root=tmp_path) and Mail.calls == 1
+
+
+def test_a_throttled_provider_is_waited_for_not_a_lost_page(monkeypatch):
+    """UNSW's page failed on Graph's HTTP 429 during a 16-worker init (2026-10-08)."""
+    from connectonion.provider_credentials import ProviderCredentialError
+    waits, calls = [], []
+    monkeypatch.setattr("time.sleep", waits.append)
+
+    def listing():
+        calls.append(1)
+        if len(calls) < 3:
+            raise ProviderCredentialError("provider_error", "Microsoft Graph API error (HTTP 429).", "co outlook inbox",
+                                          status=429)
+        return ["ok"]
+
+    assert inv._patient(listing) == ["ok"] and waits == [5, 10]
+
+
+def test_the_first_pass_reads_no_attachments_and_the_backfill_counts_them(tmp_path, monkeypatch):
+    """A fresh notebook's first pass asked the provider for every archived mail's attachments."""
+    from connectonion.rem import people_pages
+    seen = {}
+    monkeypatch.setattr(people_pages, "handles", lambda root, record: ("Vern", ["vern@x.y"]))
+    monkeypatch.setattr(inv, "investigate", lambda *a, **kw: seen.update(kw) or {})
+    monkeypatch.setattr(people_pages, "mark_investigated", lambda *a: None)
+    people_pages.investigate_person(tmp_path, {"record": "people/vern.md", "days": 180, "attachments": False},
+                                    clients={}, subscriptions={})
+    assert seen["fetch_attachments"] is False
+    monkeypatch.setattr(inv, "gather", lambda *a, **kw: ([{"role": "attachment", "timestamp": "2026-10-01T00:00:00Z"},
+                                                          {"role": "other", "timestamp": "2024-11-01T00:00:00Z"},
+                                                          {"role": "other", "timestamp": "2026-10-01T00:00:00Z"}], []))
+    asked = {}
+    real_gather = inv.gather
+    monkeypatch.setattr(inv, "gather", lambda *a, **kw: asked.update(kw) or real_gather_items)
+    real_gather_items = ([{"role": "attachment", "timestamp": "2026-10-01T00:00:00Z"},
+                          {"role": "other", "timestamp": "2024-11-01T00:00:00Z"},
+                          {"role": "other", "timestamp": "2026-10-01T00:00:00Z"}], [])
+    subs = {"gmail": {"kind": "gmail"}, "codex": {"kind": "codex", "root": "/x"}}
+    assert people_pages.backfill_person(tmp_path, {"record": "people/vern.md"}, clients={}, subscriptions=subs) == 2
+    assert list(asked["subscriptions"]) == ["gmail"]  # mail only; sessions were read by the first pass
+
+
+def test_one_run_scans_its_sessions_once_for_every_person(tmp_path, monkeypatch):
+    """1.9.1b3: 350 of a 363-second first-pass gather was re-hashing every session
+    file for each person in turn, under the lock; the window is kept for the run."""
+    from datetime import datetime, timedelta, timezone
+    from connectonion.rem import source
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    now = datetime.now(timezone.utc)
+    meta = {"type": "session_meta", "payload": {"id": "r", "cwd": "/work/demo"}}
+    row = {"type": "response_item", "timestamp": (now - timedelta(days=2)).isoformat(), "payload": {
+        "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Vern and Ody decided"}]}}
+    (sessions / "rollout-a.jsonl").write_text(json.dumps(meta) + "\n" + json.dumps(row) + "\n")
+    calls, original = [], source.collect
+    monkeypatch.setattr(inv, "collect", lambda *a, **k: calls.append(1) or original(*a, **k))
+    subs = {"codex": {"kind": "codex", "root": str(sessions)}}
+    scans = []
+    # A 180-day person, a 730-day organisation, a person again: one scan (1.9.1b4
+    # threw the window away whenever a wider request came in).
+    for name, days in (("Vern", 10), ("Ody", 700), ("Vern", 10)):
+        items, _ = inv.gather(name, [name], days=days, clients={}, subscriptions=subs, archive_root=tmp_path / "book")
+        assert [i["text"] for i in items] == ["Vern and Ody decided"]
+        scans.append(len(calls))
+    assert scans[0] > 0 and scans[2] == scans[1] == scans[0]  # later pages read the kept window

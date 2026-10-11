@@ -13,26 +13,47 @@ no `AsyncClient`, and every remote agent call crashed.
 
 ## Current release
 
-Stable **1.9.0** is the default production channel. It brings co rem's
-complete mapped first run, category progress, model-access preflight and
-visible nightly health. See [1.9.0 notes](releases/1.9.0.md) and the
-[GitHub release](https://github.com/openonion/connectonion/releases/tag/v1.9.0).
+Stable **1.9.1** is the default production channel. co rem's first run now
+investigates every page, deepens people with two years of mail, edits pages in
+place and draws decisions and principles; Person pages lead with contact facts
+and cited mail opens as a message. See [1.9.1 notes](releases/1.9.1.md) and the
+[GitHub release](https://github.com/openonion/connectonion/releases/tag/v1.9.1).
 
 ```bash
-python -m pip install --upgrade 'connectonion==1.9.0'
+python -m pip install --upgrade 'connectonion==1.9.1'
 ```
 
 ## Current preview
 
-Beta **1.9.1b1** keeps a project page when only one citation is wrong, draws
-decisions and principles from the first run, lists a page's documents, and runs
-init 16 pages at a time. See [1.9.1b1 notes](releases/1.9.1b1.md).
+Beta **1.9.2b1** lets each investigation pass delete as well as add, so pages
+improve instead of only growing. See [1.9.2b1 notes](releases/1.9.2b1.md).
 
 ```bash
-python -m pip install --upgrade 'connectonion==1.9.1b1'
+python -m pip install --upgrade 'connectonion==1.9.2b1'
 ```
 
 ## Previous previews
+
+Release candidate **1.9.1rc1** waits long enough for its notebook and credential
+locks when sixteen workers run at once. See [1.9.1rc1 notes](releases/1.9.1rc1.md).
+
+Beta **1.9.1b5** scans coding sessions once per first run whatever window a page
+asks for, and its mail backfill reads only mail. See [1.9.1b5 notes](releases/1.9.1b5.md).
+
+Beta **1.9.1b4** scans your coding sessions once per first run instead of once
+per person. See [1.9.1b4 notes](releases/1.9.1b4.md).
+
+Beta **1.9.1b3** writes people's first pages without touching the network,
+fetches attachments with the background backfill, and waits out a throttled
+mailbox. See [1.9.1b3 notes](releases/1.9.1b3.md).
+
+Beta **1.9.1b2** writes the first pages from mail already on disk, fetches each
+person's older mail in the background and deepens those pages, and keeps
+project pages that only had a citation wrong. See [1.9.1b2 notes](releases/1.9.1b2.md).
+
+Beta **1.9.1b1** keeps a project page when only one citation is wrong, draws
+decisions and principles from the first run, lists a page's documents, and runs
+init 16 pages at a time. See [1.9.1b1 notes](releases/1.9.1b1.md).
 
 Alpha **1.9.1a2** reads a large page's whole evidence in rounds, edits pages in
 place with a lead-following investigation Skill, enriches organisations from

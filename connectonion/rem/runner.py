@@ -532,6 +532,28 @@ def _searched_turn(workdir, prompt, config, stage, directory, search, items, fir
 PROMOTE_WAIT_SECONDS = 1800
 
 
+CITATION_ONLY = ("Citation has no identifiable source:", "Unused citation:", "Cited local file needs ")
+
+
+def citation_only(errors: list[str]) -> bool:
+    """Is a refusal only about citations, which dropping their lines can settle?"""
+    return bool(errors) and all(error.startswith(CITATION_ONLY) for error in errors)
+
+
+def promote_or_drop(notebook, record, candidate, original, items, directory, usage):
+    """Promote; if only citations fail, drop the lines resting on them and promote that.
+
+    The project writer had no repair at all: 1.9.1b1's first project page was
+    refused for one untraceable citation, as six were on 1.9.1a2.
+    """
+    try:
+        return _promote_candidate(notebook, record, candidate, original, items, directory, usage)
+    except RunFailed:
+        if not citation_only(read_json(directory / "review.json", {}).get("errors") or []):
+            raise
+        return _promote_candidate(notebook, record, candidate, original, items, directory, usage, last_resort=True)
+
+
 def _promote_candidate(notebook, record, candidate, original, items, directory, usage, lock_held=False,
                        investigation=True, claim_config=None, last_resort=False):
     from .page_review import (compact_page, drop_owner_addresses, drop_tool_text, drop_uncited_sources, drop_unresolved,
@@ -815,8 +837,9 @@ def _run_stage(notebook, items, config, kind, stage, maintenance_lock_held, work
         candidate.write_text(before[record], encoding="utf-8")
         prompt += (f"\n\n## Output\nThe working notebook copy is {task_root}, with this page at {task_root / record}. "
                    f"Your working copy of the page is the file {candidate}; it starts as the page as it stands. "
-                   "Edit it in place: add what the evidence adds, correct what it contradicts, and leave every "
-                   "supported line you have no reason to change exactly as it is. Do not rewrite the page from scratch. "
+                   "Edit it in place the way you edit code: add what the evidence adds, change what it corrects, and delete "
+                   "what it supersedes, what the page now says twice and doubts it settles. Leave correct lines as they are. "
+                   "Do not rewrite the page from scratch. "
                    "If the evidence changes nothing on the page, leave the file as it is and end your reply with NO CHANGE. "
                    "Write only that candidate file using an available local file tool. "
                    "The runner owns validation and replacement. Do not start nested co rem jobs. "
