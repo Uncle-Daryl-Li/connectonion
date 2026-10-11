@@ -2481,6 +2481,66 @@ from .commands.mcp_commands import mcp_app
 app.add_typer(mcp_app, name="mcp")
 
 
+# Jira (F13FCAKE-9/10/18): verify, list projects, and read selected issues.
+jira_app = _typer_app(
+    help="Verify Jira access, list projects, and read selected issues. Requires JIRA_URL, JIRA_EMAIL, and JIRA_API_TOKEN from co env set.",
+    epilog="Examples: co jira verify; co jira projects --json; co jira issues ALPHA ALPHA-1 --json",
+)
+app.add_typer(jira_app, name="jira")
+
+
+@jira_app.command("verify", epilog="Example:  co jira verify --json")
+def _jira_verify(
+    as_json: bool = typer.Option(False, "--json", help="Output connection info as JSON"),
+):
+    """Verify Jira credentials and display the authorised account. Read-only."""
+    from .commands.jira_commands import handle_jira_verify
+    handle_jira_verify(as_json=as_json)
+
+
+@jira_app.command("projects", epilog="Example:  co jira projects --json")
+def _jira_projects(
+    as_json: bool = typer.Option(False, "--json", help="Output project list as JSON"),
+):
+    """List all accessible Jira projects. Read-only."""
+    from .commands.jira_commands import handle_jira_projects
+    handle_jira_projects(as_json=as_json)
+
+
+@jira_app.command("issues", epilog="Example:  co jira issues ALPHA ALPHA-1 ALPHA-2 --json")
+def _jira_issues(
+    project_key: str = typer.Argument(..., help="Jira project key, e.g. ALPHA"),
+    issue_keys: list[str] = typer.Argument(..., help="One or more issue keys, e.g. ALPHA-1 ALPHA-2"),
+    as_json: bool = typer.Option(False, "--json", help="Output issues as JSON"),
+):
+    """Fetch Jira issues scoped to PROJECT_KEY and the given ISSUE_KEYS. Read-only."""
+    from .commands.jira_commands import handle_jira_issues
+    handle_jira_issues(project_key, issue_keys, as_json=as_json)
+
+
+@jira_app.command(
+    "sync",
+    epilog="Example:  co jira sync ALPHA ALPHA-1 ALPHA-2  |  co jira sync ALPHA ALPHA-1 --output ~/my/dir --json",
+)
+def _jira_sync(
+    project_key: str = typer.Argument(..., help="Jira project key, e.g. ALPHA"),
+    issue_keys: list[str] = typer.Argument(..., help="One or more issue keys to collect, e.g. ALPHA-1 ALPHA-2"),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        help="Directory to write source.yaml (default: ~/.co/rem/docs/jira)",
+        show_default=False,
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Output result as JSON"),
+):
+    """Verify credentials, collect selected issues, and write source.yaml for co rem.
+
+    Runs the full workflow: verify → issue_items → write_source_yaml.
+    """
+    from .commands.jira_commands import handle_jira_sync
+    handle_jira_sync(project_key, issue_keys, output_dir=output, as_json=as_json)
+
+
 # OneNote (#1887): the notebooks `co auth microsoft` grants since 1.8.9.
 onenote_app = _typer_app(
     help="Your OneNote pages. Bare co onenote shows recent pages; ls shows notebooks. Reading is Read-only.",

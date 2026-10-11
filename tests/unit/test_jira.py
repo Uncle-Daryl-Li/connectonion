@@ -2,6 +2,7 @@
 
 import datetime
 import httpx
+import json
 import yaml
 import logging
 from pathlib import Path
@@ -557,3 +558,37 @@ def test_write_source_yaml_rejects_issue_keys_not_belonging_to_project(tmp_path)
     with pytest.raises(ValueError):
         Jira().write_source_yaml(dest, ["ALPHA"], {"ALPHA-1", "BETA-2"})
     assert not (dest / "source.yaml").exists()
+
+
+def test_jira_cli_sync_writes_selected_scope_to_source_yaml(tmp_path):
+    """10-16: co jira sync verifies, collects selected issues, and writes source.yaml only."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+
+    def get(url, auth=None, params=None, timeout=None):
+        response = MagicMock(status_code=200)
+        response.raise_for_status = MagicMock()
+        if url.endswith("/myself"):
+            response.json = MagicMock(return_value={
+                "accountId": "abc123", "displayName": "Alice",
+            })
+        elif url.endswith("/search/jql"):
+            response.json = MagicMock(return_value={"issues": [_I1]})
+        else:
+            raise AssertionError(f"Unexpected GET {url!r}")
+        return response
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = CliRunner().invoke(
+            app, ["jira", "sync", "ALPHA", "ALPHA-1", "--output", str(tmp_path), "--json"]
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "written": str(tmp_path / "source.yaml"),
+        "project": "ALPHA",
+        "issues": 1,
+    }
+    source = yaml.safe_load((tmp_path / "source.yaml").read_text(encoding="utf-8"))
+    assert source["scope"] == {"projects": ["ALPHA"], "issues": ["ALPHA-1"]}
