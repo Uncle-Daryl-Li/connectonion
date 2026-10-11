@@ -5,7 +5,10 @@ LLM-Note:
   Data flow: raw tool output (Jira issues / OneNote pages) → adapter functions → AdapterResult with provenance records → write_daily_jsonl stores under daily/YYYY/MM/DD.jsonl
   State/Effects: write_daily_jsonl() creates directories and writes files; all other functions are pure
   Integration: AdapterResult is the shared record type; consume_records() is the in-memory consumer; consume_jsonl_records() reads from disk across multiple source directories; jira_issues_to_records() and onenote_pages_to_records() are the converter functions
-  Errors: none raised; malformed input produces empty/partial records
+  Errors: write_daily_jsonl() raises ValueError if the existing JSONL file contains a malformed line (refuses to append to a corrupted file) | consume_jsonl_records() never raises — malformed lines are recorded in AdapterResult.errors keyed by "file:lineno"; all other functions are pure and produce empty/partial records on malformed input
+  F13FCAKE-18 prototype status:
+    Jira chain -- fully integrated: verify_connection -> issue_items -> write_source_yaml -> jira_issues_to_records -> write_daily_jsonl
+    OneNote chain -- adapter function implemented and tested with synthetic fixtures; live Notes.Read integration is pending authorized account credentials and OneNote team implementation
 
 Common adapter contract for co rem integrations.
 

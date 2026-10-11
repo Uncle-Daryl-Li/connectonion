@@ -1136,23 +1136,53 @@ def test_json_decode_error_raises_value_error():
 
 # ── FIX 3: --secret guidance ──
 
-def test_missing_token_repair_hint_includes_secret_flag(monkeypatch):
-    """Fix-3a: JIRA_API_TOKEN missing → repair hint contains --secret."""
+def test_missing_token_repair_hint_uses_temporary_environment(monkeypatch):
+    """Fix-3a: JIRA_API_TOKEN missing → repair hint uses temporary env var procedure, not --secret."""
     monkeypatch.delenv("JIRA_API_TOKEN")
     with pytest.raises(JiraConfigError) as exc_info:
         Jira()
-    assert "--secret" in str(exc_info.value)
+    msg = str(exc_info.value)
+    assert "export JIRA_API_TOKEN" in msg
+    assert "unset JIRA_API_TOKEN" in msg
 
 
-def test_401_repair_hint_includes_secret_flag():
-    """Fix-3b: 401 → JiraAuthError repair hint contains --secret."""
+def test_401_repair_hint_uses_temporary_environment():
+    """Fix-3b: 401 → JiraAuthError repair hint uses temporary env var procedure, not --secret."""
     get, _ = _mock_get({"/rest/api/3/myself": (401, {})})
 
     with patch("connectonion.useful_tools.jira.httpx.get", get):
         with pytest.raises(JiraAuthError) as exc_info:
             Jira().verify_connection()
 
-    assert "--secret" in str(exc_info.value)
+    msg = str(exc_info.value)
+    assert "export JIRA_API_TOKEN" in msg
+    assert "unset JIRA_API_TOKEN" in msg
+
+
+def test_token_from_secret_store_is_never_used(monkeypatch):
+    """Fix-3c: JIRA_API_TOKEN absent from os.environ → JiraConfigError even when setting()
+    would return a saved value from the secret store.
+
+    Regression lock for F13FCAKE-9: jira.py must read the token ONLY via
+    os.environ.get(), never via setting().  This test patches setting() so it
+    would return "saved-token" for JIRA_API_TOKEN, removes the env var, and
+    asserts that Jira() still raises JiraConfigError — proving the secret store
+    is bypassed for the token regardless of what setting() would return.
+    """
+    monkeypatch.delenv("JIRA_API_TOKEN")
+
+    real_setting = __import__(
+        "connectonion.environment", fromlist=["setting"]
+    ).setting
+
+    def _patched_setting(name: str):
+        if name == "JIRA_API_TOKEN":
+            return "saved-token-from-secret-store"
+        return real_setting(name)
+
+    with patch("connectonion.useful_tools.jira.setting", _patched_setting):
+        with pytest.raises(JiraConfigError, match="JIRA_API_TOKEN"):
+            Jira()
 
 
 # ── FIX 4: co jira sync CLI workflow ──
@@ -1412,3 +1442,155 @@ def test_jira_cli_sync_json_with_network_error_produces_valid_json_no_traceback(
     assert "reach" in payload["error"].lower() or "network" in payload["error"].lower()
     assert "Traceback" not in result.stdout
     assert JIRA_TOKEN not in result.stdout
+
+
+# ── F13FCAKE-10: missing-key verification ──
+
+def test_issue_items_raises_when_requested_key_not_returned():
+    """10-17: requesting ALPHA-999 which Jira does not return -> ValueError naming missing key."""
+    get, _ = _mock_get(
+        {"/rest/api/3/search/jql": (200, {"issues": [_I1]})}  # returns ALPHA-1 only
+    )
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(ValueError) as exc_info:
+            Jira().issue_items("ALPHA", {"ALPHA-1", "ALPHA-999"})
+    msg = str(exc_info.value)
+    assert "ALPHA-999" in msg   # missing key named
+    assert "ALPHA-1" not in msg  # returned key not mentioned
+
+
+def test_jira_cli_sync_missing_issue_key_exits_nonzero_no_files_written(tmp_path):
+    """10-18: sync with non-existent ALPHA-999 -> non-zero exit; no source.yaml; no JSONL."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+
+    def mock_get(url, auth=None, params=None, timeout=None):
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        if "myself" in url:
+            resp.json = MagicMock(return_value={"accountId": "abc123", "displayName": "Alice"})
+        else:
+            resp.json = MagicMock(return_value={"issues": [_I1]})  # ALPHA-999 not returned
+        return resp
+
+    runner = CliRunner()
+    with patch("connectonion.useful_tools.jira.httpx.get", mock_get):
+        result = runner.invoke(
+            app, ["jira", "sync", "ALPHA", "ALPHA-1", "ALPHA-999", "--output", str(tmp_path)]
+        )
+    assert result.exit_code != 0
+    assert not (tmp_path / "source.yaml").exists()
+    today = datetime.date.today()
+    jsonl_path = (
+        tmp_path / "daily" / str(today.year)
+        / f"{today.month:02d}" / f"{today.day:02d}.jsonl"
+    )
+    assert not jsonl_path.exists()
+
+
+# ── F13FCAKE-18: end-to-end synthetic pipeline (both chains) ──
+
+def test_adapter_f13fcake18_full_pipeline_both_chains_end_to_end_synthetic(tmp_path):
+    """18-11: end-to-end synthetic proof of both adapter chains (F13FCAKE-18).
+
+    Chain A: Jira raw issue  -> jira_issues_to_records()   -> write_daily_jsonl() -> jira_dir
+    Chain B: OneNote raw page -> onenote_pages_to_records() -> write_daily_jsonl() -> onenote_dir
+    Merge:   consume_jsonl_records(jira_dir, onenote_dir)  -> unified record list
+
+    NOTE: Chain B tests synthetic fixtures only.  Live Notes.Read integration is
+    pending the OneNote team's implementation and authorized account credentials.
+    """
+    from connectonion.useful_tools.adapter import (
+        jira_issues_to_records,
+        onenote_pages_to_records,
+        write_daily_jsonl,
+        consume_jsonl_records,
+    )
+
+    jira_dir = tmp_path / "jira"
+    onenote_dir = tmp_path / "onenote"
+
+    # Chain A: Jira
+    jira_result = jira_issues_to_records([_I1, _I2], JIRA_URL)
+    assert jira_result.errors == {}
+    write_daily_jsonl(jira_result.records, jira_dir)
+
+    # Chain B: OneNote (synthetic fixture — live integration pending)
+    on_result = onenote_pages_to_records([_ON1, _ON2], _ONENOTE_ACCOUNT)
+    assert on_result.errors == {}
+    write_daily_jsonl(on_result.records, onenote_dir)
+
+    # Merge
+    merged = consume_jsonl_records(jira_dir, onenote_dir)
+    assert merged.errors == {}
+    assert len(merged.records) == 4
+    sources = {r["source"] for r in merged.records}
+    assert sources == {"jira", "onenote"}
+
+    jira_records = [r for r in merged.records if r["source"] == "jira"]
+    on_records = [r for r in merged.records if r["source"] == "onenote"]
+    assert len(jira_records) == 2
+    assert len(on_records) == 2
+
+    # Each record carries full provenance
+    for r in merged.records:
+        assert r["account"]
+        assert r["id"]
+        assert r["url"] is not None
+        assert r["date"] is not None
+
+
+def test_adapter_f13fcake18_jira_jsonl_corrupted_onenote_still_readable(tmp_path):
+    """18-12: Jira JSONL has a corrupted line; OneNote JSONL is intact.
+
+    consume_jsonl_records() must:
+    - return all valid Jira records (from non-corrupted lines)
+    - return all OneNote records unaffected
+    - record the corrupted Jira line in AdapterResult.errors (keyed by file:lineno)
+    - NOT raise — one-side corruption must not break the other side
+
+    This directly proves the "one side fails, other side still works" resilience
+    property of the shared consumer (F13FCAKE-18).
+    """
+    from connectonion.useful_tools.adapter import (
+        onenote_pages_to_records,
+        write_daily_jsonl,
+        consume_jsonl_records,
+    )
+
+    jira_dir = tmp_path / "jira"
+    onenote_dir = tmp_path / "onenote"
+
+    # Write a Jira JSONL manually: 1 valid record + 1 corrupted line
+    today = datetime.date.today()
+    jira_daily = jira_dir / "daily" / str(today.year) / f"{today.month:02d}"
+    jira_daily.mkdir(parents=True)
+    jira_jsonl = jira_daily / f"{today.day:02d}.jsonl"
+    valid_jira_line = json.dumps({
+        "source": "jira", "account": JIRA_URL, "id": "ALPHA-1",
+        "url": f"{JIRA_URL}/browse/ALPHA-1", "date": "2024-01-01", "summary": "Valid issue",
+    })
+    jira_jsonl.write_text(valid_jira_line + "\nNOT_VALID_JSON\n", encoding="utf-8")
+
+    # Write valid OneNote records via the normal path
+    on_result = onenote_pages_to_records([_ON1, _ON2], _ONENOTE_ACCOUNT)
+    write_daily_jsonl(on_result.records, onenote_dir)
+
+    # consume_jsonl_records must not raise
+    merged = consume_jsonl_records(jira_dir, onenote_dir)
+
+    # OneNote records are intact
+    on_records = [r for r in merged.records if r["source"] == "onenote"]
+    assert len(on_records) == 2, "OneNote records must survive a Jira-side corruption"
+
+    # Valid Jira record is still returned (only the bad line is skipped)
+    jira_records = [r for r in merged.records if r["source"] == "jira"]
+    assert len(jira_records) == 1
+    assert jira_records[0]["id"] == "ALPHA-1"
+
+    # The corrupted Jira line is reported in errors, keyed by file:lineno
+    assert len(merged.errors) == 1, "Exactly one error expected for the corrupted Jira line"
+    error_key = next(iter(merged.errors))
+    assert str(jira_jsonl) in error_key
+    assert "2" in error_key  # line 2 is the corrupted line
+    assert "JSON" in merged.errors[error_key]

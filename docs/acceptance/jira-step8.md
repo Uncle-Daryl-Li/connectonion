@@ -163,3 +163,50 @@ resolved), but discoverability alone is not a substitute for a passing eval.
 - Commands: `ls`, `pages [section]`, `read <num|title>`
 - Row numbers: valid 15 min; must re-list after expiry
 - If user requests any write operation: explain that this integration is read-only
+
+---
+
+## F13FCAKE-18 prototype scope and limitations
+
+### Jira chain — fully integrated
+
+The full Jira pipeline is implemented and covered by synthetic unit tests:
+
+```
+verify_connection() → issue_items() → write_source_yaml()
+    → jira_issues_to_records() → write_daily_jsonl()
+```
+
+The end-to-end test `test_adapter_f13fcake18_full_pipeline_both_chains_end_to_end_synthetic`
+(test id `18-11`) exercises both chains using synthetic fixtures only (no live network calls).
+This is synthetic evidence, **not** a live demo.
+
+### OneNote chain — synthetic fixtures only
+
+The OneNote adapter function `onenote_pages_to_records()` is implemented and covered by
+synthetic unit tests.  The full pipeline using live `Notes.Read` scope is **not yet implemented**:
+
+- The OneNote team's integration code is pending.
+- An authorized Microsoft account with `Notes.Read` scope is required for a live demo.
+- All current OneNote tests (`18-3`, `18-5`, `18-6`, `18-7`, `18-8b`, `18-11`, etc.) use
+  synthetic fixture dicts, not responses from the Graph API.
+
+### F13FCAKE-9 live Jira verification — pending
+
+`co jira verify`, `co jira projects`, and a scoped `co jira sync` against a real authorized
+read-only Jira account have **not yet been executed**.  Running them and saving sanitized
+terminal output as evidence is required before this story can be closed.
+
+The token handling code is complete (temporary shell variable, never persisted) and all
+unit-level security assertions pass, but live account verification needs an authorized
+account.
+
+### Resilience: one-side failure does not corrupt the other
+
+The `consume_jsonl_records()` reader is source-agnostic.  A corrupted or missing JSONL from
+one source (e.g. Jira) does not prevent valid records from another source (e.g. OneNote) from
+being read.  Malformed lines are reported in `AdapterResult.errors`; valid lines from all
+other sources are still returned in `AdapterResult.records`.
+
+Test `18-12` (`test_adapter_f13fcake18_jira_jsonl_corrupted_onenote_still_readable`) verifies
+this property explicitly.

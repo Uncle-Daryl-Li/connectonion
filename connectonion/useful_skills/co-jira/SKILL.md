@@ -25,16 +25,24 @@ chat.
 | `JIRA_API_TOKEN` | Use the no-echo procedure below |
 
 Tokens are created at https://id.atlassian.com/manage-profile/security/api-tokens
-(Settings → Security → API tokens). The `--secret` flag encrypts the stored value
-in the configuration file. Use the no-echo procedure below so the real token is not
-typed into shell history.
+(Settings → Security → API tokens). Set the token as a **temporary shell variable**
+so it is never saved to disk. Unset it immediately after use.
 **Never paste the real token into chat, log output, or Git.**
 
 ```bash
-# No-echo procedure — Git Bash / Linux / macOS
-read -rsp "Jira API token: " JIRA_TOKEN; echo
-co env set JIRA_API_TOKEN "$JIRA_TOKEN" --secret
-unset JIRA_TOKEN
+# Bash / Git Bash — no-echo, not saved to disk
+read -rsp "Jira API token: " JIRA_API_TOKEN; echo
+export JIRA_API_TOKEN
+co jira verify   # or any other co jira command
+unset JIRA_API_TOKEN
+```
+
+```zsh
+# zsh — no-echo, not saved to disk
+read -rs "JIRA_API_TOKEN?Jira API token: "; echo
+export JIRA_API_TOKEN
+co jira verify   # or any other co jira command
+unset JIRA_API_TOKEN
 ```
 
 ## Which command
