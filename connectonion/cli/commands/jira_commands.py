@@ -111,28 +111,36 @@ def handle_jira_sync(
     *,
     output_dir: Path | None = None,
     as_json: bool = False,
+    export_id: str | None = None,
 ) -> None:
-    """Validate credentials, collect selected issues, write source.yaml and daily JSONL.
+    """Validate credentials, collect selected issues, write source.yaml and the records.
 
-    Full workflow: verify → issue_items → write_source_yaml → jira_issues_to_records → append_daily_jsonl.
+    Full workflow: verify → issue_items → write_source_yaml → jira_issues_to_records → placement.
+    Placement (F13FCAKE-11): ongoing sync → append_daily_jsonl (daily/YYYY/MM/DD.jsonl);
+    export_id given → write_export (exports/<export_id>/ records.jsonl + manifest.json), a one-off import.
+    An unusable export id is refused before any request or file write.
     Writes to output_dir (default: ~/.co/rem/docs/jira).
-    JSON output: {"written": source_yaml_path, "jsonl": jsonl_path, "project": key, "issues": collected,
+    JSON output: {"written": source_yaml_path, "placement": "daily" | "export", "jsonl": records file path,
+    "project": key, "issues": collected,
     "mapped": records that passed the contract, "appended": records newly added to today's file
-    (already-present records are skipped), "rejected": {"jira:<key>": reason}}.
+    (already-present records are skipped; for an export, every mapped record), "rejected": {"jira:<key>": reason}}.
     Rejected items never disappear silently: valid records are still written, the rejected ones are
     listed (stderr, or "rejected" in JSON), and the command exits 1.
     """
     from ...useful_tools.jira import JiraConfigError, JiraAuthError, JiraPermissionError
-    from ...useful_tools.adapter import append_daily_jsonl, jira_issues_to_records
+    from ...useful_tools.adapter import export_target, jira_issues_to_records
     if output_dir is None:
         output_dir = Path.home() / ".co" / "rem" / "docs" / "jira"
     try:
+        if export_id is not None:
+            export_target(output_dir, export_id)
         jira = _jira()
         info = jira.verify_connection()
         issues = jira.issue_items(project_key, set(issue_keys))
         jira.write_source_yaml(output_dir, [project_key], set(issue_keys))
         adapter_result = jira_issues_to_records(issues, info["site_url"])
-        jsonl_path, appended = append_daily_jsonl(adapter_result.records, output_dir)
+        jsonl_path, appended = _place_records(adapter_result.records, output_dir, export_id,
+                                              {"projects": [project_key], "issues": sorted(set(issue_keys))})
     except (JiraConfigError, JiraAuthError, JiraPermissionError, ValueError) as exc:
         _handle_error(exc, as_json)
         return
@@ -141,6 +149,7 @@ def handle_jira_sync(
     if as_json:
         print(json.dumps({
             "written": source_yaml,
+            "placement": "export" if export_id else "daily",
             "jsonl": str(jsonl_path),
             "project": project_key,
             "issues": len(issues),
@@ -155,6 +164,14 @@ def handle_jira_sync(
               f"Records mapped: {len(adapter_result.records)}  Records appended: {appended}")
         print("Example: co rem sources")
     _exit_if_rejected(rejected, as_json)
+
+
+# Ongoing sync appends to today's daily file; --export writes a one-off snapshot under exports/<id>/.
+def _place_records(records: list[dict], output_dir: Path, export_id: str | None, scope: dict) -> tuple[Path, int]:
+    from ...useful_tools.adapter import append_daily_jsonl, write_export
+    if export_id is None:
+        return append_daily_jsonl(records, output_dir)
+    return write_export(records, output_dir, export_id, scope) / "records.jsonl", len(records)
 
 
 # Mapping errors (F13FCAKE-16) must reach the user: list each rejected item, then exit 1.

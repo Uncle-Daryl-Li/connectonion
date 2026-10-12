@@ -182,4 +182,3 @@ def test_dates_outside_the_calendar_are_dropped_not_raised():
     first_ms = {"type": "date", "attrs": {"timestamp": "0"}}
     last_ms = {"type": "date", "attrs": {"timestamp": "253402214400000"}}
     assert adf_to_text(_doc(_p(first_ms), _p(last_ms))) == "1970-01-01\n\n9999-12-31"
-

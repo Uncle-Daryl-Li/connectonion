@@ -268,7 +268,7 @@ def write_export(records: list[dict], source_dir: Path, export_id: str, scope: d
     half-written export never appears under exports/; if writing fails the staging directory is
     removed, so the same export id can be retried.
     """
-    target = _export_target(Path(source_dir), export_id)
+    target = export_target(Path(source_dir), export_id)
     problems = _export_problems(records)
     if problems:
         shown = "; ".join(problems[:5]) + (f"; … {len(problems) - 5} more" if len(problems) > 5 else "")
@@ -297,7 +297,9 @@ def _export_payload(records: list[dict], export_id: str, scope: dict) -> tuple[s
     return lines, manifest
 
 
-def _export_target(source_dir: Path, export_id: str) -> Path:
+# Where an export would go; raises ValueError for an unsafe id, an existing export or a leftover staging folder.
+# Callers (co jira sync --export) use it to fail before collecting anything.
+def export_target(source_dir: Path, export_id: str) -> Path:
     if not isinstance(export_id, str) or not EXPORT_ID.match(export_id):
         raise ValueError(f"Invalid export id {export_id!r}: use letters, digits, '.', '_' or '-' (max 64), "
                          "e.g. 'ALPHA-history-2026-10-12'. Nothing was written.")
