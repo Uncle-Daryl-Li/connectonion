@@ -1,21 +1,31 @@
 ---
 name: co-onenote
-description: Read the user's OneNote notebooks through `co onenote` — list notebooks and sections, browse recent pages, and read a page. Use when the user mentions OneNote, "my notes", "notebook", or a note title. This integration is read-only (Notes.Read scope); do not create, edit, or delete OneNote pages.
+description: Read the user's OneNote notebooks through `co onenote` — list notebooks and sections, browse recent pages, and read a page. Use when the user mentions OneNote, "my notes", "notebook", or a note title. This source workflow performs reads only; do not create, edit, or delete OneNote pages.
 ---
 
 # co onenote
 
 `co onenote` acts in the user's Microsoft OneNote as the user, via the
-Microsoft Graph API. This integration is **read-only** (`Notes.Read` scope):
+Microsoft Graph API. This workflow performs reads only:
 it lists notebooks and sections, browses pages, and reads page content. Do
 not create, edit, or delete OneNote pages.
 
 **Read the output, not just the exit code.** Every failure exits 1 and ends
 with one `Next:` line; run that command, it is the fix.
 
+## Source connection
+
+Use `co onenote source verify --json` for the separate read-only source connection.
+It accepts Notes.Read or compatible existing broader grants and reuses `co auth microsoft`.
+Older browsing commands use the general OneNote tool and require Notes.ReadWrite.
+The broker Notes.Read-only consent path remains unverified (#1886); fixture success
+does not establish live least-privilege consent. No separate Azure application is needed.
+
 ## Before anything
 
-Run `co onenote ls`. If it says the Microsoft account is not connected, tell
+For source access, start with `co onenote source verify --json`. Use `co onenote ls`
+only for older browsing when its Notes.ReadWrite permission is already available.
+If it says the Microsoft account is not connected, tell
 the user to run `co auth microsoft`. Never ask them to paste a token into the
 chat.
 
@@ -50,8 +60,8 @@ co onenote read "Sprint retro"            # read by exact title
 
 - **This integration is read-only.** Do not create, edit, or delete any
   OneNote page. If the user asks for a write operation, explain that the
-  current `co rem` OneNote integration uses `Notes.Read` scope and cannot
-  write to OneNote. `co onenote create` may exist elsewhere in ConnectOnion,
+  current source workflow only performs reads. An existing broader grant
+  does not authorize writes in this workflow. `co onenote create` may exist elsewhere in ConnectOnion,
   but it is outside this integration's scope and must not be used for co rem
   source collection.
 - **An unknown section number exits 1** and prints the listing token. Re-run

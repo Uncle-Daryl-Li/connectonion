@@ -42,6 +42,7 @@ venv.bak/
 
 # Testing
 .pytest_cache/
+.pytest-local/
 .coverage
 .coverage.*
 htmlcov/

@@ -2607,6 +2607,9 @@ onenote_app = _typer_app(
 )
 app.add_typer(onenote_app, name="onenote")
 
+from .commands.onenote_source_commands import register_onenote_source
+register_onenote_source(onenote_app, _typer_app)
+
 
 @onenote_app.callback(invoke_without_command=True)
 def _onenote_default(ctx: typer.Context):
