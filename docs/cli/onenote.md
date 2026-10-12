@@ -71,7 +71,9 @@ credentials, refresh and throttling retries as `Outlook()`.
 | `No section named …` | `co onenote ls` for the exact names and ids |
 | `Several sections are named …` | pass the section id instead |
 
-## Read-only source connection
+## Read-only co rem source imports
 
-Use `co onenote source verify --json` to verify the existing Microsoft credentials
-without OneNote writes. See [source connection](onenote-source.md) for scope requirements.
+For scoped collection with `Notes.Read`, complete discovery pagination, inline
+page text and metadata-only attachments, use `co onenote source`. This source
+does not expose page creation. See [OneNote source collection](onenote-source.md)
+for setup, scope selection, daily/export storage and acceptance limitations.
