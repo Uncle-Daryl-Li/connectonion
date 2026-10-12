@@ -2556,3 +2556,69 @@ def test_bad_key_in_a_history_batch_is_unavailable_without_a_request():
     assert outcomes["not a key"]["status"] == "unavailable"
     assert "Invalid Jira issue key" in outcomes["not a key"]["reason"]
     assert calls == ["ALPHA-1"]
+
+
+def test_changelog_entries_are_readable_and_oldest_first():
+    """12-11: raw histories become {id, at, author, changes[field, from, to]}, sorted oldest first, no emails or ids."""
+    from connectonion.useful_tools.adapter import jira_changelog_entries
+    later = _history("2", "2026-10-06T10:00:00.000+1100", "priority", "High", "Highest", who="Ben Example")
+    earlier = _history("1", "2026-10-05T10:00:00.000+1100", "status", "To Do", "In Progress")
+    earlier["items"][0].update({"from": "10000", "to": "3"})
+    entries, skipped = jira_changelog_entries([later, earlier])
+    assert skipped == 0
+    assert entries == [
+        {"id": "1", "at": "2026-10-05T10:00:00.000+1100", "author": "Diego Example",
+         "changes": [{"field": "status", "from": "To Do", "to": "In Progress"}]},
+        {"id": "2", "at": "2026-10-06T10:00:00.000+1100", "author": "Ben Example",
+         "changes": [{"field": "priority", "from": "High", "to": "Highest"}]},
+    ]
+    assert "diego@example.com" not in json.dumps(entries)
+
+
+def test_changelog_entry_keeps_every_field_changed_in_one_edit():
+    """12-12: one history with several items keeps them all; null values (field set or cleared) become ""."""
+    from connectonion.useful_tools.adapter import jira_changelog_entries
+    history = {"id": "7", "created": "2026-10-07T09:00:00Z", "author": {"displayName": "Elena Example"},
+               "items": [{"field": "assignee", "fromString": None, "toString": "Ben Example"},
+                         {"field": "labels", "fromString": "draft", "toString": None}]}
+    entries, _ = jira_changelog_entries([history])
+    assert entries[0]["changes"] == [{"field": "assignee", "from": "", "to": "Ben Example"},
+                                     {"field": "labels", "from": "draft", "to": ""}]
+
+
+def test_malformed_histories_are_skipped_and_counted():
+    """12-13: non-objects, histories without items and items without a field are skipped and counted, not raised."""
+    from connectonion.useful_tools.adapter import jira_changelog_entries
+    good = _history("1", "2026-10-05T10:00:00Z", "status", "To Do", "Done")
+    broken = ["not a history", {"id": "x", "items": "nope"}, {"id": "y", "items": [{"fromString": "a"}, "z"]}]
+    entries, skipped = jira_changelog_entries([good, *broken])
+    assert [e["id"] for e in entries] == ["1"]
+    assert skipped == 3
+    assert jira_changelog_entries("not a list") == ([], 0)
+    no_author = {"id": "2", "items": [{"field": "status", "toString": "Done"}]}
+    assert jira_changelog_entries([no_author])[0][0]["author"] == ""
+
+
+def test_long_change_values_are_cut_and_marked():
+    """12-14: a huge value (e.g. a description edit) is cut to CHANGE_VALUE_CHARS with a visible marker."""
+    from connectonion.useful_tools.adapter import CHANGE_VALUE_CHARS, jira_changelog_entries
+    big = "x" * (CHANGE_VALUE_CHARS + 250)
+    entries, _ = jira_changelog_entries([_history("1", "2026-10-05T10:00:00Z", "description", "short", big)])
+    change = entries[0]["changes"][0]
+    assert change["from"] == "short"
+    assert change["to"] == "x" * CHANGE_VALUE_CHARS + " … [250 more characters]"
+
+
+def test_changelog_extension_keeps_none_and_unreadable_distinct():
+    """12-15: ok / none / restricted / unavailable survive into the record value; unknown outcomes become unavailable."""
+    from connectonion.useful_tools.adapter import CHANGELOG_STATUSES, changelog_extension
+    from connectonion.useful_tools.jira import CHANGELOG_STATUSES as TOOL_STATUSES
+    assert CHANGELOG_STATUSES == TOOL_STATUSES
+    edited = [_history("1", "2026-10-05T10:00:00Z", "status", "To Do", "Done"), "broken"]
+    ok = changelog_extension({"status": "ok", "histories": edited, "reason": ""})
+    assert ok["status"] == "ok" and len(ok["entries"]) == 1 and ok["skipped"] == 1 and "reason" not in ok
+    assert changelog_extension({"status": "none", "histories": [], "reason": ""}) == {"status": "none", "entries": []}
+    restricted = changelog_extension({"status": "restricted", "histories": [], "reason": "Jira returned 403 for ALPHA-3"})
+    assert restricted == {"status": "restricted", "entries": [], "reason": "Jira returned 403 for ALPHA-3"}
+    for unknown in (None, {}, {"status": "maybe"}, "ok"):
+        assert changelog_extension(unknown)["status"] == "unavailable"

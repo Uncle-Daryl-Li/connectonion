@@ -14,7 +14,9 @@ LLM-Note:
     raw ADF kept under extensions.description_adf; due and resolution dates kept under extensions
     The same item twice in one batch (e.g. overlapping pages) yields one record; the repeat is reported in errors
     Placement is explicit: ongoing changes → write_daily_jsonl(); a one-off project import → write_export() (prototype writer)
-  F13FCAKE-18 prototype status:
+  F13FCAKE-12 Jira history status:
+    Jira.issue_changelogs() → per-issue outcome {status, histories, reason}; changelog_extension() turns it into
+    {status, entries, reason} with entries from jira_changelog_entries() (time, author name, field from → to)
     Jira chain -- fully integrated: verify_connection -> issue_items -> write_source_yaml -> jira_issues_to_records -> write_daily_jsonl
     OneNote chain -- adapter function implemented and tested with synthetic fixtures; live Notes.Read integration is pending authorized account credentials and OneNote team implementation
 
@@ -450,6 +452,68 @@ def _display_name(person) -> str:
 
 def _list(value) -> list:
     return value if isinstance(value, list) else []
+
+
+# History outcomes a record may carry (F13FCAKE-12); mirrors jira.CHANGELOG_STATUSES.
+CHANGELOG_STATUSES = ("ok", "none", "restricted", "unavailable")
+CHANGE_VALUE_CHARS = 1000
+
+
+# Raw Jira histories → readable entries: when, who (display name only), which field changed from what to what.
+def jira_changelog_entries(histories: list) -> tuple[list[dict], int]:
+    """Return (entries oldest first, number of malformed histories skipped).
+
+    Entry: {"id", "at", "author", "changes": [{"field", "from", "to"}]}. Only the human-readable
+    values (fromString / toString) are kept; Jira's internal ids and account emails are dropped.
+    A value longer than CHANGE_VALUE_CHARS is cut and marked. A history that is not an object or
+    has no readable change is skipped and counted, never raised.
+    """
+    entries, skipped = [], 0
+    for history in _list(histories):
+        entry = _changelog_entry(history)
+        if entry is None:
+            skipped += 1
+        else:
+            entries.append(entry)
+    return sorted(entries, key=lambda entry: entry["at"]), skipped
+
+
+def _changelog_entry(history) -> dict | None:
+    if not isinstance(history, dict):
+        return None
+    changes = [{"field": str(item.get("field") or ""),
+                "from": _change_value(item.get("fromString")),
+                "to": _change_value(item.get("toString"))}
+               for item in _list(history.get("items")) if isinstance(item, dict) and item.get("field")]
+    if not changes:
+        return None
+    return {"id": str(history.get("id") or ""), "at": str(history.get("created") or ""),
+            "author": _display_name(history.get("author")), "changes": changes}
+
+
+def _change_value(value) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= CHANGE_VALUE_CHARS:
+        return text
+    return text[:CHANGE_VALUE_CHARS] + f" … [{len(text) - CHANGE_VALUE_CHARS} more characters]"
+
+
+# One issue's history outcome → the extensions.changelog value stored on its record.
+def changelog_extension(outcome) -> dict:
+    """{"status", "entries", "reason"?, "skipped"?} from a Jira.issue_changelogs() outcome.
+
+    "none" (never edited) and "restricted"/"unavailable" (could not read) stay distinct; a missing or
+    unrecognised outcome becomes "unavailable" so an unknown state is never reported as "no history".
+    """
+    if not isinstance(outcome, dict) or outcome.get("status") not in CHANGELOG_STATUSES:
+        return {"status": "unavailable", "entries": [], "reason": "history outcome missing or unrecognised"}
+    entries, skipped = jira_changelog_entries(outcome.get("histories"))
+    extension = {"status": outcome["status"], "entries": entries}
+    if outcome.get("reason"):
+        extension["reason"] = str(outcome["reason"])
+    if skipped:
+        extension["skipped"] = skipped
+    return extension
 
 
 def onenote_pages_to_records(pages: list[dict], account: str, *, fetched: str | None = None) -> AdapterResult:
