@@ -27,6 +27,7 @@ from .file_tools import (
 )
 from .gdrive import GDrive
 from .generate_image import generate_image
+from .jira import Jira, JiraAuthError, JiraConfigError, JiraPermissionError
 from .youtube import YouTube
 from .get_emails import get_emails, mark_read, mark_unread
 from .gmail import Gmail
@@ -87,6 +88,10 @@ __all__ = [
     "Outlook",
     "MicrosoftCalendar",
     "OneNote",
+    "Jira",
+    "JiraConfigError",
+    "JiraAuthError",
+    "JiraPermissionError",
     "WebFetch",
     "web_search",
     "web_fetch",
