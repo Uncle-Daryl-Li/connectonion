@@ -72,4 +72,3 @@ def register_onenote_source(parent, factory) -> None:
               as_json: bool = typer.Option(False, "--json")):
         """List a bounded page set and report whether later pages remain."""
         _run(lambda source: source.pages(notebook, section, limit=limit), as_json, "pages")
-
