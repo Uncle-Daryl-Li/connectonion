@@ -3,7 +3,7 @@
 One record shape for every co rem source integration. Jira and OneNote map
 into it, and `validate_record()` checks both against the same rules.
 Implementation: `connectonion/useful_tools/adapter.py`.
-Tests: `tests/unit/test_jira.py` (cases `16-1` … `16-22`); `adapter.py` line and branch coverage 100%.
+Tests: `tests/unit/test_jira.py` (cases `16-1` … `16-24`); `adapter.py` line and branch coverage 100%.
 
 ---
 
@@ -85,9 +85,11 @@ input. Each item is mapped and checked; a valid record goes to
 Every rejected item gets its own entry; valid items in the same batch are unaffected.
 
 `co jira sync` never hides them: it still writes the valid records, prints
-`Records written: N`, lists each rejected item on stderr (or under
-`"rejected"` with `"records"` in `--json` output) and exits with code 1.
-A clean run has `"rejected": {}` and exits 0.
+`Records mapped: N  Records appended: M`, lists each rejected item on stderr
+(or under `"rejected"` next to `"mapped"` and `"appended"` in `--json` output)
+and exits with code 1. A clean run has `"rejected": {}` and exits 0.
+`mapped` counts records that passed the contract; `appended` counts the ones
+actually added to today's file, so a same-day re-sync shows `appended: 0`.
 
 ## Layout (#1938)
 
@@ -101,7 +103,8 @@ Records are placed under `~/.co/rem/docs/<source>/`:
   exports/<id>/records.jsonl        one-off import: records
 ```
 
-The prototype writer (`write_daily_jsonl`, F13FCAKE-18) writes `daily/` only,
+The prototype writer (`write_daily_jsonl`, F13FCAKE-18; `append_daily_jsonl` also
+returns how many records were new) writes `daily/` only,
 dated by the import day, and skips a record whose `(source, account, id)`
 already exists in that day's file. A page cites a record by file and id, for
 example `docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42`.
@@ -122,7 +125,7 @@ example `docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42`.
 python -m pytest tests/unit/test_jira.py -q
 ```
 
-Expected: all tests pass, including `16-1` … `16-22`.
+Expected: all tests pass, including `16-1` … `16-24`.
 
 Coverage check:
 

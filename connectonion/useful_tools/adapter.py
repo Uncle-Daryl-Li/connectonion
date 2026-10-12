@@ -3,7 +3,7 @@ Purpose: Shared record contract and common adapter for co rem source integration
 LLM-Note:
   Dependencies: imports from [datetime, json, dataclasses, pathlib] | imported by [tests/unit/test_jira.py, cli/commands/jira_commands.py] | no network calls
   Data flow: raw tool output (Jira issues / OneNote pages) → *_to_records() → make_record() envelope → validate_record() → AdapterResult (valid records + per-item errors) → write_daily_jsonl stores under daily/YYYY/MM/DD.jsonl
-  State/Effects: write_daily_jsonl() creates directories and writes files; all other functions are pure
+  State/Effects: write_daily_jsonl() / append_daily_jsonl() create directories and write files (append_daily_jsonl also returns how many records were new); all other functions are pure
   Integration: RECORD_FIELDS is the #1833 envelope every source writes; record_id() is the shared identity rule; make_record() / media_ref() build records; validate_record() is the one contract check for every source; AdapterResult is the shared result type; consume_records() is the in-memory consumer; consume_jsonl_records() reads from disk across multiple source directories; jira_issues_to_records() and onenote_pages_to_records() are the converter functions
   Errors: write_daily_jsonl() raises ValueError if the existing JSONL file contains a malformed line (refuses to append to a corrupted file) | consume_jsonl_records() never raises — malformed lines are recorded in AdapterResult.errors keyed by "file:lineno" | converters never raise on bad input — an invalid or malformed item is left out of records and reported in AdapterResult.errors keyed by "<source>:<item>"
   F13FCAKE-16 contract status:
@@ -165,13 +165,23 @@ def consume_records(result: AdapterResult) -> list[dict]:
 
 
 def write_daily_jsonl(records: list[dict], source_dir: Path) -> Path:
+    """Append records as JSONL under source_dir/daily/YYYY/MM/DD.jsonl and return that path.
+
+    Same behaviour as append_daily_jsonl(); use that when the caller needs to know how
+    many records were actually appended (CLI summaries).
+    """
+    return append_daily_jsonl(records, source_dir)[0]
+
+
+# Same append as write_daily_jsonl, but also reports how many records were new (not deduplicated away).
+def append_daily_jsonl(records: list[dict], source_dir: Path) -> tuple[Path, int]:
     """Append records as JSONL under source_dir/daily/YYYY/MM/DD.jsonl.
 
     Deduplicates by (source, account, id): records whose composite key already
     exists in the file are skipped so that a second write on the same day
     does not overwrite or duplicate entries from the first write.  Duplicate
     keys within the same records list are also suppressed.
-    Creates all intermediate directories.  Returns the path written.
+    Creates all intermediate directories.  Returns (path written, number of records appended).
     Raises ValueError if the existing file contains a malformed JSON line —
     refuses to append to a corrupted file to avoid data inconsistency.
     """
@@ -212,7 +222,7 @@ def write_daily_jsonl(records: list[dict], source_dir: Path) -> Path:
         for record in new_records:
             json.dump(record, fh, ensure_ascii=False)
             fh.write("\n")
-    return target
+    return target, len(new_records)
 
 
 def consume_jsonl_records(
