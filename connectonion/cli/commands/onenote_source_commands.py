@@ -45,7 +45,7 @@ def _run(operation, as_json: bool, family: str | None = None) -> None:
 
 
 def register_onenote_source(parent, factory) -> None:
-    source_app = factory(help="Verify the existing Microsoft connection for read-only OneNote access.",
+    source_app = factory(help="Read-only OneNote collection: choose notebook, section and explicit page IDs.",
                          no_args_is_help=True)
     parent.add_typer(source_app, name="source")
 
@@ -53,4 +53,23 @@ def register_onenote_source(parent, factory) -> None:
     def verify(as_json: bool = typer.Option(False, "--json")):
         """Verify existing co auth microsoft credentials and OneNote read access."""
         _run(lambda source: source.verify_connection(), as_json)
+
+    @source_app.command("notebooks")
+    def notebooks(as_json: bool = typer.Option(False, "--json")):
+        """List all accessible notebooks, following pagination."""
+        _run(lambda source: {"notebooks": source.notebooks()}, as_json, "notebooks")
+
+    @source_app.command("sections")
+    def sections(notebook: str = typer.Argument(..., help="Notebook ID or unique exact name"),
+                 as_json: bool = typer.Option(False, "--json")):
+        """List all sections of the selected notebook, following pagination."""
+        _run(lambda source: {"sections": source.sections(notebook)}, as_json, "sections")
+
+    @source_app.command("pages")
+    def pages(notebook: str = typer.Argument(..., help="Notebook ID or unique exact name"),
+              section: str = typer.Argument(..., help="Section ID or unique exact name within that notebook"),
+              limit: int = typer.Option(100, "--limit", min=1, max=1000),
+              as_json: bool = typer.Option(False, "--json")):
+        """List a bounded page set and report whether later pages remain."""
+        _run(lambda source: source.pages(notebook, section, limit=limit), as_json, "pages")
 

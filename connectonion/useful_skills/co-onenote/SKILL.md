@@ -68,3 +68,11 @@ co onenote read "Sprint retro"            # read by exact title
   `co onenote ls` to refresh section numbers.
 - **Pagination**: `pages` defaults to 20 results. Pass a specific section
   number to narrow the scope when needed.
+
+## Source scope discovery
+
+Run `co onenote source notebooks --json`, then `sections NOTEBOOK_ID --json`
+and `pages NOTEBOOK_ID SECTION_ID --limit 100 --json`. Prefer stable IDs.
+Ask the user to choose the scope; empty scope is valid and truncated means
+more pages remain. Pagination must stay on the selected Graph collection.
+Page import is provided separately by F13FCAKE-14.

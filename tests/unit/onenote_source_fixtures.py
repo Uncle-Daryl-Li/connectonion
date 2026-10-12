@@ -5,7 +5,8 @@ import httpx
 import pytest
 
 BASE = "https://graph.microsoft.com/v1.0"
-DATA = {"notebooks": [{"id": "nb-fixture", "displayName": "Synthetic notebook"}], "sections": [], "pages": []}
+FIXTURES = Path(__file__).parents[1] / "fixtures" / "onenote"
+DATA = json.loads((FIXTURES / "pages.json").read_text(encoding="utf-8"))
 HTML = ""
 
 @pytest.fixture
