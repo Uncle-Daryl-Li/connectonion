@@ -2483,7 +2483,7 @@ app.add_typer(mcp_app, name="mcp")
 
 # Jira (F13FCAKE-9/10/18): verify, list projects, and read selected issues.
 jira_app = _typer_app(
-    help="Verify Jira access, list projects, and read selected issues. Requires JIRA_URL, JIRA_EMAIL, and JIRA_API_TOKEN from co env set.",
+    help="Verify Jira access, list projects, and read selected issues. JIRA_URL and JIRA_EMAIL can be set with 'co env set'. JIRA_API_TOKEN must be supplied only as a temporary, non-persistent shell environment variable; use the no-echo setup procedure documented in the Jira Skill, then unset it after the command.",
     epilog="Examples: co jira verify; co jira projects --json; co jira issues ALPHA ALPHA-1 --json",
 )
 app.add_typer(jira_app, name="jira")

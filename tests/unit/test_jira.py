@@ -396,6 +396,58 @@ def test_issue_items_jql_query_is_scoped_server_side_not_post_filtered():
     assert result == [_I1, _I2]
 
 
+def test_issue_items_sends_explicit_fields_param():
+    """10-6c-fields: issue_items() sends fields=<comma-list> to search/jql; contains required fields."""
+    received_params: list[dict] = []
+
+    def get(url, auth=None, params=None, timeout=None):
+        received_params.append(dict(params or {}))
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"issues": [_I1]})
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        Jira().issue_items("ALPHA", {"ALPHA-1"})
+
+    assert len(received_params) == 1
+    fields_param = received_params[0].get("fields", "")
+    assert fields_param, "fields param must be present and non-empty"
+    field_names = [f.strip() for f in fields_param.split(",")]
+    for required in ("summary", "description", "status", "created", "updated"):
+        assert required in field_names, f"required field {required!r} missing from fields param"
+
+
+def test_issue_items_realistic_response_shape_with_fields_succeeds():
+    """10-6c-shape: server returns realistic shape (expand/fields/id/key/self) -> key check passes."""
+    realistic_issue = {
+        "expand": "operations,versionedRepresentations,editmeta,changelog,renderedFields",
+        "id": "10001",
+        "key": "ALPHA-1",
+        "self": "https://example.atlassian.net/rest/api/3/issue/10001",
+        "fields": {
+            "summary": "Realistic issue summary",
+            "description": None,
+            "status": {"name": "To Do", "id": "1"},
+            "created": "2024-01-15T09:00:00.000+0000",
+            "updated": "2024-01-16T12:00:00.000+0000",
+        },
+    }
+
+    def get(url, auth=None, params=None, timeout=None):
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"issues": [realistic_issue]})
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().issue_items("ALPHA", {"ALPHA-1"})
+
+    assert len(result) == 1
+    assert result[0]["key"] == "ALPHA-1"
+    assert result[0]["fields"]["summary"] == "Realistic issue summary"
+
+
 def test_issue_items_rejects_key_from_wrong_project_before_network():
     """10-6d: BETA-1 passed to ALPHA project -> ValueError, 0 HTTP; message names the key."""
     call_count = [0]
