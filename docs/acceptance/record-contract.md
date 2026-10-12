@@ -92,7 +92,7 @@ pages) and stores it on that issue's own record, matched by issue key:
 - A change value longer than 1000 characters is cut and marked; malformed history entries are
   skipped and counted under `skipped`.
 - `co jira sync --no-history` skips these reads; the records then have no `changelog` key.
-- If history was skipped, restricted or unavailable, retrying with readable history appends
+- If history was skipped, restricted or unavailable, retrying `co jira sync` with readable history appends
   the recovered evidence even when Jira's `updated` timestamp has not changed. An identical
   retry appends nothing; only a new `fetched` time does not create a snapshot.
 - `--json` output reports `"history": {"ok": n, "none": n, "restricted": n, "unavailable": n}`
@@ -156,7 +156,7 @@ unusable `--export` id before contacting Jira or writing any file:
 
 | Placement | Use for | Writer | Behaviour |
 |-----------|---------|--------|-----------|
-| `daily/YYYY/MM/DD.jsonl` | ongoing changes from a sync — `co jira sync PROJECT KEY…` | `write_daily_jsonl` / `append_daily_jsonl` (F13FCAKE-18) | dated by the import day; deduplicates `(source, account, id, updated, content hash)`, ignoring `fetched`; an edit or newly read history appends a snapshot even with the same `updated`. Existing lines and earlier days' files are never rewritten (F13FCAKE-12); `append_daily_jsonl` also returns how many were new |
+| `daily/YYYY/MM/DD.jsonl` | ongoing changes from a sync — `co jira sync PROJECT KEY…` | `write_daily_jsonl` / `append_daily_jsonl` (F13FCAKE-18) | dated by the import day; existing lines and earlier days' files are never rewritten. Default (every source, including the OneNote import): one line per `(source, account, id)` per day, so a page that changed later the same day is skipped. `co jira sync` opts in with `keep_versions=True` (F13FCAKE-12): deduplicates `(source, account, id, updated, content hash)`, ignoring `fetched`, so an edit or newly read history appends a snapshot even with the same `updated`. `append_daily_jsonl` also returns how many were new |
 | `exports/<id>/` | a one-off import, e.g. a project's history — `co jira sync PROJECT KEY… --export <id>` | `write_export` (F13FCAKE-11 prototype) | written once, never appended; refuses an unsafe or existing id, any invalid or repeated record, and data that cannot be saved as JSON before writing anything; staged in a hidden `.<id>.partial` directory and renamed into place; if writing fails the staging directory is removed so the same id can be retried (a `.partial` left by a crash is reported with instructions to delete it) |
 
 `exports/<id>/manifest.json` example:

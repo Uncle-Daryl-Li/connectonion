@@ -120,7 +120,7 @@ def handle_jira_sync(
     Full workflow: verify → issue_items → issue_changelogs → write_source_yaml → jira_issues_to_records → placement.
     History (F13FCAKE-12): one extra read per issue, attached as extensions.changelog; history=False
     (--no-history) skips those reads and the records carry no changelog.
-    Placement (F13FCAKE-11): ongoing sync → append_daily_jsonl (daily/YYYY/MM/DD.jsonl);
+    Placement (F13FCAKE-11): ongoing sync → append_daily_jsonl(keep_versions=True) (daily/YYYY/MM/DD.jsonl);
     export_id given → write_export (exports/<export_id>/ records.jsonl + manifest.json), a one-off import.
     An unusable export id is refused before any request or file write.
     Writes to output_dir (default: ~/.co/rem/docs/jira).
@@ -205,7 +205,7 @@ def _print_history(counts: dict | None) -> None:
 def _place_records(records: list[dict], output_dir: Path, export_id: str | None, scope: dict) -> tuple[Path, int]:
     from ...useful_tools.adapter import append_daily_jsonl, write_export
     if export_id is None:
-        return append_daily_jsonl(records, output_dir)
+        return append_daily_jsonl(records, output_dir, keep_versions=True)
     return write_export(records, output_dir, export_id, scope) / "records.jsonl", len(records)
 
 

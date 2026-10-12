@@ -2708,10 +2708,10 @@ def test_changed_item_is_appended_as_a_new_version_and_old_lines_stay(tmp_path):
     day = datetime.date(2026, 10, 12)
     draft = jira_issues_to_records([_DRAFT], JIRA_URL).records
     final = jira_issues_to_records([_FINAL], JIRA_URL).records
-    path, _ = append_daily_jsonl(draft, tmp_path, date=day)
+    path, _ = append_daily_jsonl(draft, tmp_path, date=day, keep_versions=True)
     original = path.read_text(encoding="utf-8")
-    assert append_daily_jsonl(final, tmp_path, date=day) == (path, 1)
-    assert append_daily_jsonl(final + draft, tmp_path, date=day) == (path, 0)
+    assert append_daily_jsonl(final, tmp_path, date=day, keep_versions=True) == (path, 1)
+    assert append_daily_jsonl(final + draft, tmp_path, date=day, keep_versions=True) == (path, 0)
     stored = path.read_text(encoding="utf-8")
     assert stored.startswith(original)
     assert [json.loads(line)["title"] for line in stored.splitlines()] == ["Draft", "Final"]
@@ -2723,9 +2723,9 @@ def test_a_new_day_never_rewrites_the_previous_day(tmp_path):
     from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records
     draft = jira_issues_to_records([_DRAFT], JIRA_URL).records
     final = jira_issues_to_records([_FINAL], JIRA_URL).records
-    yesterday, _ = append_daily_jsonl(draft, tmp_path, date=datetime.date(2026, 10, 11))
+    yesterday, _ = append_daily_jsonl(draft, tmp_path, date=datetime.date(2026, 10, 11), keep_versions=True)
     before = yesterday.read_bytes()
-    today, appended = append_daily_jsonl(final, tmp_path, date=datetime.date(2026, 10, 12))
+    today, appended = append_daily_jsonl(final, tmp_path, date=datetime.date(2026, 10, 12), keep_versions=True)
     assert appended == 1
     assert yesterday.read_bytes() == before
     assert today.relative_to(tmp_path).as_posix() == "daily/2026/10/12.jsonl"
@@ -2757,8 +2757,8 @@ def test_resolve_reference_returns_the_cited_version_or_none(tmp_path):
     day = datetime.date(2026, 10, 12)
     draft = jira_issues_to_records([_DRAFT], JIRA_URL).records
     final = jira_issues_to_records([_FINAL], JIRA_URL).records
-    path, _ = append_daily_jsonl(draft, jira_dir, date=day)
-    append_daily_jsonl(final, jira_dir, date=day)
+    path, _ = append_daily_jsonl(draft, jira_dir, date=day, keep_versions=True)
+    append_daily_jsonl(final, jira_dir, date=day, keep_versions=True)
     with open(path, "a", encoding="utf-8") as fh:
         fh.write("{damaged line\n")
     reference = record_reference(path, draft[0], notebook)
@@ -2889,10 +2889,10 @@ def test_reference_keeps_its_snapshot_after_same_day_update(tmp_path):
     day = datetime.date(2026, 10, 12)
     draft = jira_issues_to_records([_DRAFT], JIRA_URL, fetched=_FETCHED).records[0]
     final = jira_issues_to_records([_FINAL], JIRA_URL, fetched=_FETCHED).records[0]
-    path, _ = append_daily_jsonl([draft], source_dir, date=day)
+    path, _ = append_daily_jsonl([draft], source_dir, date=day, keep_versions=True)
     reference = record_reference(path, draft, notebook)
     assert resolve_reference(reference, notebook) == draft
-    append_daily_jsonl([final], source_dir, date=day)
+    append_daily_jsonl([final], source_dir, date=day, keep_versions=True)
     assert resolve_reference(reference, notebook) == draft
     assert record_reference(path, final, notebook) != reference
     assert resolve_reference(record_reference(path, final, notebook), notebook) == final
@@ -2937,8 +2937,8 @@ def test_fetch_time_alone_does_not_append_or_change_the_citation(tmp_path):
     )
     first = jira_issues_to_records([_DRAFT], JIRA_URL, fetched="2026-10-12T10:00:00Z").records[0]
     reread = jira_issues_to_records([_DRAFT], JIRA_URL, fetched="2026-10-12T11:00:00Z").records[0]
-    path, _ = append_daily_jsonl([first], tmp_path, date=datetime.date(2026, 10, 12))
-    assert append_daily_jsonl([reread], tmp_path, date=datetime.date(2026, 10, 12)) == (path, 0)
+    path, _ = append_daily_jsonl([first], tmp_path, date=datetime.date(2026, 10, 12), keep_versions=True)
+    assert append_daily_jsonl([reread], tmp_path, date=datetime.date(2026, 10, 12), keep_versions=True) == (path, 0)
     assert record_reference(path, first, tmp_path) == record_reference(path, reread, tmp_path)
     assert resolve_reference(record_reference(path, reread, tmp_path), tmp_path) == first
 
@@ -2949,10 +2949,10 @@ def test_legacy_reference_keeps_the_first_stored_record(tmp_path):
     draft = jira_issues_to_records([_DRAFT], JIRA_URL, fetched=_FETCHED).records[0]
     final = jira_issues_to_records([_FINAL], JIRA_URL, fetched=_FETCHED).records[0]
     day = datetime.date(2026, 10, 12)
-    path, _ = append_daily_jsonl([draft], tmp_path, date=day)
+    path, _ = append_daily_jsonl([draft], tmp_path, date=day, keep_versions=True)
     reference = f"{path.relative_to(tmp_path).as_posix()}#{draft['id']}"
     assert resolve_reference(reference, tmp_path) == draft
-    append_daily_jsonl([final], tmp_path, date=day)
+    append_daily_jsonl([final], tmp_path, date=day, keep_versions=True)
     assert resolve_reference(reference, tmp_path) == draft
 
 
@@ -2963,7 +2963,7 @@ def test_missing_or_invalid_snapshot_never_falls_back_to_another_record(tmp_path
         append_daily_jsonl, jira_issues_to_records, record_reference, resolve_reference,
     )
     record = jira_issues_to_records([_DRAFT], JIRA_URL, fetched=_FETCHED).records[0]
-    path, _ = append_daily_jsonl([record], tmp_path, date=datetime.date(2026, 10, 12))
+    path, _ = append_daily_jsonl([record], tmp_path, date=datetime.date(2026, 10, 12), keep_versions=True)
     prefix = record_reference(path, record, tmp_path).rpartition("?version=")[0]
     assert resolve_reference(f"{prefix}?version={version}", tmp_path) is None
 
@@ -2976,8 +2976,8 @@ def test_record_key_order_does_not_create_a_new_snapshot(tmp_path):
     reordered = dict(reversed(list(record.items())))
     reordered["extensions"] = dict(reversed(list(record["extensions"].items())))
     day = datetime.date(2026, 10, 12)
-    path, _ = append_daily_jsonl([record], tmp_path, date=day)
-    assert append_daily_jsonl([reordered], tmp_path, date=day) == (path, 0)
+    path, _ = append_daily_jsonl([record], tmp_path, date=day, keep_versions=True)
+    assert append_daily_jsonl([reordered], tmp_path, date=day, keep_versions=True) == (path, 0)
     assert record_reference(path, record, tmp_path) == record_reference(path, reordered, tmp_path)
 
 
@@ -2992,15 +2992,15 @@ def test_more_history_at_the_same_updated_time_keeps_both_snapshots(tmp_path):
     complete = jira_issues_to_records([_DRAFT], JIRA_URL, changelogs={"ALPHA-1": _outcome("ok", histories)},
                                   fetched=_FETCHED).records[0]
     day = datetime.date(2026, 10, 12)
-    path, count = append_daily_jsonl([partial, complete, partial, complete], tmp_path, date=day)
+    path, count = append_daily_jsonl([partial, complete, partial, complete], tmp_path, date=day, keep_versions=True)
     assert count == 2
-    assert append_daily_jsonl([partial, complete], tmp_path, date=day) == (path, 0)
+    assert append_daily_jsonl([partial, complete], tmp_path, date=day, keep_versions=True) == (path, 0)
     assert resolve_reference(record_reference(path, partial, tmp_path), tmp_path) == partial
     assert resolve_reference(record_reference(path, complete, tmp_path), tmp_path) == complete
 
 
-def test_shared_writer_keeps_onenote_evidence_and_its_old_citation(tmp_path):
-    """12-38: the shared writer also preserves OneNote scope/media references when new evidence is appended."""
+def test_shared_writer_keeps_onenote_same_day_rule_and_its_citation(tmp_path):
+    """12-38: by default a changed same-day OneNote page is skipped (its import rule); versions are opt-in only."""
     from connectonion.useful_tools.adapter import (
         append_daily_jsonl, media_ref, onenote_pages_to_records, record_reference, resolve_reference,
     )
@@ -3012,9 +3012,10 @@ def test_shared_writer_keeps_onenote_evidence_and_its_old_citation(tmp_path):
     day = datetime.date(2026, 10, 12)
     path, _ = append_daily_jsonl([first], tmp_path, date=day)
     reference = record_reference(path, first, tmp_path)
-    assert append_daily_jsonl([enriched], tmp_path, date=day) == (path, 1)
+    assert append_daily_jsonl([enriched], tmp_path, date=day) == (path, 0)
     assert resolve_reference(reference, tmp_path) == first
-    stored = resolve_reference(record_reference(path, enriched, tmp_path), tmp_path)
-    assert stored == enriched
-    assert stored["extensions"]["scope"] == {"sections": ["design"]}
-    assert stored["extensions"]["media_fetch_references"] == {"diagram": "attachment-1"}
+    assert first["extensions"]["scope"] == {"sections": ["design"]}
+    assert first["extensions"]["media_fetch_references"] == {"diagram": "attachment-1"}
+    assert append_daily_jsonl([enriched], tmp_path, date=day, keep_versions=True) == (path, 1)
+    assert resolve_reference(reference, tmp_path) == first
+    assert resolve_reference(record_reference(path, enriched, tmp_path), tmp_path) == enriched

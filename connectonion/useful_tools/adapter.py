@@ -17,7 +17,8 @@ LLM-Note:
   F13FCAKE-12 Jira history status:
     Jira.issue_changelogs() → per-issue outcome {status, histories, reason}; changelog_extension() turns it into
     {status, entries, reason} with entries from jira_changelog_entries() (time, author name, field from → to)
-    A changed item or newly read history is appended as a new snapshot; fetched alone never creates a duplicate
+    co jira sync appends with keep_versions=True: a changed item or newly read history is appended as a new snapshot;
+      fetched alone never creates a duplicate. Other sources (OneNote) keep the default one-line-per-id-per-day rule
     record_reference() cites "<notebook-relative file>#<id>?version=<content hash>"; resolution keeps that snapshot
     Jira chain -- fully integrated: verify_connection -> issue_items -> issue_changelogs (co jira sync, unless --no-history)
       -> write_source_yaml -> jira_issues_to_records(changelogs=...) -> write_daily_jsonl / write_export
@@ -210,13 +211,15 @@ def write_daily_jsonl(records: list[dict], source_dir: Path) -> Path:
 
 # Same append as write_daily_jsonl, but also reports how many records were new (not deduplicated away).
 def append_daily_jsonl(records: list[dict], source_dir: Path, *,
-                       date: datetime.date | None = None) -> tuple[Path, int]:
+                       date: datetime.date | None = None, keep_versions: bool = False) -> tuple[Path, int]:
     """Append records as JSONL under source_dir/daily/YYYY/MM/DD.jsonl.
 
-    Deduplicates by identity, updated and a content hash excluding fetched. An unchanged
-    re-read is skipped; an edit or newly available history is appended even if updated has
-    not changed. Old lines stay untouched (F13FCAKE-12). Duplicate snapshots within the
-    same records list are also suppressed.
+    Default (every source): deduplicates by (source, account, id), so an id already in that
+    day's file is skipped even if its content changed — the OneNote import relies on this.
+    keep_versions=True (co jira sync, F13FCAKE-12): deduplicates by identity, updated and a
+    content hash excluding fetched, so an edit or newly available history is appended as a new
+    snapshot even if updated has not changed, while an unchanged re-read is still skipped.
+    Old lines stay untouched either way. Duplicates within the same records list are also suppressed.
     Creates all intermediate directories.  Returns (path written, number of records appended).
     Raises ValueError if the existing file contains a malformed JSON line —
     refuses to append to a corrupted file to avoid data inconsistency.
@@ -236,7 +239,7 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
                 if line:
                     try:
                         rec = json.loads(line)
-                        existing_keys.add(_version_key(rec))
+                        existing_keys.add(_dedupe_key(rec, keep_versions))
                     except (json.JSONDecodeError, AttributeError, TypeError) as exc:
                         raise ValueError(
                             f"Existing JSONL file {target} is corrupted at line {lineno}: {exc}. "
@@ -246,7 +249,7 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
     seen_keys: set[tuple] = set(existing_keys)
     new_records: list[dict] = []
     for r in records:
-        key = _version_key(r)
+        key = _dedupe_key(r, keep_versions)
         if key not in seen_keys:
             seen_keys.add(key)
             new_records.append(r)
@@ -265,10 +268,12 @@ def _snapshot_hash(record: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-# Version identity includes evidence content, not just Jira's last-modified time.
-def _version_key(record) -> tuple:
-    identity = tuple(record.get(name, "") for name in ("source", "account", "id", "updated"))
-    return (*identity, _snapshot_hash(record))
+# Same item = same (source, account, id); with keep_versions each distinct snapshot of it counts separately.
+def _dedupe_key(record, keep_versions: bool) -> tuple:
+    identity = tuple(record.get(name, "") for name in ("source", "account", "id"))
+    if not keep_versions:
+        return identity
+    return (*identity, record.get("updated", ""), _snapshot_hash(record))
 
 
 # Cite one immutable snapshot, so later appends cannot change the evidence behind a page.
