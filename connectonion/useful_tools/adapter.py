@@ -17,6 +17,8 @@ LLM-Note:
   F13FCAKE-12 Jira history status:
     Jira.issue_changelogs() → per-issue outcome {status, histories, reason}; changelog_extension() turns it into
     {status, entries, reason} with entries from jira_changelog_entries() (time, author name, field from → to)
+    A changed item is appended to the daily file as a new version (dedupe key includes "updated"); older lines stay
+    record_reference() cites a stored record as "<notebook-relative file>#<id>"; resolve_reference() follows it back
     Jira chain -- fully integrated: verify_connection -> issue_items -> write_source_yaml -> jira_issues_to_records -> write_daily_jsonl
     OneNote chain -- adapter function implemented and tested with synthetic fixtures; live Notes.Read integration is pending authorized account credentials and OneNote team implementation
 
@@ -209,10 +211,10 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
                        date: datetime.date | None = None) -> tuple[Path, int]:
     """Append records as JSONL under source_dir/daily/YYYY/MM/DD.jsonl.
 
-    Deduplicates by (source, account, id): records whose composite key already
-    exists in the file are skipped so that a second write on the same day
-    does not overwrite or duplicate entries from the first write.  Duplicate
-    keys within the same records list are also suppressed.
+    Deduplicates by (source, account, id, updated): a record whose version is already in the
+    file is skipped, so a same-day re-sync neither overwrites nor duplicates entries; a changed
+    item (new "updated") is appended as a newer version below the old line, which stays as it was
+    (F13FCAKE-12). Duplicate versions within the same records list are also suppressed.
     Creates all intermediate directories.  Returns (path written, number of records appended).
     Raises ValueError if the existing file contains a malformed JSON line —
     refuses to append to a corrupted file to avoid data inconsistency.
@@ -232,11 +234,7 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
                 if line:
                     try:
                         rec = json.loads(line)
-                        existing_keys.add((
-                            rec.get("source", ""),
-                            rec.get("account", ""),
-                            rec.get("id", ""),
-                        ))
+                        existing_keys.add(_version_key(rec))
                     except (json.JSONDecodeError, AttributeError, TypeError) as exc:
                         raise ValueError(
                             f"Existing JSONL file {target} is corrupted at line {lineno}: {exc}. "
@@ -246,7 +244,7 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
     seen_keys: set[tuple] = set(existing_keys)
     new_records: list[dict] = []
     for r in records:
-        key = (r.get("source", ""), r.get("account", ""), r.get("id", ""))
+        key = _version_key(r)
         if key not in seen_keys:
             seen_keys.add(key)
             new_records.append(r)
@@ -256,6 +254,54 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
             json.dump(record, fh, ensure_ascii=False)
             fh.write("\n")
     return target, len(new_records)
+
+
+# Version identity in a daily file: the same item with a new "updated" time is a new version.
+def _version_key(record) -> tuple:
+    return tuple(record.get(name, "") for name in ("source", "account", "id", "updated"))
+
+
+# Citation for one stored record: notebook-relative file path + "#" + record id (F13FCAKE-12).
+def record_reference(file_path: Path, record: dict, notebook_root: Path) -> str:
+    """Return "<file relative to notebook_root>#<record id>", e.g. "docs/jira/daily/2026/10/12.jsonl#jira:…".
+
+    The path always uses "/" so a reference written on Windows resolves on macOS and Linux.
+    Raises ValueError if file_path is outside notebook_root or the record has no id.
+    """
+    root = Path(notebook_root).resolve()
+    path = Path(file_path).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError(f"{file_path} is outside the notebook {notebook_root}; a reference must stay inside it.")
+    if not isinstance(record, dict) or not record.get("id"):
+        raise ValueError("The record has no id, so it cannot be referenced.")
+    return f"{path.relative_to(root).as_posix()}#{record['id']}"
+
+
+# Follow a reference back to its record; the newest line for that id wins (new versions are appended below).
+def resolve_reference(reference: str, notebook_root: Path) -> dict | None:
+    """Return the record a record_reference() points to, or None if it cannot be found.
+
+    None when the reference has no "#", points outside notebook_root, names a missing file, or no
+    line in that file carries the id. Malformed lines are skipped, so reading never raises on a damaged file.
+    """
+    relative, _, wanted = str(reference).partition("#")
+    root = Path(notebook_root).resolve()
+    path = (root / relative).resolve()
+    if not wanted or not path.is_relative_to(root) or not path.is_file():
+        return None
+    found = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        record = _json_line(line)
+        if isinstance(record, dict) and record.get("id") == wanted:
+            found = record
+    return found
+
+
+def _json_line(line: str):
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
 
 
 # One-off import (#1938): a validated snapshot in exports/<id>/, written once and never appended to.

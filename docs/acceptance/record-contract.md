@@ -120,7 +120,7 @@ unusable `--export` id before contacting Jira or writing any file:
 
 | Placement | Use for | Writer | Behaviour |
 |-----------|---------|--------|-----------|
-| `daily/YYYY/MM/DD.jsonl` | ongoing changes from a sync — `co jira sync PROJECT KEY…` | `write_daily_jsonl` / `append_daily_jsonl` (F13FCAKE-18) | dated by the import day; appends, skipping a record whose `(source, account, id)` is already in that day's file; `append_daily_jsonl` also returns how many were new |
+| `daily/YYYY/MM/DD.jsonl` | ongoing changes from a sync — `co jira sync PROJECT KEY…` | `write_daily_jsonl` / `append_daily_jsonl` (F13FCAKE-18) | dated by the import day; appends, skipping a record whose `(source, account, id, updated)` is already in that day's file, so a changed item is added as a new version below the old line and existing lines (and earlier days' files) are never rewritten (F13FCAKE-12); `append_daily_jsonl` also returns how many were new |
 | `exports/<id>/` | a one-off import, e.g. a project's history — `co jira sync PROJECT KEY… --export <id>` | `write_export` (F13FCAKE-11 prototype) | written once, never appended; refuses an unsafe or existing id, any invalid or repeated record, and data that cannot be saved as JSON before writing anything; staged in a hidden `.<id>.partial` directory and renamed into place; if writing fails the staging directory is removed so the same id can be retried (a `.partial` left by a crash is reported with instructions to delete it) |
 
 `exports/<id>/manifest.json` example:
@@ -143,14 +143,25 @@ export (0 records) is a valid outcome. These are prototype writers for the
 client's layout; the general storage, blob, quota and eviction engines stay
 with the client.
 
+### References (F13FCAKE-12)
+
 A page cites a record by file and id, for example
 `docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42`.
+
+- `record_reference(file, record, notebook_root)` builds it: the file path relative to
+  the notebook root, always with `/`, then `#` and the record id. A file outside the
+  notebook or a record without an id raises `ValueError`.
+- `resolve_reference(reference, notebook_root)` follows it back. When a file holds
+  several versions of the same item, the newest (last) line wins. A missing file, an
+  unknown id, a reference without `#` or one pointing outside the notebook gives
+  `None`; damaged lines are skipped.
+- Daily files and `exports/<id>/records.jsonl` are cited the same way.
 
 ## Not in this contract yet
 
 | Item | Story |
 |------|-------|
-| Changelog under `extensions.changelog`, new version on update (`updated` in the dedupe key) | F13FCAKE-12 |
+| Changelog under `extensions.changelog` collected by `co jira sync` | F13FCAKE-12 |
 | Who owns the production `exports/` writer (prototype here) | confirm on #1938 |
 | OneNote page HTML → text, per-user `account` value | F13FCAKE-14 / F13FCAKE-15 |
 

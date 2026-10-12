@@ -2690,3 +2690,89 @@ def test_records_with_history_survive_the_daily_round_trip(tmp_path):
     assert read_back == records
     assert validate_record(read_back[0]) == []
     assert read_back[0]["extensions"]["changelog"]["entries"][0]["author"] == "Diego Example"
+
+
+def _version(updated: str, summary: str) -> dict:
+    return {"id": "10001", "key": "ALPHA-1", "fields": {"summary": summary, "updated": updated}}
+
+
+_DRAFT = _version("2026-10-12T09:00:00.000+0000", "Draft")
+_FINAL = _version("2026-10-12T15:30:00.000+0000", "Final")
+
+
+def test_changed_item_is_appended_as_a_new_version_and_old_lines_stay(tmp_path):
+    """12-21: the same issue with a new "updated" is appended below; the same version is skipped; line 1 is untouched."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records
+    day = datetime.date(2026, 10, 12)
+    draft = jira_issues_to_records([_DRAFT], JIRA_URL).records
+    final = jira_issues_to_records([_FINAL], JIRA_URL).records
+    path, _ = append_daily_jsonl(draft, tmp_path, date=day)
+    original = path.read_text(encoding="utf-8")
+    assert append_daily_jsonl(final, tmp_path, date=day) == (path, 1)
+    assert append_daily_jsonl(final + draft, tmp_path, date=day) == (path, 0)
+    stored = path.read_text(encoding="utf-8")
+    assert stored.startswith(original)
+    assert [json.loads(line)["title"] for line in stored.splitlines()] == ["Draft", "Final"]
+    assert {json.loads(line)["id"] for line in stored.splitlines()} == {"jira:test.atlassian.net:ALPHA-1"}
+
+
+def test_a_new_day_never_rewrites_the_previous_day(tmp_path):
+    """12-22: a change synced the next day goes into that day's file; the previous day's file is byte-for-byte unchanged."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records
+    draft = jira_issues_to_records([_DRAFT], JIRA_URL).records
+    final = jira_issues_to_records([_FINAL], JIRA_URL).records
+    yesterday, _ = append_daily_jsonl(draft, tmp_path, date=datetime.date(2026, 10, 11))
+    before = yesterday.read_bytes()
+    today, appended = append_daily_jsonl(final, tmp_path, date=datetime.date(2026, 10, 12))
+    assert appended == 1
+    assert yesterday.read_bytes() == before
+    assert today.relative_to(tmp_path).as_posix() == "daily/2026/10/12.jsonl"
+
+
+def test_record_reference_is_notebook_relative_file_and_id(tmp_path):
+    """12-23: a reference is "<notebook-relative file>#<id>" with "/" separators; outside the notebook or no id raises."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records, record_reference
+    notebook = tmp_path / "notebook"
+    record = jira_issues_to_records([_I1], JIRA_URL).records[0]
+    path, _ = append_daily_jsonl([record], notebook / "docs" / "jira", date=datetime.date(2026, 10, 12))
+    assert record_reference(path, record, notebook) == (
+        "docs/jira/daily/2026/10/12.jsonl#jira:test.atlassian.net:ALPHA-1")
+    with pytest.raises(ValueError, match="outside the notebook"):
+        record_reference(tmp_path / "elsewhere.jsonl", record, notebook)
+    with pytest.raises(ValueError, match="no id"):
+        record_reference(path, {"title": "no id"}, notebook)
+
+
+def test_resolve_reference_returns_the_newest_version_or_none(tmp_path):
+    """12-24: the newest line for the id wins; unknown id, missing file, no "#" or a path escaping the notebook give None."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, jira_issues_to_records, record_reference, resolve_reference,
+    )
+    notebook = tmp_path / "notebook"
+    jira_dir = notebook / "docs" / "jira"
+    day = datetime.date(2026, 10, 12)
+    draft = jira_issues_to_records([_DRAFT], JIRA_URL).records
+    final = jira_issues_to_records([_FINAL], JIRA_URL).records
+    path, _ = append_daily_jsonl(draft, jira_dir, date=day)
+    append_daily_jsonl(final, jira_dir, date=day)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write("{damaged line\n")
+    reference = record_reference(path, draft[0], notebook)
+    assert resolve_reference(reference, notebook) == final[0]
+    (tmp_path / "outside.jsonl").write_text(json.dumps(draft[0]) + "\n", encoding="utf-8")
+    for broken in (reference.replace("ALPHA-1", "ALPHA-404"), reference.replace("12.jsonl", "13.jsonl"),
+                   reference.split("#")[0], "../outside.jsonl#" + draft[0]["id"], ""):
+        assert resolve_reference(broken, notebook) is None
+
+
+def test_references_also_point_into_one_off_exports(tmp_path):
+    """12-25: a record in exports/<id>/records.jsonl is cited and resolved the same way as a daily record."""
+    from connectonion.useful_tools.adapter import (
+        jira_issues_to_records, record_reference, resolve_reference, write_export,
+    )
+    notebook = tmp_path / "notebook"
+    records = jira_issues_to_records([_I1, _I2], JIRA_URL, fetched=_FETCHED).records
+    export_dir = write_export(records, notebook / "docs" / "jira", "alpha-history", _SCOPE)
+    reference = record_reference(export_dir / "records.jsonl", records[1], notebook)
+    assert reference == "docs/jira/exports/alpha-history/records.jsonl#jira:test.atlassian.net:ALPHA-2"
+    assert resolve_reference(reference, notebook) == records[1]
