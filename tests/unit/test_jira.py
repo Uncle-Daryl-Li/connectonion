@@ -2407,3 +2407,84 @@ def test_issue_changelog_stops_after_the_page_limit():
     with patch("connectonion.useful_tools.jira.httpx.get", endless):
         with pytest.raises(ValueError, match="exceeded 50 pages"):
             Jira().issue_changelog("ALPHA-1")
+
+
+def _changelog_by_key(responses: dict):
+    """httpx.get stand-in routing /issue/{key}/changelog to (status, values) per key; one page each."""
+    calls: list[str] = []
+
+    def get(url, auth=None, params=None, timeout=None):
+        key = url.rstrip("/").split("/issue/")[1].split("/")[0]
+        calls.append(key)
+        status, values = responses[key]
+        resp = MagicMock(status_code=status)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"values": values, "isLast": True})
+        return resp
+
+    return get, calls
+
+
+def test_issue_changelogs_classifies_each_issue_independently():
+    """12-6: ok / none / restricted / unavailable per issue; a 403 or 500 on one issue does not stop the others."""
+    from connectonion.useful_tools.jira import CHANGELOG_STATUSES
+    edited = [_history("1", "2026-10-05T10:00:00.000+1100", "status", "To Do", "Done")]
+    get, calls = _changelog_by_key({
+        "ALPHA-1": (200, edited),
+        "ALPHA-2": (200, []),
+        "ALPHA-3": (403, {"errorMessages": ["raw server body"]}),
+        "ALPHA-4": (500, []),
+    })
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        outcomes = Jira().issue_changelogs({"ALPHA-4", "ALPHA-2", "ALPHA-1", "ALPHA-3"})
+    assert list(outcomes) == ["ALPHA-1", "ALPHA-2", "ALPHA-3", "ALPHA-4"]
+    assert calls == ["ALPHA-1", "ALPHA-2", "ALPHA-3", "ALPHA-4"]
+    assert {k: v["status"] for k, v in outcomes.items()} == {
+        "ALPHA-1": "ok", "ALPHA-2": "none", "ALPHA-3": "restricted", "ALPHA-4": "unavailable"}
+    assert set(v["status"] for v in outcomes.values()) == set(CHANGELOG_STATUSES)
+    assert outcomes["ALPHA-1"]["histories"] == edited
+    assert outcomes["ALPHA-2"] == {"status": "none", "histories": [], "reason": ""}
+    assert "ALPHA-3" in outcomes["ALPHA-3"]["reason"]
+    assert "HTTP 500" in outcomes["ALPHA-4"]["reason"]
+
+
+def test_no_history_is_distinguishable_from_unreadable_history():
+    """12-7: "never edited" (none) and "could not read" (restricted/unavailable) are different outcomes."""
+    get, _ = _changelog_by_key({"ALPHA-1": (200, []), "ALPHA-2": (403, {}), "ALPHA-3": (429, [])})
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        outcomes = Jira().issue_changelogs(["ALPHA-1", "ALPHA-2", "ALPHA-3"])
+    assert [outcomes[k]["status"] for k in ("ALPHA-1", "ALPHA-2", "ALPHA-3")] == ["none", "restricted", "unavailable"]
+    assert outcomes["ALPHA-1"]["reason"] == ""
+    assert outcomes["ALPHA-2"]["reason"] and outcomes["ALPHA-3"]["reason"]
+    assert "rate limit" in outcomes["ALPHA-3"]["reason"]
+
+
+def test_issue_changelogs_reasons_never_leak_secrets_or_server_bodies():
+    """12-8: restricted / unavailable reasons contain the key and guidance, never the token, email or body."""
+    get, _ = _changelog_by_key({"ALPHA-1": (403, {"errorMessages": ["raw server body"]}),
+                                "ALPHA-2": (503, {"message": "raw outage body"})})
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        outcomes = Jira().issue_changelogs(["ALPHA-1", "ALPHA-2"])
+    text = json.dumps(outcomes)
+    for secret in (JIRA_TOKEN, JIRA_EMAIL, "raw server body", "raw outage body"):
+        assert secret not in text
+
+
+def test_authentication_failure_stops_the_whole_history_run():
+    """12-9: a 401 is not per item — issue_changelogs raises JiraAuthError instead of marking every issue."""
+    get, calls = _changelog_by_key({"ALPHA-1": (401, []), "ALPHA-2": (200, [])})
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(JiraAuthError):
+            Jira().issue_changelogs(["ALPHA-1", "ALPHA-2"])
+    assert calls == ["ALPHA-1"]
+
+
+def test_bad_key_in_a_history_batch_is_unavailable_without_a_request():
+    """12-10: an invalid key is reported as unavailable for that key only; no request is made for it."""
+    get, calls = _changelog_by_key({"ALPHA-1": (200, [])})
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        outcomes = Jira().issue_changelogs(["ALPHA-1", "not a key"])
+    assert outcomes["ALPHA-1"]["status"] == "none"
+    assert outcomes["not a key"]["status"] == "unavailable"
+    assert "Invalid Jira issue key" in outcomes["not a key"]["reason"]
+    assert calls == ["ALPHA-1"]

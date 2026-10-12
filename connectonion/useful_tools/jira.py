@@ -4,7 +4,7 @@ LLM-Note:
   Dependencies: imports from [os, re, pathlib, datetime, importlib.metadata, httpx, yaml, connectonion.environment.setting] | imported by [useful_tools/__init__.py, cli/commands/jira_commands.py] | tested by [tests/unit/test_jira.py]
   Data flow: Jira methods → HTTP Basic Auth (JIRA_EMAIL:JIRA_API_TOKEN) httpx requests to JIRA_URL → raw Jira REST API v3 JSON → returned as plain dicts/lists
   State/Effects: JIRA_URL and JIRA_EMAIL are read via setting() (may fall back to secret store) | JIRA_API_TOKEN is read ONLY from os.environ (never the secret store — must be a temporary shell export, never persisted) | write_source_yaml() creates source.yaml under source_dir | no blobs or derived files (metadata_only, v1)
-  Integration: exposes Jira with verify_connection(), project_items(), issue_items(), issue_changelog(), write_source_yaml() | CLI via cli/commands/jira_commands.py
+  Integration: exposes Jira with verify_connection(), project_items(), issue_items(), issue_changelog(), issue_changelogs(), write_source_yaml() | CLI via cli/commands/jira_commands.py
   Errors: JiraConfigError (missing env var) | JiraAuthError (HTTP 401) | JiraPermissionError (HTTP 403) — all ValueError subclasses; never swallow; never put token in messages
 
 Jira Cloud tool: list projects, collect issues, write source.yaml for co rem.
@@ -40,6 +40,9 @@ class JiraPermissionError(ValueError):
 _KEY_PATTERN = re.compile(r'^[A-Z][A-Z0-9]*-\d+$')
 
 _MAX_PAGES = 50
+
+# History outcome per work item (F13FCAKE-12): read with entries, read and empty, no permission, not readable now.
+CHANGELOG_STATUSES = ("ok", "none", "restricted", "unavailable")
 
 # Fields explicitly requested from the enhanced search endpoint.
 # Without an explicit fields param, Jira Cloud returns each issue with only
@@ -323,6 +326,31 @@ class Jira:
             f"Jira changelog pagination for {issue_key} exceeded {_MAX_PAGES} pages without reaching isLast=true. "
             "Aborting to prevent an infinite loop."
         )
+
+    # Change history for many work items; one item's missing permission or outage never stops the others.
+    def issue_changelogs(self, issue_keys) -> dict[str, dict]:
+        """Read the history of each key and classify it, keyed by issue key (sorted).
+
+        Each value is {"status": one of CHANGELOG_STATUSES, "histories": raw histories, "reason": text}:
+          ok          — history read, at least one entry
+          none        — history read, the issue was never edited
+          restricted  — HTTP 403 for this issue's history (the issue itself stays importable)
+          unavailable — anything else for this key (rate limit, 5xx, network, deleted issue, bad key)
+        Authentication or configuration failures are not per item: they raise and stop the run.
+        The reason never contains the token or the server's response body.
+        """
+        return {key: self._changelog_outcome(key) for key in sorted(issue_keys)}
+
+    def _changelog_outcome(self, issue_key: str) -> dict:
+        try:
+            histories = self.issue_changelog(issue_key)
+        except (JiraAuthError, JiraConfigError):
+            raise
+        except JiraPermissionError as exc:
+            return {"status": "restricted", "histories": [], "reason": str(exc)}
+        except ValueError as exc:
+            return {"status": "unavailable", "histories": [], "reason": str(exc)}
+        return {"status": "ok" if histories else "none", "histories": histories, "reason": ""}
 
     def write_source_yaml(
         self,
