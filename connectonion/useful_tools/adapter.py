@@ -1,11 +1,15 @@
 """
-Purpose: Common adapter contract for co rem source integrations (F13FCAKE-18).
+Purpose: Shared record contract and common adapter for co rem source integrations (F13FCAKE-16, F13FCAKE-18).
 LLM-Note:
   Dependencies: imports from [datetime, json, dataclasses, pathlib] | imported by [tests/unit/test_jira.py, cli/commands/jira_commands.py] | no network calls
-  Data flow: raw tool output (Jira issues / OneNote pages) → adapter functions → AdapterResult with provenance records → write_daily_jsonl stores under daily/YYYY/MM/DD.jsonl
+  Data flow: raw tool output (Jira issues / OneNote pages) → *_to_records() → make_record() envelope → validate_record() → AdapterResult (valid records + per-item errors) → write_daily_jsonl stores under daily/YYYY/MM/DD.jsonl
   State/Effects: write_daily_jsonl() creates directories and writes files; all other functions are pure
-  Integration: AdapterResult is the shared record type; consume_records() is the in-memory consumer; consume_jsonl_records() reads from disk across multiple source directories; jira_issues_to_records() and onenote_pages_to_records() are the converter functions
-  Errors: write_daily_jsonl() raises ValueError if the existing JSONL file contains a malformed line (refuses to append to a corrupted file) | consume_jsonl_records() never raises — malformed lines are recorded in AdapterResult.errors keyed by "file:lineno"; all other functions are pure and produce empty/partial records on malformed input
+  Integration: RECORD_FIELDS is the #1833 envelope every source writes; record_id() is the shared identity rule; make_record() / media_ref() build records; validate_record() is the one contract check for every source; AdapterResult is the shared result type; consume_records() is the in-memory consumer; consume_jsonl_records() reads from disk across multiple source directories; jira_issues_to_records() and onenote_pages_to_records() are the converter functions
+  Errors: write_daily_jsonl() raises ValueError if the existing JSONL file contains a malformed line (refuses to append to a corrupted file) | consume_jsonl_records() never raises — malformed lines are recorded in AdapterResult.errors keyed by "file:lineno" | converters never raise on bad input — an invalid or malformed item is left out of records and reported in AdapterResult.errors keyed by "<source>:<item>"
+  F13FCAKE-16 contract status:
+    Envelope, identity, extensions, media references and validation implemented for both sources; documented in docs/acceptance/record-contract.md
+    Jira description ADF is kept raw under extensions.description_adf; readable text conversion is F13FCAKE-11
+    OneNote page HTML is not fetched here; readable text conversion is F13FCAKE-14
   F13FCAKE-18 prototype status:
     Jira chain -- fully integrated: verify_connection -> issue_items -> write_source_yaml -> jira_issues_to_records -> write_daily_jsonl
     OneNote chain -- adapter function implemented and tested with synthetic fixtures; live Notes.Read integration is pending authorized account credentials and OneNote team implementation
@@ -14,11 +18,12 @@ Common adapter contract for co rem integrations.
 
 Usage:
     from connectonion.useful_tools.adapter import (
-        AdapterResult, consume_records, consume_jsonl_records,
+        AdapterResult, consume_records, consume_jsonl_records, validate_record,
         write_daily_jsonl, jira_issues_to_records, onenote_pages_to_records,
     )
     result = jira_issues_to_records(issues, base_url)
-    records = consume_records(result)
+    records = consume_records(result)          # only records that passed validate_record()
+    rejected = result.errors                   # "<source>:<item>" -> reason
     jsonl_path = write_daily_jsonl(result.records, source_dir)
     # Read back from disk (source-agnostic):
     result = consume_jsonl_records(jira_dir, onenote_dir)
@@ -30,17 +35,121 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# The shared envelope (#1833): every source writes exactly these top-level fields, plus optional "media".
+RECORD_FIELDS = ("id", "source", "account", "external_id", "kind", "title", "text",
+                 "url", "author", "at", "updated", "fetched", "extensions")
+REQUIRED_FIELDS = ("id", "source", "account", "external_id", "kind", "fetched")
+MEDIA_FIELDS = ("sha256", "name", "mime", "size", "status")
+MEDIA_STATUSES = ("metadata_only", "stored", "unavailable")
+
 
 @dataclass
 class AdapterResult:
-    """Common result type for all co rem source adapters (F13FCAKE-18).
+    """Common result type for all co rem source adapters (F13FCAKE-16, F13FCAKE-18).
 
-    records: list of provenance dicts with source/account/id/url/date.
-    errors: mapping of label → error message for partial failures.
+    records: list of envelope dicts that passed validate_record().
+    errors: mapping of label → error message for partial failures and rejected items.
     """
 
     records: list[dict] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
+
+
+# Shared identity rule: source + account + external id, e.g. "jira:test.atlassian.net:ALPHA-1".
+def record_id(source: str, account: str, external_id: str) -> str:
+    """Globally unique record id; the same external id in two sources or two accounts never collides."""
+    account_key = account.split("://", 1)[-1].rstrip("/")
+    return f"{source}:{account_key}:{external_id}"
+
+
+def _now_utc() -> str:
+    stamp = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    return stamp.isoformat().replace("+00:00", "Z")
+
+
+# Build one envelope; anything source-specific belongs under extensions, never at the top level.
+def make_record(source: str, account: str, external_id: str, kind: str, *,
+                title: str = "", text: str = "", url: str = "", author: str = "",
+                at: str = "", updated: str = "", extensions: dict | None = None,
+                media: list[dict] | None = None, fetched: str | None = None) -> dict:
+    """Return a record in the shared envelope; "media" is present only when there is media."""
+    record = {
+        "id": record_id(source, account, external_id),
+        "source": source, "account": account, "external_id": external_id, "kind": kind,
+        "title": title, "text": text, "url": url, "author": author,
+        "at": at, "updated": updated, "fetched": fetched or _now_utc(),
+        "extensions": extensions or {},
+    }
+    if media:
+        record["media"] = media
+    return record
+
+
+# Media reference (#1938): content hash when the bytes are stored, metadata only otherwise.
+def media_ref(name: str, mime: str = "", size: int | None = None,
+              sha256: str | None = None, status: str = "metadata_only") -> dict:
+    """Describe an image or attachment without embedding or downloading it."""
+    return {"sha256": sha256, "name": name, "mime": mime, "size": size, "status": status}
+
+
+# The one contract check every source mapping is validated against; empty list means valid.
+def validate_record(record) -> list[str]:
+    """Return every contract violation in one record, worded for a mapping-error report."""
+    if not isinstance(record, dict):
+        return ["record is not an object"]
+    problems = [f"missing required field '{name}'" for name in REQUIRED_FIELDS if not record.get(name)]
+    problems += [f"field '{name}' must be a string" for name in RECORD_FIELDS
+                 if name != "extensions" and name in record and not isinstance(record[name], str)]
+    if not isinstance(record.get("extensions", {}), dict):
+        problems.append("field 'extensions' must be an object")
+    expected = record_id(str(record.get("source", "")), str(record.get("account", "")),
+                         str(record.get("external_id", "")))
+    if record.get("id") and record["id"] != expected:
+        problems.append(f"field 'id' must be '{expected}' (source:account:external_id)")
+    problems += _media_problems(record.get("media", []))
+    problems += [f"unknown top-level field '{name}'; put source-specific data under extensions"
+                 for name in sorted(set(record) - set(RECORD_FIELDS) - {"media"})]
+    return problems
+
+
+def _media_problems(media) -> list[str]:
+    if not isinstance(media, list):
+        return ["field 'media' must be a list"]
+    problems = []
+    for index, item in enumerate(media):
+        if not isinstance(item, dict) or set(item) != set(MEDIA_FIELDS):
+            problems.append(f"media[{index}] must have exactly: {', '.join(MEDIA_FIELDS)}")
+        elif item["status"] not in MEDIA_STATUSES:
+            problems.append(f"media[{index}] has unknown status {item['status']!r}")
+        elif item["status"] == "stored" and not item["sha256"]:
+            problems.append(f"media[{index}] is stored but has no sha256 content hash")
+    return problems
+
+
+# Map every item, keep only valid records; malformed or invalid items are reported, not raised.
+def _collect(items: list, source: str, shape_problems, build) -> AdapterResult:
+    result = AdapterResult()
+    for index, item in enumerate(items):
+        problems = shape_problems(item)
+        record = None if problems else build(item)
+        problems = problems or validate_record(record)
+        if problems:
+            result.errors[_error_label(result.errors, source, item, index)] = "mapping error: " + "; ".join(problems)
+        else:
+            result.records.append(record)
+    return result
+
+
+# Error labels stay unique: a second bad item with the same key gets "#<position>" instead of overwriting.
+def _error_label(errors: dict, source: str, item, index: int) -> str:
+    label = f"{source}:{_item_label(item, index)}"
+    return f"{label}#{index}" if label in errors else label
+
+
+def _item_label(item, index: int) -> str:
+    if isinstance(item, dict) and (item.get("key") or item.get("id")):
+        return str(item.get("key") or item.get("id"))
+    return f"item-{index}"
 
 
 def consume_records(result: AdapterResult) -> list[dict]:
@@ -137,50 +246,115 @@ def consume_jsonl_records(
     return AdapterResult(records=records, errors=errors)
 
 
-def jira_issues_to_records(issues: list[dict], base_url: str) -> AdapterResult:
-    """Convert raw Jira issue dicts to provenance records (F13FCAKE-18).
+def jira_issues_to_records(issues: list[dict], base_url: str, *, fetched: str | None = None) -> AdapterResult:
+    """Convert raw Jira issue dicts to shared-contract records (F13FCAKE-16, F13FCAKE-18).
 
-    Each record contains: source ("jira"), account (site URL), id (issue key),
-    url (browse URL), date (created or updated timestamp from fields),
-    summary (inline issue text — metadata_only convention, no blob hash references).
-    Token and email are never included.
+    Envelope: id = "jira:<site>:<key>", external_id = issue key, kind = issue type,
+    title = summary, url = browse URL, author = reporter, at = created, updated = updated.
+    Jira-only fields (status, priority, labels, people, parent, raw ADF) go under extensions;
+    attachments become metadata-only media references. Token and email are never included.
+    An item that is not an object or fails validate_record() is reported in errors, not raised.
     """
-    records = []
-    for issue in issues:
-        key = issue.get("key", "")
-        fields = issue.get("fields") or {}
-        record: dict = {
-            "source": "jira",
-            "account": base_url,
-            "id": key,
-            "url": f"{base_url}/browse/{key}",
-            "date": fields.get("created") or fields.get("updated", ""),
-            "summary": fields.get("summary", ""),
-        }
-        description = fields.get("description")
-        if description:
-            record["description"] = description
-        records.append(record)
-    return AdapterResult(records=records)
+    stamp = fetched or _now_utc()
+    return _collect(issues, "jira", _jira_shape_problems, lambda issue: _jira_record(issue, base_url, stamp))
 
 
-def onenote_pages_to_records(pages: list[dict], account: str) -> AdapterResult:
-    """Convert raw OneNote page dicts to provenance records (F13FCAKE-18).
+def _jira_shape_problems(issue) -> list[str]:
+    if not isinstance(issue, dict):
+        return ["item is not an object"]
+    if not isinstance(issue.get("fields", {}), dict):
+        return ["'fields' is not an object"]
+    return []
 
-    Each record contains: source ("onenote"), account (Graph account URL),
-    id (page id), url (oneNoteWebUrl or contentUrl), date (lastModifiedDateTime).
+
+# One Jira issue → one envelope; description ADF stays raw until F13FCAKE-11 converts it.
+def _jira_record(issue: dict, base_url: str, fetched: str) -> dict:
+    fields = issue.get("fields") or {}
+    key = str(issue.get("key") or "")
+    description = fields.get("description")
+    return make_record(
+        "jira", base_url, key, _name(fields.get("issuetype")) or "issue",
+        title=str(fields.get("summary") or ""),
+        text=description if isinstance(description, str) else "",
+        url=f"{base_url}/browse/{key}" if key else "",
+        author=_display_name(fields.get("reporter") or fields.get("creator")),
+        at=str(fields.get("created") or ""), updated=str(fields.get("updated") or ""),
+        extensions=_jira_extensions(issue, fields),
+        media=[_jira_media(item) for item in _list(fields.get("attachment")) if isinstance(item, dict)],
+        fetched=fetched,
+    )
+
+
+# Jira-only fields kept under extensions; empty values are left out.
+def _jira_extensions(issue: dict, fields: dict) -> dict:
+    parent = fields.get("parent")
+    description = fields.get("description")
+    values = {
+        "issue_id": str(issue.get("id") or ""),
+        "status": _name(fields.get("status")),
+        "priority": _name(fields.get("priority")),
+        "labels": [str(label) for label in _list(fields.get("labels"))],
+        "assignee": _display_name(fields.get("assignee")),
+        "reporter": _display_name(fields.get("reporter")),
+        "parent": str(parent.get("key") or "") if isinstance(parent, dict) else "",
+        "description_adf": description if isinstance(description, dict) else None,
+    }
+    return {name: value for name, value in values.items() if value not in ("", None, [])}
+
+
+def _jira_media(attachment: dict) -> dict:
+    return media_ref(str(attachment.get("filename") or ""), str(attachment.get("mimeType") or ""),
+                     attachment.get("size"))
+
+
+def _name(value) -> str:
+    return str(value.get("name") or "") if isinstance(value, dict) else ""
+
+
+def _display_name(person) -> str:
+    """Display name only; account emails never enter a record."""
+    return str(person.get("displayName") or "") if isinstance(person, dict) else ""
+
+
+def _list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def onenote_pages_to_records(pages: list[dict], account: str, *, fetched: str | None = None) -> AdapterResult:
+    """Convert raw OneNote page dicts to shared-contract records (F13FCAKE-16, F13FCAKE-18).
+
+    Envelope: id = "onenote:<account>:<page id>", external_id = page id, kind = "page",
+    title, url (oneNoteWebUrl, or contentUrl flagged extensions.url_is_api),
+    at = createdDateTime, updated = lastModifiedDateTime; section and notebook go under extensions.
+    Page HTML is not fetched here (F13FCAKE-14). Invalid items are reported in errors, not raised.
     """
-    records = []
-    for page in pages:
-        page_id = page.get("id", "")
-        web_url = ((page.get("links") or {}).get("oneNoteWebUrl") or {}).get("href", "")
-        if not web_url:
-            web_url = page.get("contentUrl", "")
-        records.append({
-            "source": "onenote",
-            "account": account,
-            "id": page_id,
-            "url": web_url,
-            "date": page.get("lastModifiedDateTime", ""),
-        })
-    return AdapterResult(records=records)
+    stamp = fetched or _now_utc()
+    return _collect(pages, "onenote", _onenote_shape_problems, lambda page: _onenote_record(page, account, stamp))
+
+
+def _onenote_shape_problems(page) -> list[str]:
+    return [] if isinstance(page, dict) else ["item is not an object"]
+
+
+# One OneNote page → one envelope; the web link is preferred over the Graph content URL.
+def _onenote_record(page: dict, account: str, fetched: str) -> dict:
+    links = page.get("links") if isinstance(page.get("links"), dict) else {}
+    web = links.get("oneNoteWebUrl")
+    web_url = str(web.get("href") or "") if isinstance(web, dict) else ""
+    content_url = str(page.get("contentUrl") or "")
+    values = {
+        "section": _parent_name(page.get("parentSection")),
+        "notebook": _parent_name(page.get("parentNotebook")),
+        "url_is_api": True if not web_url and content_url else None,
+    }
+    return make_record(
+        "onenote", account, str(page.get("id") or ""), "page",
+        title=str(page.get("title") or ""), url=web_url or content_url,
+        at=str(page.get("createdDateTime") or ""), updated=str(page.get("lastModifiedDateTime") or ""),
+        extensions={name: value for name, value in values.items() if value not in ("", None)},
+        fetched=fetched,
+    )
+
+
+def _parent_name(parent) -> str:
+    return str(parent.get("displayName") or "") if isinstance(parent, dict) else ""
