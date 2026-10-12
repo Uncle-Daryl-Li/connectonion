@@ -52,6 +52,25 @@ def test_shared_mapping_rejection_is_reported_without_losing_valid_page(graph, m
     assert "onenote:page-good" in result.errors
     assert "text" in result.errors["onenote:page-good"]
 
+
+def test_legacy_daily_directory_is_preserved_and_cli_reports_upgrade_requirement(graph, tmp_path):
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    result = sync_onenote(OneNoteSource(), "nb-fixture", "section-fixture", ["page-good"], tmp_path)
+    target = Path(result["jsonl"])
+    legacy = {"source": "onenote", "account": "https://graph.microsoft.com/v1.0/users/fixture-user",
+              "id": "page-good", "date": "2026-10-02T01:00:00Z", "text": "Legacy content"}
+    target.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+    original = target.read_bytes()
+    config = (tmp_path / "source.yaml").read_bytes()
+    output = CliRunner().invoke(app, ["onenote", "source", "sync", "nb-fixture", "section-fixture",
+                                     "page-good", "--output", str(tmp_path), "--json"])
+    assert output.exit_code == 1
+    error = json.loads(output.stdout)["error"]
+    assert "incompatible" in error and "new --output" in error
+    assert target.read_bytes() == original
+    assert (tmp_path / "source.yaml").read_bytes() == config
+
 def test_selected_import_preserves_content_media_and_partial_errors(graph):
     routes, calls = graph
     routes["/me/onenote/pages/page-malformed"] = ["invalid"]

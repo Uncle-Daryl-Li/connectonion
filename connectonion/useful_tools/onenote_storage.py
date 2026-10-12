@@ -43,6 +43,22 @@ def write_import(result: AdapterResult, source_dir: Path, target: Path, scope: d
     doc = source_config(source_dir, account, scope, command)
     now = doc["validated_with"]["timestamp"]
     if mode == "daily":
+        # Pre-contract imports used page IDs as the deduplication key. Never
+        # silently mix those rows with the global IDs expected by consumers.
+        if target.exists():
+            for lineno, line in enumerate(target.read_text(encoding="utf-8").splitlines(), 1):
+                if not line.strip():
+                    continue
+                try:
+                    existing = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(f"Existing JSONL is corrupted at line {lineno}; preserved without appending.") from error
+                if not isinstance(existing, dict):
+                    raise ValueError(f"Existing JSONL is corrupted at line {lineno}; preserved without appending.")
+                if validate_record(existing):
+                    raise ValueError("Existing JSONL contains an incompatible or corrupted record; "
+                                     "preserved without appending. Use a new --output directory for "
+                                     "the shared record format; automatic migration is not implemented.")
         # Keep classification and actual file consistent if collection crosses midnight.
         date = datetime.strptime(target.relative_to(source_dir).as_posix(), "daily/%Y/%m/%d.jsonl").date()
         target, written = append_daily_jsonl(result.records, source_dir, date=date)

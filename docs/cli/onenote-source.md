@@ -73,6 +73,10 @@ accounts, notebooks, sections or page selections. Existing export IDs cannot be
 overwritten. Every record has an `extensions.ingestion` field identifying its mode and
 relative JSONL path.
 
+Daily imports refuse to append to an existing file containing the older record
+format. The file and source configuration are preserved; use a new `--output`
+directory. Automatic migration of previous imports is not implemented.
+
 `source.yaml` contains driver, stable account, notebook/section/page scope,
 `retention: 90d`, `media_policy: metadata_only`, the version, exact import command,
 config path and validation timestamp. Retention is a declaration for the
