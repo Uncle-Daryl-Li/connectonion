@@ -2,7 +2,7 @@
 
 ## Baseline and authentication
 
-- Implementation branch: `F13FCAKE-13`.
+- Implementation branch: `F13FCAKE-15`, depending on `F13FCAKE-13`.
 - Starting revision: `d69aecda` (`origin/develop` at implementation time).
 - Tested source version: ConnectOnion `1.9.2b10`, Python `3.13.5`, Windows.
 - This baseline is newer than the task's original `1.9.0a39` example; no 1.8.x
@@ -31,4 +31,35 @@ Offline fixture success does not establish live consent support.
 python -m pytest tests/unit/test_onenote_source_auth.py tests/unit/test_onenote.py tests/unit/test_provider_credentials.py -q
 ```
 
-Discovery and selection are added by F13FCAKE-15; page import is added by F13FCAKE-14. This branch exposes `co onenote source verify` only.
+This branch adds notebook/section discovery, bounded page selection and scope configuration on top of F13FCAKE-13 verification. Page content import and configuration persistence are added by F13FCAKE-14.
+
+## Choose the exact scope
+
+
+```console
+co onenote source notebooks --json
+co onenote source sections NOTEBOOK_ID --json
+co onenote source pages NOTEBOOK_ID SECTION_ID --limit 100 --json
+```
+
+Notebook and section IDs are preferred; unique exact names also work. Duplicate
+names, unknown IDs and inaccessible scopes are rejected. Discovery follows all
+Graph pages and includes nested section groups. Empty notebooks and sections
+are valid results. Each page listing is bounded (1–1000); `truncated: true`
+explicitly means more pages remain. Increase `--limit` to inspect a larger set;
+the source never silently claims this bounded listing is a complete notebook.
+
+Copy only the desired page IDs into the import command. Before reading each
+page's HTML, collection verifies its current parent notebook and section. A
+moved page or one outside the scope is skipped with an error; its body is not
+fetched. Only explicit IDs are collected. Pagination links must stay on the
+same Microsoft Graph collection; redirects, foreign hosts and loops are refused.
+
+
+## Scope declaration
+
+`onenote_scope.source_config()` builds the account-bound `source.yaml` declaration with driver, scope, retention, metadata-only policy and validation provenance. It does not write records or register a runtime source. Persistence and explicit daily/export import arrive in F13FCAKE-14.
+
+```console
+python -m pytest tests/unit/test_onenote_source_auth.py tests/unit/test_onenote_source_scope.py -q
+```

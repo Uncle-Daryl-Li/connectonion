@@ -111,7 +111,10 @@ HANDLER = None   # the handler prints its own, data-dependent tip (e.g. "co gmai
 # Audited 2026-09-08 over every command: which ended on a URL, a file path,
 # `✓ done.` or nothing. Everything below that is not HANDLER was one of those.
 NEXT = {
-    "co onenote source verify": "co onenote source verify --help",
+    "co onenote source verify": "co onenote source notebooks",
+    "co onenote source notebooks": "co onenote source sections --help",
+    "co onenote source sections": "co onenote source pages --help",
+    "co onenote source pages": "co onenote source pages --help",
     # -- top level --
     "co ai": HANDLER,                 # the answer is the output
     "co announce": "Give subscribers the address they follow:  co keys",
