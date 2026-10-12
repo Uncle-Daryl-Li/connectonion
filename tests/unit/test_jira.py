@@ -2243,6 +2243,74 @@ def test_failed_export_leaves_nothing_behind_and_can_be_retried(tmp_path):
     assert (export_dir / "manifest.json").exists()
 
 
+def _sync_cli(args: list[str], issues: list[dict]):
+    """Run co jira sync with a mocked Jira; returns (result, mock_jira)."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.verify_connection.return_value = {
+            "accountId": "abc", "displayName": "Alice", "site_url": JIRA_URL,
+        }
+        mock_jira.return_value.issue_items.return_value = issues
+        mock_jira.return_value.write_source_yaml = MagicMock()
+        result = CliRunner().invoke(app, ["jira", "sync", *args])
+    return result, mock_jira
+
+
+def test_sync_export_writes_a_one_off_snapshot_instead_of_daily(tmp_path):
+    """11-27: co jira sync --export <id> places the records in exports/<id>/ with a manifest; daily/ is untouched."""
+    result, _ = _sync_cli(["ALPHA", "ALPHA-1", "ALPHA-2", "--output", str(tmp_path),
+                           "--export", "ALPHA-history", "--json"], [_I1, _I2])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    export_dir = tmp_path / "exports" / "ALPHA-history"
+    assert data["placement"] == "export"
+    assert data["jsonl"] == str(export_dir / "records.jsonl")
+    assert (data["mapped"], data["appended"]) == (2, 2)
+    manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["scope"] == {"projects": ["ALPHA"], "issues": ["ALPHA-1", "ALPHA-2"]}
+    assert manifest["counts"]["records"] == 2
+    assert not (tmp_path / "daily").exists()
+
+
+def test_sync_without_export_reports_daily_placement(tmp_path):
+    """11-28: the ongoing path is unchanged and says so: placement "daily", records in today's daily file."""
+    result, _ = _sync_cli(["ALPHA", "ALPHA-1", "--output", str(tmp_path), "--json"], [_I1])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["placement"] == "daily"
+    assert "/daily/" in data["jsonl"].replace("\\", "/")
+    assert not (tmp_path / "exports").exists()
+
+
+def test_sync_export_with_unusable_id_fails_before_any_request(tmp_path):
+    """11-29: a bad or already-used export id exits 1 before calling Jira or writing source.yaml."""
+    bad, mock_jira = _sync_cli(["ALPHA", "ALPHA-1", "--output", str(tmp_path), "--export", "../escape"], [_I1])
+    assert bad.exit_code == 1
+    assert "Invalid export id" in bad.stderr
+    mock_jira.assert_not_called()
+    first, _ = _sync_cli(["ALPHA", "ALPHA-1", "--output", str(tmp_path), "--export", "once"], [_I1])
+    assert first.exit_code == 0, first.output
+    again, mock_jira = _sync_cli(["ALPHA", "ALPHA-1", "--output", str(tmp_path), "--export", "once", "--json"], [_I1])
+    assert again.exit_code == 1
+    assert "already exists" in json.loads(again.stdout)["error"]
+    mock_jira.assert_not_called()
+
+
+def test_jira_help_is_defined_once_with_the_temporary_token_guidance():
+    """11-30: co jira is registered once; its help gives the temporary-token rule and sync documents --export."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    import connectonion.cli.main as cli_main
+    source = Path(cli_main.__file__).read_text(encoding="utf-8")
+    assert source.count("jira_app = _typer_app(") == 1
+    top = CliRunner().invoke(app, ["jira", "--help"])
+    assert "temporary" in top.stdout
+    assert "Requires JIRA_URL, JIRA_EMAIL, and JIRA_API_TOKEN from co env set" not in top.stdout
+    sync_help = CliRunner().invoke(app, ["jira", "sync", "--help"])
+    assert "--export" in sync_help.stdout
+
+
 _SCOPE = {"projects": ["ALPHA"], "issues": "all", "reason": "first import of project history"}
 
 
