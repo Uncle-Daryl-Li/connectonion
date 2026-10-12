@@ -70,3 +70,8 @@ credentials, refresh and throttling retries as `Outlook()`.
 | `OneNote refused this sign-in (HTTP 401)` | Run `co auth microsoft` to obtain `Notes.ReadWrite` for a personal account. |
 | `No section named …` | `co onenote ls` for the exact names and ids |
 | `Several sections are named …` | pass the section id instead |
+
+## Read-only source connection
+
+Use `co onenote source verify --json` to verify the existing Microsoft credentials
+without OneNote writes. See [source connection](onenote-source.md) for scope requirements.
