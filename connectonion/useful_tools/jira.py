@@ -44,7 +44,11 @@ _MAX_PAGES = 50
 # Fields explicitly requested from the enhanced search endpoint.
 # Without an explicit fields param, Jira Cloud returns each issue with only
 # {"id": ...} — key and all application fields are omitted.
-_ISSUE_FIELDS = ("summary", "description", "status", "created", "updated")
+# The set covers everything the shared record maps (F13FCAKE-11): content, type, status,
+# priority, people, labels, dates, parent and attachment metadata.
+ISSUE_FIELDS = ("summary", "description", "issuetype", "status", "priority", "labels",
+                "assignee", "reporter", "creator", "created", "updated", "duedate",
+                "resolutiondate", "parent", "attachment")
 
 class Jira:
     """Read-only Jira Cloud integration: project listing, issue collection, source.yaml."""
@@ -194,7 +198,7 @@ class Jira:
         Pagination: nextPageToken (absent = last page); startAt is silently ignored by server.
         JQL is server-scoped: project = project_key AND key IN (selected_issue_keys).
 
-        fields=_ISSUE_FIELDS is passed explicitly on every request. Without it, Jira Cloud's
+        fields=ISSUE_FIELDS is passed explicitly on every request. Without it, Jira Cloud's
         enhanced search endpoint returns each issue with only {"id": ...} — key and all
         application fields (summary, status, etc.) are omitted from the response.
 
@@ -243,7 +247,7 @@ class Jira:
             params: dict = {
                 "jql": jql,
                 "maxResults": max_results,
-                "fields": ",".join(_ISSUE_FIELDS),
+                "fields": ",".join(ISSUE_FIELDS),
             }
             if next_token is not None:
                 params["nextPageToken"] = next_token

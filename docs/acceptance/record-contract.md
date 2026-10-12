@@ -20,7 +20,7 @@ has images or attachments. Nothing else is allowed at the top level.
 | `external_id` | yes | The source's own id | issue key | page id |
 | `kind` | yes | Item type | issue type name, else `issue` | `page` |
 | `title` | no | Title | `summary` | `title` |
-| `text` | no | Readable content | plain-string description only (ADF → text is F13FCAKE-11) | empty (HTML → text is F13FCAKE-14) |
+| `text` | no | Readable content | description converted from ADF by `jira_adf.adf_to_text()` (light Markdown: headings, lists, code fences, quotes, tables; media as `[attachment: name]`) | empty (HTML → text is F13FCAKE-14) |
 | `url` | no | Link back to the original item | browse URL | `oneNoteWebUrl`, else `contentUrl` |
 | `author` | no | Who wrote it (display name) | reporter, else creator | — |
 | `at` | no | Created time, as the source gives it | `created` | `createdDateTime` |
@@ -32,6 +32,10 @@ has images or attachments. Nothing else is allowed at the top level.
 All fields except `extensions` and `media` are strings. Every envelope field must
 be present: optional ones may be empty (`""` or `{}`) but never missing —
 `validate_record()` reports `missing field '<name>'` otherwise.
+
+Jira content comes from `Jira.issue_items()`, which asks `/search/jql` for
+`jira.ISSUE_FIELDS` explicitly (`fields=` on every page), so the record does not
+depend on the server's default field set (F13FCAKE-11).
 
 ## Identity
 
@@ -52,7 +56,7 @@ are left out.
 
 | Source | Keys |
 |--------|------|
-| Jira | `issue_id`, `status`, `priority`, `labels`, `assignee`, `reporter`, `parent`, `description_adf` (raw ADF until F13FCAKE-11) |
+| Jira | `issue_id`, `status`, `priority`, `labels`, `assignee`, `reporter`, `parent`, `duedate`, `resolutiondate`, `description_adf` (the raw ADF, kept so nothing in the original is lost) |
 | OneNote | `section`, `notebook`, `url_is_api` (true when `url` is the Graph content URL, not a web link) |
 
 People are stored by display name only. Account emails and tokens never enter
@@ -80,9 +84,16 @@ input. Each item is mapped and checked; a valid record goes to
 "jira:ALPHA-9":  "mapping error: 'fields' is not an object"
 "jira:item-3":   "mapping error: missing required field 'external_id'; ..."
 "jira:ALPHA-9#4": "mapping error: ..."   (a second bad item with the same key: "#<position>")
+"jira:ALPHA-50":  "mapping error: duplicate of an earlier item in this batch (jira:<site>:ALPHA-50); the first copy was kept"
 ```
 
 Every rejected item gets its own entry; valid items in the same batch are unaffected.
+This includes failures nobody anticipated: if mapping one item raises (for example
+an ADF date node far outside the calendar), that item is reported as
+`content could not be mapped (<error type>: …)` and the batch continues.
+The same item twice in one batch (for example a server repeating an issue on the
+next page) produces one record; the repeat is reported, so pagination can neither
+duplicate nor silently drop items (F13FCAKE-11).
 
 `co jira sync` never hides them: it still writes the valid records, prints
 `Records mapped: N  Records appended: M`, lists each rejected item on stderr
@@ -103,20 +114,44 @@ Records are placed under `~/.co/rem/docs/<source>/`:
   exports/<id>/records.jsonl        one-off import: records
 ```
 
-The prototype writer (`write_daily_jsonl`, F13FCAKE-18; `append_daily_jsonl` also
-returns how many records were new) writes `daily/` only,
-dated by the import day, and skips a record whose `(source, account, id)`
-already exists in that day's file. A page cites a record by file and id, for
-example `docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42`.
+Every item is placed explicitly by the caller (F13FCAKE-11). `co jira sync` reports
+which one it used as `"placement": "daily"` or `"export"` in `--json` output, and refuses an
+unusable `--export` id before contacting Jira or writing any file:
+
+| Placement | Use for | Writer | Behaviour |
+|-----------|---------|--------|-----------|
+| `daily/YYYY/MM/DD.jsonl` | ongoing changes from a sync — `co jira sync PROJECT KEY…` | `write_daily_jsonl` / `append_daily_jsonl` (F13FCAKE-18) | dated by the import day; appends, skipping a record whose `(source, account, id)` is already in that day's file; `append_daily_jsonl` also returns how many were new |
+| `exports/<id>/` | a one-off import, e.g. a project's history — `co jira sync PROJECT KEY… --export <id>` | `write_export` (F13FCAKE-11 prototype) | written once, never appended; refuses an unsafe or existing id, any invalid or repeated record, and data that cannot be saved as JSON before writing anything; staged in a hidden `.<id>.partial` directory and renamed into place; if writing fails the staging directory is removed so the same id can be retried (a `.partial` left by a crash is reported with instructions to delete it) |
+
+`exports/<id>/manifest.json` example:
+
+```json
+{
+  "export_id": "ALPHA-history-2026-10-12",
+  "created": "2026-10-12T05:00:00Z",
+  "scope": {"projects": ["ALPHA"], "issues": "all"},
+  "sources": ["jira"],
+  "accounts": ["https://example.atlassian.net"],
+  "counts": {"records": 3, "by_kind": {"Bug": 1, "Story": 2}},
+  "files": ["records.jsonl"],
+  "contract": "#1833 shared record envelope — docs/acceptance/record-contract.md"
+}
+```
+
+An export id may contain letters, digits, `.`, `_` and `-` (max 64). An empty
+export (0 records) is a valid outcome. These are prototype writers for the
+client's layout; the general storage, blob, quota and eviction engines stay
+with the client.
+
+A page cites a record by file and id, for example
+`docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42`.
 
 ## Not in this contract yet
 
 | Item | Story |
 |------|-------|
-| ADF → readable `text` | F13FCAKE-11 |
-| Requesting the full Jira field set (`fields`) in `issue_items()` | F13FCAKE-11 |
 | Changelog under `extensions.changelog`, new version on update (`updated` in the dedupe key) | F13FCAKE-12 |
-| `exports/` writer and the daily-vs-exports decision per item | F13FCAKE-11 / F13FCAKE-14, writer ownership to confirm on #1938 |
+| Who owns the production `exports/` writer (prototype here) | confirm on #1938 |
 | OneNote page HTML → text, per-user `account` value | F13FCAKE-14 / F13FCAKE-15 |
 
 ## Verify

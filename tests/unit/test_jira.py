@@ -1747,7 +1747,7 @@ def test_source_specific_fields_live_under_extensions_only():
     assert ext["reporter"] == "Bob Example"
     assert ext["parent"] == "ALPHA-7"
     assert ext["description_adf"]["type"] == "doc"
-    assert record["text"] == ""  # ADF → text is F13FCAKE-11
+    assert record["text"] == "Use JSON Lines."  # ADF → readable text (F13FCAKE-11); raw ADF kept above
 
 
 def test_missing_optional_fields_still_produce_valid_records():
@@ -2012,3 +2012,374 @@ def test_append_daily_jsonl_counts_only_new_records(tmp_path):
     assert appended == 2
     assert append_daily_jsonl(records, tmp_path) == (path, 0)
     assert write_daily_jsonl(records, tmp_path) == path
+
+
+# ── F13FCAKE-11: Jira work-item content import ──
+
+def test_issue_items_requests_the_full_content_field_set():
+    """11-1: every /search/jql page asks for ISSUE_FIELDS, so content does not depend on server defaults."""
+    from connectonion.useful_tools.jira import ISSUE_FIELDS
+    received_params: list[dict] = []
+
+    def get(url, auth=None, params=None, timeout=None):
+        received_params.append(dict(params or {}))
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        page = {"issues": [_I1]} if len(received_params) == 1 else {"issues": [_I2]}
+        if len(received_params) == 1:
+            page["nextPageToken"] = "page-2"
+        resp.json = MagicMock(return_value=page)
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        issues = Jira().issue_items("ALPHA", {"ALPHA-1", "ALPHA-2"})
+
+    assert [i["key"] for i in issues] == ["ALPHA-1", "ALPHA-2"]
+    assert len(received_params) == 2
+    for params in received_params:
+        assert params["fields"].split(",") == list(ISSUE_FIELDS)
+    for needed in ("summary", "description", "issuetype", "status", "priority", "labels",
+                   "assignee", "reporter", "created", "updated", "attachment"):
+        assert needed in ISSUE_FIELDS
+
+
+_I_SEARCH = {
+    "id": "10077",
+    "key": "ALPHA-77",
+    "fields": {
+        "summary": "Pagination stops after the first page",
+        "issuetype": {"name": "Bug"},
+        "status": {"name": "Done"},
+        "priority": {"name": "Highest"},
+        "labels": ["bug", "pagination"],
+        "assignee": {"displayName": "Ben Example"},
+        "reporter": {"displayName": "Diego Example"},
+        "created": "2026-10-05T09:00:00.000+1100",
+        "updated": "2026-10-07T16:20:00.000+1100",
+        "duedate": "2026-10-09",
+        "resolutiondate": "2026-10-07T16:20:00.000+1100",
+        "parent": {"key": "ALPHA-1"},
+        "description": {"type": "doc", "version": 1, "content": [
+            {"type": "heading", "attrs": {"level": 2}, "content": [{"type": "text", "text": "Steps"}]},
+            {"type": "orderedList", "content": [
+                {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Select 60 issues"}]}]},
+                {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Run the import"}]}]}]},
+        ]},
+        "attachment": [],
+    },
+}
+
+
+def test_jira_record_text_is_readable_and_raw_adf_is_retained():
+    """11-12: ADF description becomes readable text in record["text"]; the raw ADF stays in extensions."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    record = jira_issues_to_records([_I_SEARCH], JIRA_URL, fetched=_FETCHED).records[0]
+    assert record["text"] == "## Steps\n\n1. Select 60 issues\n2. Run the import"
+    assert record["extensions"]["description_adf"] == _I_SEARCH["fields"]["description"]
+    plain = {"key": "ALPHA-78", "fields": {"summary": "s", "description": "  Plain text body.  "}}
+    plain_record = jira_issues_to_records([plain], JIRA_URL).records[0]
+    assert plain_record["text"] == "Plain text body."
+    assert "description_adf" not in plain_record["extensions"]
+
+
+def test_jira_record_carries_every_requested_content_field():
+    """11-13: summary, type, status, priority, people, labels, timestamps, dates and URL all reach the record."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, validate_record
+    record = jira_issues_to_records([_I_SEARCH], JIRA_URL, fetched=_FETCHED).records[0]
+    assert validate_record(record) == []
+    assert (record["title"], record["kind"], record["author"]) == (
+        "Pagination stops after the first page", "Bug", "Diego Example")
+    assert (record["at"], record["updated"]) == ("2026-10-05T09:00:00.000+1100", "2026-10-07T16:20:00.000+1100")
+    assert record["url"] == f"{JIRA_URL}/browse/ALPHA-77"
+    assert record["extensions"] == {
+        "issue_id": "10077", "status": "Done", "priority": "Highest", "labels": ["bug", "pagination"],
+        "assignee": "Ben Example", "reporter": "Diego Example", "parent": "ALPHA-1",
+        "duedate": "2026-10-09", "resolutiondate": "2026-10-07T16:20:00.000+1100",
+        "description_adf": _I_SEARCH["fields"]["description"],
+    }
+
+
+def test_missing_or_unreadable_description_does_not_block_the_record():
+    """11-14: no description, an empty ADF doc or an unreadable description still gives a valid record with text ""."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    issues = [
+        {"key": "ALPHA-80", "fields": {"summary": "no description"}},
+        {"key": "ALPHA-81", "fields": {"summary": "empty doc", "description": {"type": "doc", "content": []}}},
+        {"key": "ALPHA-82", "fields": {"summary": "odd description", "description": ["not", "adf"]}},
+    ]
+    result = jira_issues_to_records(issues, JIRA_URL)
+    assert result.errors == {}
+    assert [r["text"] for r in result.records] == ["", "", ""]
+    assert [r["title"] for r in result.records] == ["no description", "empty doc", "odd description"]
+
+
+def _paged_search(pages: list[list[dict]]):
+    """httpx.get stand-in: /search/jql returns the given pages in order, chained by nextPageToken."""
+    calls: list[dict] = []
+
+    def get(url, auth=None, params=None, timeout=None):
+        calls.append(dict(params or {}))
+        index = len(calls) - 1
+        body = {"issues": pages[index]}
+        if index + 1 < len(pages):
+            body["nextPageToken"] = f"page-{index + 2}"
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value=body)
+        return resp
+
+    return get, calls
+
+
+def _issues(first: int, last: int) -> list[dict]:
+    return [{"id": str(10000 + n), "key": f"ALPHA-{n}", "fields": {"summary": f"Issue {n}"}}
+            for n in range(first, last + 1)]
+
+
+def test_duplicate_items_in_one_batch_are_reported_not_stored_twice():
+    """11-15: the same issue twice in one batch gives one record; the repeat is reported, keeping the first copy."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    result = jira_issues_to_records([_I1, _I2, dict(_I1)], JIRA_URL)
+    assert [r["external_id"] for r in result.records] == ["ALPHA-1", "ALPHA-2"]
+    assert result.errors == {"jira:ALPHA-1": "mapping error: duplicate of an earlier item in this batch "
+                                             "(jira:test.atlassian.net:ALPHA-1); the first copy was kept"}
+
+
+def test_sixty_issues_over_two_pages_map_to_sixty_unique_records(tmp_path):
+    """11-16: issue_items + mapping + daily write over 2 pages (50 + 10): nothing duplicated, nothing missing."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records
+    wanted = {f"ALPHA-{n}" for n in range(1, 61)}
+    get, calls = _paged_search([_issues(1, 50), _issues(51, 60)])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        issues = Jira().issue_items("ALPHA", wanted)
+    assert len(calls) == 2
+    result = jira_issues_to_records(issues, JIRA_URL)
+    assert result.errors == {}
+    assert {r["external_id"] for r in result.records} == wanted
+    assert len({r["id"] for r in result.records}) == 60
+    _, appended = append_daily_jsonl(result.records, tmp_path)
+    assert appended == 60
+
+
+def test_overlapping_pages_do_not_create_duplicate_records(tmp_path):
+    """11-17: a server that repeats an issue on the next page yields 60 records and reports the repeat."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records
+    wanted = {f"ALPHA-{n}" for n in range(1, 61)}
+    get, _ = _paged_search([_issues(1, 50), _issues(50, 60)])  # ALPHA-50 appears on both pages
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        issues = Jira().issue_items("ALPHA", wanted)
+    assert len(issues) == 61
+    result = jira_issues_to_records(issues, JIRA_URL)
+    assert len(result.records) == 60
+    assert {r["external_id"] for r in result.records} == wanted
+    assert list(result.errors) == ["jira:ALPHA-50"]
+    assert "the first copy was kept" in result.errors["jira:ALPHA-50"]
+    _, appended = append_daily_jsonl(result.records, tmp_path)
+    assert appended == 60
+
+
+def test_sync_reports_a_repeated_issue_instead_of_hiding_it(tmp_path):
+    """11-18: co jira sync lists the repeated issue under "rejected", appends each issue once and exits 1."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.verify_connection.return_value = {
+            "accountId": "abc", "displayName": "Alice", "site_url": JIRA_URL,
+        }
+        mock_jira.return_value.issue_items.return_value = [_I1, _I2, dict(_I2)]
+        mock_jira.return_value.write_source_yaml = MagicMock()
+        result = CliRunner().invoke(app, ["jira", "sync", "ALPHA", "ALPHA-1", "ALPHA-2",
+                                          "--output", str(tmp_path), "--json"])
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert (data["issues"], data["mapped"], data["appended"]) == (3, 2, 2)
+    assert list(data["rejected"]) == ["jira:ALPHA-2"]
+
+
+def test_one_item_that_cannot_be_mapped_does_not_abort_the_batch():
+    """11-24: an unexpected failure while mapping one issue is reported for that issue; the rest still map."""
+    from connectonion.useful_tools import adapter
+    original = adapter._jira_record
+
+    def flaky(issue, base_url, fetched):
+        if issue.get("key") == "ALPHA-2":
+            raise OverflowError("timestamp out of range")
+        return original(issue, base_url, fetched)
+
+    with patch.object(adapter, "_jira_record", flaky):
+        result = adapter.jira_issues_to_records([_I1, _I2, _I3], JIRA_URL)
+    assert [r["external_id"] for r in result.records] == ["ALPHA-1", "ALPHA-3"]
+    assert result.errors == {"jira:ALPHA-2": "mapping error: content could not be mapped "
+                                             "(OverflowError: timestamp out of range)"}
+
+
+def test_out_of_range_adf_date_keeps_the_issue_and_the_batch():
+    """11-25: a date node far outside the calendar is dropped from the text; both issues are still imported."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    bad_date = {"key": "ALPHA-2", "fields": {"summary": "odd date", "description": {"type": "doc", "content": [
+        {"type": "paragraph", "content": [{"type": "text", "text": "due "},
+                                          {"type": "date", "attrs": {"timestamp": "9" * 30}}]}]}}}
+    result = jira_issues_to_records([_I1, bad_date], JIRA_URL)
+    assert result.errors == {}
+    assert [r["external_id"] for r in result.records] == ["ALPHA-1", "ALPHA-2"]
+    assert result.records[1]["text"] == "due"
+
+
+def test_failed_export_leaves_nothing_behind_and_can_be_retried(tmp_path):
+    """11-26: unserialisable data is refused before any write; a failure while writing removes the staging folder."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, write_export
+    good = jira_issues_to_records([_I1], JIRA_URL).records
+    weird = [dict(good[0], extensions={"not_json": {1, 2}})]
+    with pytest.raises(ValueError, match="cannot be saved as JSON.*Nothing was written"):
+        write_export(weird, tmp_path, "retry-me", _SCOPE)
+    with pytest.raises(ValueError, match="cannot be saved as JSON"):
+        write_export(good, tmp_path, "retry-me", {"when": {1, 2}})
+    assert not (tmp_path / "exports").exists()
+    with patch("pathlib.Path.rename", side_effect=OSError("disk full")):
+        with pytest.raises(OSError, match="disk full"):
+            write_export(good, tmp_path, "retry-me", _SCOPE)
+    assert list((tmp_path / "exports").iterdir()) == []
+    export_dir = write_export(good, tmp_path, "retry-me", _SCOPE)
+    assert (export_dir / "manifest.json").exists()
+
+
+def _sync_cli(args: list[str], issues: list[dict]):
+    """Run co jira sync with a mocked Jira; returns (result, mock_jira)."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.verify_connection.return_value = {
+            "accountId": "abc", "displayName": "Alice", "site_url": JIRA_URL,
+        }
+        mock_jira.return_value.issue_items.return_value = issues
+        mock_jira.return_value.write_source_yaml = MagicMock()
+        result = CliRunner().invoke(app, ["jira", "sync", *args])
+    return result, mock_jira
+
+
+def test_sync_export_writes_a_one_off_snapshot_instead_of_daily(tmp_path):
+    """11-27: co jira sync --export <id> places the records in exports/<id>/ with a manifest; daily/ is untouched."""
+    result, _ = _sync_cli(["ALPHA", "ALPHA-1", "ALPHA-2", "--output", str(tmp_path),
+                           "--export", "ALPHA-history", "--json"], [_I1, _I2])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    export_dir = tmp_path / "exports" / "ALPHA-history"
+    assert data["placement"] == "export"
+    assert data["jsonl"] == str(export_dir / "records.jsonl")
+    assert (data["mapped"], data["appended"]) == (2, 2)
+    manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["scope"] == {"projects": ["ALPHA"], "issues": ["ALPHA-1", "ALPHA-2"]}
+    assert manifest["counts"]["records"] == 2
+    assert not (tmp_path / "daily").exists()
+
+
+def test_sync_without_export_reports_daily_placement(tmp_path):
+    """11-28: the ongoing path is unchanged and says so: placement "daily", records in today's daily file."""
+    result, _ = _sync_cli(["ALPHA", "ALPHA-1", "--output", str(tmp_path), "--json"], [_I1])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["placement"] == "daily"
+    assert "/daily/" in data["jsonl"].replace("\\", "/")
+    assert not (tmp_path / "exports").exists()
+
+
+def test_sync_export_with_unusable_id_fails_before_any_request(tmp_path):
+    """11-29: a bad or already-used export id exits 1 before calling Jira or writing source.yaml."""
+    bad, mock_jira = _sync_cli(["ALPHA", "ALPHA-1", "--output", str(tmp_path), "--export", "../escape"], [_I1])
+    assert bad.exit_code == 1
+    assert "Invalid export id" in bad.stderr
+    mock_jira.assert_not_called()
+    first, _ = _sync_cli(["ALPHA", "ALPHA-1", "--output", str(tmp_path), "--export", "once"], [_I1])
+    assert first.exit_code == 0, first.output
+    again, mock_jira = _sync_cli(["ALPHA", "ALPHA-1", "--output", str(tmp_path), "--export", "once", "--json"], [_I1])
+    assert again.exit_code == 1
+    assert "already exists" in json.loads(again.stdout)["error"]
+    mock_jira.assert_not_called()
+
+
+def test_jira_help_is_defined_once_with_the_temporary_token_guidance():
+    """11-30: co jira is registered once; its help gives the temporary-token rule and sync documents --export."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    import connectonion.cli.main as cli_main
+    source = Path(cli_main.__file__).read_text(encoding="utf-8")
+    assert source.count("jira_app = _typer_app(") == 1
+    top = CliRunner().invoke(app, ["jira", "--help"])
+    assert "temporary" in top.stdout
+    assert "Requires JIRA_URL, JIRA_EMAIL, and JIRA_API_TOKEN from co env set" not in top.stdout
+    sync_help = CliRunner().invoke(app, ["jira", "sync", "--help"])
+    assert "--export" in sync_help.stdout
+
+
+_SCOPE = {"projects": ["ALPHA"], "issues": "all", "reason": "first import of project history"}
+
+
+def test_write_export_writes_records_and_manifest(tmp_path):
+    """11-19: a one-off import lands in exports/<id>/ as records.jsonl plus a manifest of scope and counts."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, validate_record, write_export
+    records = jira_issues_to_records([_I_SEARCH, _I1, _I2], JIRA_URL, fetched=_FETCHED).records
+    export_dir = write_export(records, tmp_path / "jira", "ALPHA-history-2026-10-12", _SCOPE)
+    assert export_dir == tmp_path / "jira" / "exports" / "ALPHA-history-2026-10-12"
+    assert sorted(f.name for f in export_dir.iterdir()) == ["manifest.json", "records.jsonl"]
+    lines = (export_dir / "records.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    stored = [json.loads(line) for line in lines]
+    assert [r["external_id"] for r in stored] == ["ALPHA-77", "ALPHA-1", "ALPHA-2"]
+    assert all(validate_record(r) == [] for r in stored)
+    manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["export_id"] == "ALPHA-history-2026-10-12"
+    assert manifest["scope"] == _SCOPE
+    assert manifest["sources"] == ["jira"]
+    assert manifest["accounts"] == [JIRA_URL]
+    assert manifest["counts"] == {"records": 3, "by_kind": {"Bug": 1, "issue": 2}}
+    assert manifest["files"] == ["records.jsonl"]
+    assert manifest["created"].endswith("Z")
+    assert not (tmp_path / "jira" / "daily").exists()  # an export never touches daily/
+
+
+def test_write_export_refuses_invalid_or_duplicate_records_and_writes_nothing(tmp_path):
+    """11-20: one invalid record or a repeated id stops the whole export before any file is written."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, write_export
+    good = jira_issues_to_records([_I1, _I2], JIRA_URL).records
+    broken = dict(good[1])
+    del broken["text"]
+    with pytest.raises(ValueError, match=r"missing field 'text'.*Nothing was written"):
+        write_export([good[0], broken], tmp_path, "bad-record", _SCOPE)
+    with pytest.raises(ValueError, match="duplicate id in this export"):
+        write_export([good[0], good[0]], tmp_path, "dup-record", _SCOPE)
+    with pytest.raises(ValueError, match="record 0: record is not an object"):
+        write_export(["not a record"], tmp_path, "not-a-record", _SCOPE)
+    assert not (tmp_path / "exports").exists()
+
+
+def test_write_export_reports_at_most_five_problems(tmp_path):
+    """11-21: a large bad batch names the first five problems and counts the rest."""
+    from connectonion.useful_tools.adapter import write_export
+    with pytest.raises(ValueError, match=r"; … 2 more\. Nothing was written"):
+        write_export(["a", "b", "c", "d", "e", "f", "g"], tmp_path, "many", _SCOPE)
+
+
+def test_write_export_refuses_unsafe_ids_and_existing_exports(tmp_path):
+    """11-22: export ids cannot escape exports/, and an existing export is never overwritten or appended to."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, write_export
+    records = jira_issues_to_records([_I1], JIRA_URL).records
+    for bad_id in ("", "../outside", "a/b", ".hidden", "with space", "x" * 65, None):
+        with pytest.raises(ValueError, match="Invalid export id"):
+            write_export(records, tmp_path, bad_id, _SCOPE)
+    first = write_export(records, tmp_path, "once", _SCOPE)
+    before = (first / "records.jsonl").read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="already exists"):
+        write_export(jira_issues_to_records([_I2], JIRA_URL).records, tmp_path, "once", _SCOPE)
+    assert (first / "records.jsonl").read_text(encoding="utf-8") == before
+    (tmp_path / "exports" / ".stale.partial").mkdir()
+    with pytest.raises(ValueError, match="unfinished earlier attempt.*Delete that folder and retry"):
+        write_export(records, tmp_path, "stale", _SCOPE)
+
+
+def test_empty_export_is_a_valid_outcome(tmp_path):
+    """11-23: an export with no records is written with a manifest that says 0, not treated as a failure."""
+    from connectonion.useful_tools.adapter import write_export
+    export_dir = write_export([], tmp_path, "empty-scope", {"projects": ["ALPHA"], "issues": []})
+    assert (export_dir / "records.jsonl").read_text(encoding="utf-8") == ""
+    manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["counts"] == {"records": 0, "by_kind": {}}
+    assert manifest["sources"] == [] and manifest["accounts"] == []

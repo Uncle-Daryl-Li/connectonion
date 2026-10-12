@@ -1,15 +1,19 @@
 """
 Purpose: Shared record contract and common adapter for co rem source integrations (F13FCAKE-16, F13FCAKE-18).
 LLM-Note:
-  Dependencies: imports from [datetime, json, dataclasses, pathlib] | imported by [tests/unit/test_jira.py, cli/commands/jira_commands.py] | no network calls
-  Data flow: raw tool output (Jira issues / OneNote pages) → *_to_records() → make_record() envelope → validate_record() → AdapterResult (valid records + per-item errors) → write_daily_jsonl stores under daily/YYYY/MM/DD.jsonl
-  State/Effects: write_daily_jsonl() / append_daily_jsonl() create directories and write files (append_daily_jsonl also returns how many records were new); all other functions are pure
+  Dependencies: imports from [datetime, json, dataclasses, pathlib, useful_tools/jira_adf.adf_to_text] | imported by [tests/unit/test_jira.py, cli/commands/jira_commands.py] | no network calls
+  Data flow: raw tool output (Jira issues / OneNote pages) → *_to_records() → make_record() envelope → validate_record() → AdapterResult (valid records + per-item errors) → ongoing: write_daily_jsonl() / append_daily_jsonl() under daily/YYYY/MM/DD.jsonl | one-off: write_export() under exports/<id>/{records.jsonl,manifest.json}
+  State/Effects: write_daily_jsonl() / append_daily_jsonl() / write_export() create directories and write files (append_daily_jsonl also returns how many records were new); all other functions are pure
   Integration: RECORD_FIELDS is the #1833 envelope every source writes; record_id() is the shared identity rule; make_record() / media_ref() build records; validate_record() is the one contract check for every source; AdapterResult is the shared result type; consume_records() is the in-memory consumer; consume_jsonl_records() reads from disk across multiple source directories; jira_issues_to_records() and onenote_pages_to_records() are the converter functions
-  Errors: write_daily_jsonl() raises ValueError if the existing JSONL file contains a malformed line (refuses to append to a corrupted file) | consume_jsonl_records() never raises — malformed lines are recorded in AdapterResult.errors keyed by "file:lineno" | converters never raise on bad input — an invalid or malformed item is left out of records and reported in AdapterResult.errors keyed by "<source>:<item>"
+  Errors: write_daily_jsonl() raises ValueError if the existing JSONL file contains a malformed line (refuses to append to a corrupted file) | write_export() raises ValueError for an unsafe export id, an existing export or any invalid/duplicate record, before writing anything | consume_jsonl_records() never raises — malformed lines are recorded in AdapterResult.errors keyed by "file:lineno" | converters never raise on bad input — an invalid, malformed or duplicate item is left out of records and reported in AdapterResult.errors keyed by "<source>:<item>"
   F13FCAKE-16 contract status:
     Envelope, identity, extensions, media references and validation implemented for both sources; documented in docs/acceptance/record-contract.md
-    Jira description ADF is kept raw under extensions.description_adf; readable text conversion is F13FCAKE-11
     OneNote page HTML is not fetched here; readable text conversion is F13FCAKE-14
+  F13FCAKE-11 Jira content status:
+    Jira.issue_items() requests jira.ISSUE_FIELDS; description ADF → record["text"] via jira_adf.adf_to_text(),
+    raw ADF kept under extensions.description_adf; due and resolution dates kept under extensions
+    The same item twice in one batch (e.g. overlapping pages) yields one record; the repeat is reported in errors
+    Placement is explicit: ongoing changes → write_daily_jsonl(); a one-off project import → write_export() (prototype writer)
   F13FCAKE-18 prototype status:
     Jira chain -- fully integrated: verify_connection -> issue_items -> write_source_yaml -> jira_issues_to_records -> write_daily_jsonl
     OneNote chain -- adapter function implemented and tested with synthetic fixtures; live Notes.Read integration is pending authorized account credentials and OneNote team implementation
@@ -32,8 +36,15 @@ Usage:
 
 import datetime
 import json
+import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .jira_adf import adf_to_text
+
+# An export id becomes a directory name under exports/: letters, digits, ".", "_", "-" only.
+EXPORT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 # The shared envelope (#1833): every source writes exactly these top-level fields, plus optional "media".
 RECORD_FIELDS = ("id", "source", "account", "external_id", "kind", "title", "text",
@@ -132,15 +143,33 @@ def _media_problems(media) -> list[str]:
 # Map every item, keep only valid records; malformed or invalid items are reported, not raised.
 def _collect(items: list, source: str, shape_problems, build) -> AdapterResult:
     result = AdapterResult()
+    seen: set[str] = set()
     for index, item in enumerate(items):
         problems = shape_problems(item)
-        record = None if problems else build(item)
-        problems = problems or validate_record(record)
+        record, build_problems = (None, []) if problems else _build(build, item)
+        problems = problems or build_problems or validate_record(record) or _duplicate_problem(record, seen)
         if problems:
             result.errors[_error_label(result.errors, source, item, index)] = "mapping error: " + "; ".join(problems)
         else:
+            seen.add(record["id"])
             result.records.append(record)
     return result
+
+
+# Source content is untrusted: an unexpected failure while mapping one item becomes that item's error,
+# never an exception that aborts the whole batch (F13FCAKE-11 "malformed content is isolated").
+def _build(build, item) -> tuple[dict | None, list[str]]:
+    try:
+        return build(item), []
+    except Exception as exc:  # noqa: BLE001 — reported per item, not swallowed
+        return None, [f"content could not be mapped ({type(exc).__name__}: {str(exc)[:200]})"]
+
+
+# A source that returns the same item twice (e.g. a repeated page) must not yield two records.
+def _duplicate_problem(record: dict, seen: set[str]) -> list[str]:
+    if record["id"] in seen:
+        return [f"duplicate of an earlier item in this batch ({record['id']}); the first copy was kept"]
+    return []
 
 
 # Error labels stay unique: a second bad item with the same key gets "#<position>" instead of overwriting.
@@ -227,6 +256,92 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
     return target, len(new_records)
 
 
+# One-off import (#1938): a validated snapshot in exports/<id>/, written once and never appended to.
+def write_export(records: list[dict], source_dir: Path, export_id: str, scope: dict) -> Path:
+    """Write exports/<export_id>/records.jsonl and manifest.json; return the export directory.
+
+    Ongoing changes go to write_daily_jsonl(); a one-off import of a project's history goes here.
+    Everything is checked before anything is written: an unsafe export id, an export that already
+    exists, any record that fails validate_record() or repeats an id, and records or a scope that
+    cannot be serialised to JSON all raise ValueError.
+    Files are written into a hidden staging directory first, then renamed into place, so a
+    half-written export never appears under exports/; if writing fails the staging directory is
+    removed, so the same export id can be retried.
+    """
+    target = export_target(Path(source_dir), export_id)
+    problems = _export_problems(records)
+    if problems:
+        shown = "; ".join(problems[:5]) + (f"; … {len(problems) - 5} more" if len(problems) > 5 else "")
+        raise ValueError(f"Refusing to write export {export_id!r}: {shown}. Nothing was written.")
+    lines, manifest_text = _export_payload(records, export_id, scope)
+    staging = target.with_name(f".{export_id}.partial")
+    staging.mkdir(parents=True)
+    try:
+        (staging / "records.jsonl").write_text(lines, encoding="utf-8")
+        (staging / "manifest.json").write_text(manifest_text, encoding="utf-8")
+        staging.rename(target)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return target
+
+
+# Serialise everything before touching the disk, so a bad value fails with nothing written.
+def _export_payload(records: list[dict], export_id: str, scope: dict) -> tuple[str, str]:
+    try:
+        lines = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+        manifest = json.dumps(_export_manifest(records, export_id, scope), ensure_ascii=False, indent=2) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Refusing to write export {export_id!r}: records or scope cannot be saved as JSON "
+                         f"({exc}). Nothing was written.") from None
+    return lines, manifest
+
+
+# Where an export would go; raises ValueError for an unsafe id, an existing export or a leftover staging folder.
+# Callers (co jira sync --export) use it to fail before collecting anything.
+def export_target(source_dir: Path, export_id: str) -> Path:
+    if not isinstance(export_id, str) or not EXPORT_ID.match(export_id):
+        raise ValueError(f"Invalid export id {export_id!r}: use letters, digits, '.', '_' or '-' (max 64), "
+                         "e.g. 'ALPHA-history-2026-10-12'. Nothing was written.")
+    target = source_dir / "exports" / export_id
+    if target.exists():
+        raise ValueError(f"Export {export_id!r} already exists at {target}; exports are one-off snapshots. "
+                         "Choose a new export id. Nothing was written.")
+    staging = target.with_name(f".{export_id}.partial")
+    if staging.exists():
+        raise ValueError(f"An unfinished earlier attempt left {staging} (for example after a crash). "
+                         "Delete that folder and retry. Nothing was written.")
+    return target
+
+
+# Every record must pass the shared contract and appear once; problems are collected, not raised one by one.
+def _export_problems(records: list[dict]) -> list[str]:
+    problems, seen = [], set()
+    for index, record in enumerate(records):
+        label = record.get("id") if isinstance(record, dict) and record.get("id") else f"record {index}"
+        problems += [f"{label}: {problem}" for problem in validate_record(record)]
+        if isinstance(record, dict) and record.get("id") in seen:
+            problems.append(f"{label}: duplicate id in this export")
+        seen.add(record.get("id") if isinstance(record, dict) else None)
+    return problems
+
+
+def _export_manifest(records: list[dict], export_id: str, scope: dict) -> dict:
+    kinds: dict[str, int] = {}
+    for record in records:
+        kinds[record["kind"]] = kinds.get(record["kind"], 0) + 1
+    return {
+        "export_id": export_id,
+        "created": _now_utc(),
+        "scope": scope,
+        "sources": sorted({record["source"] for record in records}),
+        "accounts": sorted({record["account"] for record in records}),
+        "counts": {"records": len(records), "by_kind": dict(sorted(kinds.items()))},
+        "files": ["records.jsonl"],
+        "contract": "#1833 shared record envelope — docs/acceptance/record-contract.md",
+    }
+
+
 def consume_jsonl_records(
     *source_dirs: Path,
     date: datetime.date | None = None,
@@ -262,11 +377,12 @@ def consume_jsonl_records(
 
 
 def jira_issues_to_records(issues: list[dict], base_url: str, *, fetched: str | None = None) -> AdapterResult:
-    """Convert raw Jira issue dicts to shared-contract records (F13FCAKE-16, F13FCAKE-18).
+    """Convert raw Jira issue dicts to shared-contract records (F13FCAKE-11, F13FCAKE-16, F13FCAKE-18).
 
     Envelope: id = "jira:<site>:<key>", external_id = issue key, kind = issue type,
-    title = summary, url = browse URL, author = reporter, at = created, updated = updated.
-    Jira-only fields (status, priority, labels, people, parent, raw ADF) go under extensions;
+    title = summary, text = description as readable text (ADF converted by jira_adf.adf_to_text),
+    url = browse URL, author = reporter, at = created, updated = updated.
+    Jira-only fields (status, priority, labels, people, parent, due/resolution dates, raw ADF) go under extensions;
     attachments become metadata-only media references. Token and email are never included.
     An item that is not an object or fails validate_record() is reported in errors, not raised.
     """
@@ -282,15 +398,14 @@ def _jira_shape_problems(issue) -> list[str]:
     return []
 
 
-# One Jira issue → one envelope; description ADF stays raw until F13FCAKE-11 converts it.
+# One Jira issue → one envelope; the description becomes readable text, its raw ADF stays in extensions.
 def _jira_record(issue: dict, base_url: str, fetched: str) -> dict:
     fields = issue.get("fields") or {}
     key = str(issue.get("key") or "")
-    description = fields.get("description")
     return make_record(
         "jira", base_url, key, _name(fields.get("issuetype")) or "issue",
         title=str(fields.get("summary") or ""),
-        text=description if isinstance(description, str) else "",
+        text=adf_to_text(fields.get("description")),
         url=f"{base_url}/browse/{key}" if key else "",
         author=_display_name(fields.get("reporter") or fields.get("creator")),
         at=str(fields.get("created") or ""), updated=str(fields.get("updated") or ""),
@@ -312,6 +427,8 @@ def _jira_extensions(issue: dict, fields: dict) -> dict:
         "assignee": _display_name(fields.get("assignee")),
         "reporter": _display_name(fields.get("reporter")),
         "parent": str(parent.get("key") or "") if isinstance(parent, dict) else "",
+        "duedate": str(fields.get("duedate") or ""),
+        "resolutiondate": str(fields.get("resolutiondate") or ""),
         "description_adf": description if isinstance(description, dict) else None,
     }
     return {name: value for name, value in values.items() if value not in ("", None, [])}
