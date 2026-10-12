@@ -2196,6 +2196,53 @@ def test_sync_reports_a_repeated_issue_instead_of_hiding_it(tmp_path):
     assert list(data["rejected"]) == ["jira:ALPHA-2"]
 
 
+def test_one_item_that_cannot_be_mapped_does_not_abort_the_batch():
+    """11-24: an unexpected failure while mapping one issue is reported for that issue; the rest still map."""
+    from connectonion.useful_tools import adapter
+    original = adapter._jira_record
+
+    def flaky(issue, base_url, fetched):
+        if issue.get("key") == "ALPHA-2":
+            raise OverflowError("timestamp out of range")
+        return original(issue, base_url, fetched)
+
+    with patch.object(adapter, "_jira_record", flaky):
+        result = adapter.jira_issues_to_records([_I1, _I2, _I3], JIRA_URL)
+    assert [r["external_id"] for r in result.records] == ["ALPHA-1", "ALPHA-3"]
+    assert result.errors == {"jira:ALPHA-2": "mapping error: content could not be mapped "
+                                             "(OverflowError: timestamp out of range)"}
+
+
+def test_out_of_range_adf_date_keeps_the_issue_and_the_batch():
+    """11-25: a date node far outside the calendar is dropped from the text; both issues are still imported."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    bad_date = {"key": "ALPHA-2", "fields": {"summary": "odd date", "description": {"type": "doc", "content": [
+        {"type": "paragraph", "content": [{"type": "text", "text": "due "},
+                                          {"type": "date", "attrs": {"timestamp": "9" * 30}}]}]}}}
+    result = jira_issues_to_records([_I1, bad_date], JIRA_URL)
+    assert result.errors == {}
+    assert [r["external_id"] for r in result.records] == ["ALPHA-1", "ALPHA-2"]
+    assert result.records[1]["text"] == "due"
+
+
+def test_failed_export_leaves_nothing_behind_and_can_be_retried(tmp_path):
+    """11-26: unserialisable data is refused before any write; a failure while writing removes the staging folder."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, write_export
+    good = jira_issues_to_records([_I1], JIRA_URL).records
+    weird = [dict(good[0], extensions={"not_json": {1, 2}})]
+    with pytest.raises(ValueError, match="cannot be saved as JSON.*Nothing was written"):
+        write_export(weird, tmp_path, "retry-me", _SCOPE)
+    with pytest.raises(ValueError, match="cannot be saved as JSON"):
+        write_export(good, tmp_path, "retry-me", {"when": {1, 2}})
+    assert not (tmp_path / "exports").exists()
+    with patch("pathlib.Path.rename", side_effect=OSError("disk full")):
+        with pytest.raises(OSError, match="disk full"):
+            write_export(good, tmp_path, "retry-me", _SCOPE)
+    assert list((tmp_path / "exports").iterdir()) == []
+    export_dir = write_export(good, tmp_path, "retry-me", _SCOPE)
+    assert (export_dir / "manifest.json").exists()
+
+
 _SCOPE = {"projects": ["ALPHA"], "issues": "all", "reason": "first import of project history"}
 
 
@@ -2256,7 +2303,7 @@ def test_write_export_refuses_unsafe_ids_and_existing_exports(tmp_path):
         write_export(jira_issues_to_records([_I2], JIRA_URL).records, tmp_path, "once", _SCOPE)
     assert (first / "records.jsonl").read_text(encoding="utf-8") == before
     (tmp_path / "exports" / ".stale.partial").mkdir()
-    with pytest.raises(ValueError, match="already exists"):
+    with pytest.raises(ValueError, match="unfinished earlier attempt.*Delete that folder and retry"):
         write_export(records, tmp_path, "stale", _SCOPE)
 
 
