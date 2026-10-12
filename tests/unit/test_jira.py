@@ -1895,12 +1895,13 @@ def _sync_with(issues, extra_args):
 
 
 def test_jira_cli_sync_json_reports_rejected_items_and_exits_nonzero(tmp_path):
-    """16-19: a rejected item is listed in JSON "rejected", only valid records are written, exit code is 1."""
+    """16-19: a rejected item is listed in JSON "rejected", only valid records are mapped and appended, exit code is 1."""
     result = _sync_with([_I1, {"key": "ALPHA-9", "fields": "broken"}], ["--output", str(tmp_path), "--json"])
     assert result.exit_code == 1, result.output
     data = json.loads(result.stdout)
     assert data["issues"] == 2
-    assert data["records"] == 1
+    assert data["mapped"] == 1
+    assert data["appended"] == 1
     assert data["rejected"] == {"jira:ALPHA-9": "mapping error: 'fields' is not an object"}
     lines = Path(data["jsonl"]).read_text(encoding="utf-8").strip().splitlines()
     assert [json.loads(line)["external_id"] for line in lines] == ["ALPHA-1"]
@@ -1911,7 +1912,7 @@ def test_jira_cli_sync_text_mode_lists_rejected_items_on_stderr(tmp_path):
     """16-20: human output still reports what was written, names each rejected item on stderr, exits 1."""
     result = _sync_with([_I1, {"key": "ALPHA-9", "fields": "broken"}], ["--output", str(tmp_path)])
     assert result.exit_code == 1
-    assert "Records written: 1" in result.stdout
+    assert "Records mapped: 1  Records appended: 1" in result.stdout
     assert "1 item(s) were rejected" in result.stderr
     assert "jira:ALPHA-9" in result.stderr
 
@@ -1922,7 +1923,8 @@ def test_jira_cli_sync_with_no_rejections_still_exits_zero(tmp_path):
     assert result.exit_code == 0, result.output
     data = json.loads(result.stdout)
     assert data["rejected"] == {}
-    assert data["records"] == 1
+    assert data["mapped"] == 1
+    assert data["appended"] == 1
 
 
 def test_onenote_records_from_two_users_do_not_collide_when_account_is_per_user():
@@ -1935,3 +1937,26 @@ def test_onenote_records_from_two_users_do_not_collide_when_account_is_per_user(
     assert alice["external_id"] == bob["external_id"] == "page-1"
     shared = onenote_pages_to_records([page], _ONENOTE_ACCOUNT).records[0]
     assert shared["id"] == "onenote:graph.microsoft.com/v1.0:page-1"  # fixture placeholder: not per user
+
+
+def test_jira_cli_sync_same_day_resync_reports_zero_appended(tmp_path):
+    """16-23: a second sync on the same day maps the item again but appends nothing; the summary says so."""
+    first = json.loads(_sync_with([_I1], ["--output", str(tmp_path), "--json"]).stdout)
+    second_run = _sync_with([_I1], ["--output", str(tmp_path), "--json"])
+    second = json.loads(second_run.stdout)
+    assert (first["mapped"], first["appended"]) == (1, 1)
+    assert (second["mapped"], second["appended"]) == (1, 0)
+    assert second_run.exit_code == 0
+    assert len(Path(second["jsonl"]).read_text(encoding="utf-8").strip().splitlines()) == 1
+    text_run = _sync_with([_I1], ["--output", str(tmp_path)])
+    assert "Records mapped: 1  Records appended: 0" in text_run.stdout
+
+
+def test_append_daily_jsonl_counts_only_new_records(tmp_path):
+    """16-24: append_daily_jsonl returns the same path as write_daily_jsonl plus the number really appended."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records, write_daily_jsonl
+    records = jira_issues_to_records([_I1, _I2], JIRA_URL).records
+    path, appended = append_daily_jsonl(records, tmp_path)
+    assert appended == 2
+    assert append_daily_jsonl(records, tmp_path) == (path, 0)
+    assert write_daily_jsonl(records, tmp_path) == path
