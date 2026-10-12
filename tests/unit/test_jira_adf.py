@@ -172,3 +172,14 @@ def test_output_is_tidy():
     """11-11: trailing spaces are dropped and runs of blank lines collapse to one."""
     adf = _doc(_p(_t("line with trailing spaces   ")), _p(_t("   ")), {"type": "hardBreak"}, _p(_t("end")))
     assert adf_to_text(adf) == "line with trailing spaces\n\nend"
+
+
+def test_dates_outside_the_calendar_are_dropped_not_raised():
+    """11-12b: huge, negative-looking or year-10000 timestamps give "" instead of OverflowError/OSError."""
+    for timestamp in ("9" * 30, "253402300800000", "-1000", "1e12"):
+        adf = _doc(_p(_t("due "), {"type": "date", "attrs": {"timestamp": timestamp}}))
+        assert adf_to_text(adf) == "due"
+    first_ms = {"type": "date", "attrs": {"timestamp": "0"}}
+    last_ms = {"type": "date", "attrs": {"timestamp": "253402214400000"}}
+    assert adf_to_text(_doc(_p(first_ms), _p(last_ms))) == "1970-01-01\n\n9999-12-31"
+

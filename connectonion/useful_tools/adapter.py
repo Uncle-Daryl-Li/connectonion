@@ -37,6 +37,7 @@ Usage:
 import datetime
 import json
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -145,14 +146,23 @@ def _collect(items: list, source: str, shape_problems, build) -> AdapterResult:
     seen: set[str] = set()
     for index, item in enumerate(items):
         problems = shape_problems(item)
-        record = None if problems else build(item)
-        problems = problems or validate_record(record) or _duplicate_problem(record, seen)
+        record, build_problems = (None, []) if problems else _build(build, item)
+        problems = problems or build_problems or validate_record(record) or _duplicate_problem(record, seen)
         if problems:
             result.errors[_error_label(result.errors, source, item, index)] = "mapping error: " + "; ".join(problems)
         else:
             seen.add(record["id"])
             result.records.append(record)
     return result
+
+
+# Source content is untrusted: an unexpected failure while mapping one item becomes that item's error,
+# never an exception that aborts the whole batch (F13FCAKE-11 "malformed content is isolated").
+def _build(build, item) -> tuple[dict | None, list[str]]:
+    try:
+        return build(item), []
+    except Exception as exc:  # noqa: BLE001 — reported per item, not swallowed
+        return None, [f"content could not be mapped ({type(exc).__name__}: {str(exc)[:200]})"]
 
 
 # A source that returns the same item twice (e.g. a repeated page) must not yield two records.
@@ -252,23 +262,39 @@ def write_export(records: list[dict], source_dir: Path, export_id: str, scope: d
 
     Ongoing changes go to write_daily_jsonl(); a one-off import of a project's history goes here.
     Everything is checked before anything is written: an unsafe export id, an export that already
-    exists, or any record that fails validate_record() or repeats an id raises ValueError.
+    exists, any record that fails validate_record() or repeats an id, and records or a scope that
+    cannot be serialised to JSON all raise ValueError.
     Files are written into a hidden staging directory first, then renamed into place, so a
-    half-written export never appears under exports/.
+    half-written export never appears under exports/; if writing fails the staging directory is
+    removed, so the same export id can be retried.
     """
     target = _export_target(Path(source_dir), export_id)
     problems = _export_problems(records)
     if problems:
         shown = "; ".join(problems[:5]) + (f"; … {len(problems) - 5} more" if len(problems) > 5 else "")
         raise ValueError(f"Refusing to write export {export_id!r}: {shown}. Nothing was written.")
+    lines, manifest_text = _export_payload(records, export_id, scope)
     staging = target.with_name(f".{export_id}.partial")
     staging.mkdir(parents=True)
-    lines = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
-    (staging / "records.jsonl").write_text(lines, encoding="utf-8")
-    manifest = _export_manifest(records, export_id, scope)
-    (staging / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    staging.rename(target)
+    try:
+        (staging / "records.jsonl").write_text(lines, encoding="utf-8")
+        (staging / "manifest.json").write_text(manifest_text, encoding="utf-8")
+        staging.rename(target)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     return target
+
+
+# Serialise everything before touching the disk, so a bad value fails with nothing written.
+def _export_payload(records: list[dict], export_id: str, scope: dict) -> tuple[str, str]:
+    try:
+        lines = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+        manifest = json.dumps(_export_manifest(records, export_id, scope), ensure_ascii=False, indent=2) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Refusing to write export {export_id!r}: records or scope cannot be saved as JSON "
+                         f"({exc}). Nothing was written.") from None
+    return lines, manifest
 
 
 def _export_target(source_dir: Path, export_id: str) -> Path:
@@ -276,9 +302,13 @@ def _export_target(source_dir: Path, export_id: str) -> Path:
         raise ValueError(f"Invalid export id {export_id!r}: use letters, digits, '.', '_' or '-' (max 64), "
                          "e.g. 'ALPHA-history-2026-10-12'. Nothing was written.")
     target = source_dir / "exports" / export_id
-    if target.exists() or target.with_name(f".{export_id}.partial").exists():
+    if target.exists():
         raise ValueError(f"Export {export_id!r} already exists at {target}; exports are one-off snapshots. "
                          "Choose a new export id. Nothing was written.")
+    staging = target.with_name(f".{export_id}.partial")
+    if staging.exists():
+        raise ValueError(f"An unfinished earlier attempt left {staging} (for example after a crash). "
+                         "Delete that folder and retry. Nothing was written.")
     return target
 
 

@@ -14,6 +14,9 @@ import datetime
 import re
 
 _LISTS = ("bulletList", "orderedList")
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+# Largest timestamp (ms) that is still a real date; anything above is not a date and is dropped.
+_MAX_TIMESTAMP_MS = (datetime.datetime(9999, 12, 31, tzinfo=datetime.timezone.utc) - _EPOCH) // datetime.timedelta(milliseconds=1)
 
 
 # Public entry point: ADF document (or plain string) → readable text; never raises.
@@ -124,11 +127,12 @@ def _task_item(node, depth: int) -> str:
     return f"{box} {_inline(node)}"
 
 
+# Date nodes carry epoch milliseconds; out-of-range or non-numeric values become "" instead of raising.
 def _date(node, depth: int) -> str:
     timestamp = str(_attrs(node).get("timestamp") or "")
-    if not timestamp.isdigit():
+    if not timestamp.isdigit() or int(timestamp) > _MAX_TIMESTAMP_MS:
         return ""
-    return datetime.datetime.fromtimestamp(int(timestamp) / 1000, datetime.timezone.utc).date().isoformat()
+    return (_EPOCH + datetime.timedelta(milliseconds=int(timestamp))).date().isoformat()
 
 
 # Media is never downloaded here: it becomes a placeholder naming the file when ADF gives one.

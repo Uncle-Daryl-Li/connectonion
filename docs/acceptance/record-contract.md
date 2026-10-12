@@ -88,6 +88,9 @@ input. Each item is mapped and checked; a valid record goes to
 ```
 
 Every rejected item gets its own entry; valid items in the same batch are unaffected.
+This includes failures nobody anticipated: if mapping one item raises (for example
+an ADF date node far outside the calendar), that item is reported as
+`content could not be mapped (<error type>: …)` and the batch continues.
 The same item twice in one batch (for example a server repeating an issue on the
 next page) produces one record; the repeat is reported, so pagination can neither
 duplicate nor silently drop items (F13FCAKE-11).
@@ -116,7 +119,7 @@ Every item is placed explicitly by the caller (F13FCAKE-11):
 | Placement | Use for | Writer | Behaviour |
 |-----------|---------|--------|-----------|
 | `daily/YYYY/MM/DD.jsonl` | ongoing changes from a sync | `write_daily_jsonl` / `append_daily_jsonl` (F13FCAKE-18) | dated by the import day; appends, skipping a record whose `(source, account, id)` is already in that day's file; `append_daily_jsonl` also returns how many were new |
-| `exports/<id>/` | a one-off import, e.g. a project's history | `write_export` (F13FCAKE-11 prototype) | written once, never appended; refuses an unsafe or existing id and any invalid or repeated record before writing anything; staged in a hidden `.<id>.partial` directory and renamed into place |
+| `exports/<id>/` | a one-off import, e.g. a project's history | `write_export` (F13FCAKE-11 prototype) | written once, never appended; refuses an unsafe or existing id, any invalid or repeated record, and data that cannot be saved as JSON before writing anything; staged in a hidden `.<id>.partial` directory and renamed into place; if writing fails the staging directory is removed so the same id can be retried (a `.partial` left by a crash is reported with instructions to delete it) |
 
 `exports/<id>/manifest.json` example:
 
