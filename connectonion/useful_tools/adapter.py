@@ -97,10 +97,13 @@ def validate_record(record) -> list[str]:
     """Return every contract violation in one record, worded for a mapping-error report."""
     if not isinstance(record, dict):
         return ["record is not an object"]
-    problems = [f"missing required field '{name}'" for name in REQUIRED_FIELDS if not record.get(name)]
+    # Every envelope field must be present; optional ones may be empty ("" or {}), never absent.
+    problems = [f"missing field '{name}'" for name in RECORD_FIELDS if name not in record]
+    problems += [f"missing required field '{name}'" for name in REQUIRED_FIELDS
+                 if name in record and not record[name]]
     problems += [f"field '{name}' must be a string" for name in RECORD_FIELDS
                  if name != "extensions" and name in record and not isinstance(record[name], str)]
-    if not isinstance(record.get("extensions", {}), dict):
+    if "extensions" in record and not isinstance(record["extensions"], dict):
         problems.append("field 'extensions' must be an object")
     expected = record_id(str(record.get("source", "")), str(record.get("account", "")),
                          str(record.get("external_id", "")))

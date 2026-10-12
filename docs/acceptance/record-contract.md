@@ -3,7 +3,7 @@
 One record shape for every co rem source integration. Jira and OneNote map
 into it, and `validate_record()` checks both against the same rules.
 Implementation: `connectonion/useful_tools/adapter.py`.
-Tests: `tests/unit/test_jira.py` (cases `16-1` … `16-17`); `adapter.py` line and branch coverage 100%.
+Tests: `tests/unit/test_jira.py` (cases `16-1` … `16-22`); `adapter.py` line and branch coverage 100%.
 
 ---
 
@@ -16,7 +16,7 @@ has images or attachments. Nothing else is allowed at the top level.
 |-------|----------|---------|------|---------|
 | `id` | yes | Global identity, `source:account:external_id` | `jira:<site>:<key>` | `onenote:<account>:<page id>` |
 | `source` | yes | Source name | `jira` | `onenote` |
-| `account` | yes | Site or account the item was read from | site URL | account the page was read from |
+| `account` | yes | Site or account the item was read from | site URL | an id naming the signed-in user (see Identity); the Graph base URL in fixtures is a placeholder only |
 | `external_id` | yes | The source's own id | issue key | page id |
 | `kind` | yes | Item type | issue type name, else `issue` | `page` |
 | `title` | no | Title | `summary` | `title` |
@@ -29,8 +29,9 @@ has images or attachments. Nothing else is allowed at the top level.
 | `extensions` | yes (may be `{}`) | Source-only fields | see below | see below |
 | `media` | only when present | Image / attachment references | `attachment` | — (not read in Sprint 1) |
 
-All fields except `extensions` and `media` are strings. Empty optional values
-are empty strings, never missing keys.
+All fields except `extensions` and `media` are strings. Every envelope field must
+be present: optional ones may be empty (`""` or `{}`) but never missing —
+`validate_record()` reports `missing field '<name>'` otherwise.
 
 ## Identity
 
@@ -39,6 +40,10 @@ are empty strings, never missing keys.
 - The same Jira key on two sites gives two ids.
 - The same value as a Jira key and a OneNote page id gives two ids.
 - `validate_record()` rejects a record whose `id` does not match this rule.
+- OneNote: `account` must name the user (for example the signed-in user's
+  object id), so the same page id read for two users gives two ids. A shared
+  value such as the Graph base URL would make them collide; the OneNote import
+  (F13FCAKE-14/15) supplies the per-user value.
 
 ## Extensions
 
@@ -79,6 +84,11 @@ input. Each item is mapped and checked; a valid record goes to
 
 Every rejected item gets its own entry; valid items in the same batch are unaffected.
 
+`co jira sync` never hides them: it still writes the valid records, prints
+`Records written: N`, lists each rejected item on stderr (or under
+`"rejected"` with `"records"` in `--json` output) and exits with code 1.
+A clean run has `"rejected": {}` and exits 0.
+
 ## Layout (#1938)
 
 Records are placed under `~/.co/rem/docs/<source>/`:
@@ -112,7 +122,7 @@ example `docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42`.
 python -m pytest tests/unit/test_jira.py -q
 ```
 
-Expected: all tests pass, including `16-1` … `16-17`.
+Expected: all tests pass, including `16-1` … `16-22`.
 
 Coverage check:
 
