@@ -53,4 +53,3 @@ def register_onenote_source(parent, factory) -> None:
     def verify(as_json: bool = typer.Option(False, "--json")):
         """Verify existing co auth microsoft credentials and OneNote read access."""
         _run(lambda source: source.verify_connection(), as_json)
-
