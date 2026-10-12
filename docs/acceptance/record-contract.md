@@ -20,7 +20,7 @@ has images or attachments. Nothing else is allowed at the top level.
 | `external_id` | yes | The source's own id | issue key | page id |
 | `kind` | yes | Item type | issue type name, else `issue` | `page` |
 | `title` | no | Title | `summary` | `title` |
-| `text` | no | Readable content | plain-string description only (ADF → text is F13FCAKE-11) | empty (HTML → text is F13FCAKE-14) |
+| `text` | no | Readable content | description converted from ADF by `jira_adf.adf_to_text()` (light Markdown: headings, lists, code fences, quotes, tables; media as `[attachment: name]`) | empty (HTML → text is F13FCAKE-14) |
 | `url` | no | Link back to the original item | browse URL | `oneNoteWebUrl`, else `contentUrl` |
 | `author` | no | Who wrote it (display name) | reporter, else creator | — |
 | `at` | no | Created time, as the source gives it | `created` | `createdDateTime` |
@@ -32,6 +32,10 @@ has images or attachments. Nothing else is allowed at the top level.
 All fields except `extensions` and `media` are strings. Every envelope field must
 be present: optional ones may be empty (`""` or `{}`) but never missing —
 `validate_record()` reports `missing field '<name>'` otherwise.
+
+Jira content comes from `Jira.issue_items()`, which asks `/search/jql` for
+`jira.ISSUE_FIELDS` explicitly (`fields=` on every page), so the record does not
+depend on the server's default field set (F13FCAKE-11).
 
 ## Identity
 
@@ -52,7 +56,7 @@ are left out.
 
 | Source | Keys |
 |--------|------|
-| Jira | `issue_id`, `status`, `priority`, `labels`, `assignee`, `reporter`, `parent`, `description_adf` (raw ADF until F13FCAKE-11) |
+| Jira | `issue_id`, `status`, `priority`, `labels`, `assignee`, `reporter`, `parent`, `duedate`, `resolutiondate`, `description_adf` (the raw ADF, kept so nothing in the original is lost) |
 | OneNote | `section`, `notebook`, `url_is_api` (true when `url` is the Graph content URL, not a web link) |
 
 People are stored by display name only. Account emails and tokens never enter
@@ -113,8 +117,6 @@ example `docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42`.
 
 | Item | Story |
 |------|-------|
-| ADF → readable `text` | F13FCAKE-11 |
-| Requesting the full Jira field set (`fields`) in `issue_items()` | F13FCAKE-11 |
 | Changelog under `extensions.changelog`, new version on update (`updated` in the dedupe key) | F13FCAKE-12 |
 | `exports/` writer and the daily-vs-exports decision per item | F13FCAKE-11 / F13FCAKE-14, writer ownership to confirm on #1938 |
 | OneNote page HTML → text, per-user `account` value | F13FCAKE-14 / F13FCAKE-15 |

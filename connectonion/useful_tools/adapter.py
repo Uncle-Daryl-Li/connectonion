@@ -1,15 +1,17 @@
 """
 Purpose: Shared record contract and common adapter for co rem source integrations (F13FCAKE-16, F13FCAKE-18).
 LLM-Note:
-  Dependencies: imports from [datetime, json, dataclasses, pathlib] | imported by [tests/unit/test_jira.py, cli/commands/jira_commands.py] | no network calls
+  Dependencies: imports from [datetime, json, dataclasses, pathlib, useful_tools/jira_adf.adf_to_text] | imported by [tests/unit/test_jira.py, cli/commands/jira_commands.py] | no network calls
   Data flow: raw tool output (Jira issues / OneNote pages) → *_to_records() → make_record() envelope → validate_record() → AdapterResult (valid records + per-item errors) → write_daily_jsonl stores under daily/YYYY/MM/DD.jsonl
   State/Effects: write_daily_jsonl() / append_daily_jsonl() create directories and write files (append_daily_jsonl also returns how many records were new); all other functions are pure
   Integration: RECORD_FIELDS is the #1833 envelope every source writes; record_id() is the shared identity rule; make_record() / media_ref() build records; validate_record() is the one contract check for every source; AdapterResult is the shared result type; consume_records() is the in-memory consumer; consume_jsonl_records() reads from disk across multiple source directories; jira_issues_to_records() and onenote_pages_to_records() are the converter functions
   Errors: write_daily_jsonl() raises ValueError if the existing JSONL file contains a malformed line (refuses to append to a corrupted file) | consume_jsonl_records() never raises — malformed lines are recorded in AdapterResult.errors keyed by "file:lineno" | converters never raise on bad input — an invalid or malformed item is left out of records and reported in AdapterResult.errors keyed by "<source>:<item>"
   F13FCAKE-16 contract status:
     Envelope, identity, extensions, media references and validation implemented for both sources; documented in docs/acceptance/record-contract.md
-    Jira description ADF is kept raw under extensions.description_adf; readable text conversion is F13FCAKE-11
     OneNote page HTML is not fetched here; readable text conversion is F13FCAKE-14
+  F13FCAKE-11 Jira content status:
+    Jira.issue_items() requests jira.ISSUE_FIELDS; description ADF → record["text"] via jira_adf.adf_to_text(),
+    raw ADF kept under extensions.description_adf; due and resolution dates kept under extensions
   F13FCAKE-18 prototype status:
     Jira chain -- fully integrated: verify_connection -> issue_items -> write_source_yaml -> jira_issues_to_records -> write_daily_jsonl
     OneNote chain -- adapter function implemented and tested with synthetic fixtures; live Notes.Read integration is pending authorized account credentials and OneNote team implementation
@@ -34,6 +36,8 @@ import datetime
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .jira_adf import adf_to_text
 
 # The shared envelope (#1833): every source writes exactly these top-level fields, plus optional "media".
 RECORD_FIELDS = ("id", "source", "account", "external_id", "kind", "title", "text",
@@ -260,11 +264,12 @@ def consume_jsonl_records(
 
 
 def jira_issues_to_records(issues: list[dict], base_url: str, *, fetched: str | None = None) -> AdapterResult:
-    """Convert raw Jira issue dicts to shared-contract records (F13FCAKE-16, F13FCAKE-18).
+    """Convert raw Jira issue dicts to shared-contract records (F13FCAKE-11, F13FCAKE-16, F13FCAKE-18).
 
     Envelope: id = "jira:<site>:<key>", external_id = issue key, kind = issue type,
-    title = summary, url = browse URL, author = reporter, at = created, updated = updated.
-    Jira-only fields (status, priority, labels, people, parent, raw ADF) go under extensions;
+    title = summary, text = description as readable text (ADF converted by jira_adf.adf_to_text),
+    url = browse URL, author = reporter, at = created, updated = updated.
+    Jira-only fields (status, priority, labels, people, parent, due/resolution dates, raw ADF) go under extensions;
     attachments become metadata-only media references. Token and email are never included.
     An item that is not an object or fails validate_record() is reported in errors, not raised.
     """
@@ -280,15 +285,14 @@ def _jira_shape_problems(issue) -> list[str]:
     return []
 
 
-# One Jira issue → one envelope; description ADF stays raw until F13FCAKE-11 converts it.
+# One Jira issue → one envelope; the description becomes readable text, its raw ADF stays in extensions.
 def _jira_record(issue: dict, base_url: str, fetched: str) -> dict:
     fields = issue.get("fields") or {}
     key = str(issue.get("key") or "")
-    description = fields.get("description")
     return make_record(
         "jira", base_url, key, _name(fields.get("issuetype")) or "issue",
         title=str(fields.get("summary") or ""),
-        text=description if isinstance(description, str) else "",
+        text=adf_to_text(fields.get("description")),
         url=f"{base_url}/browse/{key}" if key else "",
         author=_display_name(fields.get("reporter") or fields.get("creator")),
         at=str(fields.get("created") or ""), updated=str(fields.get("updated") or ""),
@@ -310,6 +314,8 @@ def _jira_extensions(issue: dict, fields: dict) -> dict:
         "assignee": _display_name(fields.get("assignee")),
         "reporter": _display_name(fields.get("reporter")),
         "parent": str(parent.get("key") or "") if isinstance(parent, dict) else "",
+        "duedate": str(fields.get("duedate") or ""),
+        "resolutiondate": str(fields.get("resolutiondate") or ""),
         "description_adf": description if isinstance(description, dict) else None,
     }
     return {name: value for name, value in values.items() if value not in ("", None, [])}

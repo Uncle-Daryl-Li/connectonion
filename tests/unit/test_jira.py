@@ -1695,7 +1695,7 @@ def test_source_specific_fields_live_under_extensions_only():
     assert ext["reporter"] == "Bob Example"
     assert ext["parent"] == "ALPHA-7"
     assert ext["description_adf"]["type"] == "doc"
-    assert record["text"] == ""  # ADF → text is F13FCAKE-11
+    assert record["text"] == "Use JSON Lines."  # ADF → readable text (F13FCAKE-11); raw ADF kept above
 
 
 def test_missing_optional_fields_still_produce_valid_records():
@@ -1989,3 +1989,73 @@ def test_issue_items_requests_the_full_content_field_set():
     for needed in ("summary", "description", "issuetype", "status", "priority", "labels",
                    "assignee", "reporter", "created", "updated", "attachment"):
         assert needed in ISSUE_FIELDS
+
+
+_I_SEARCH = {
+    "id": "10077",
+    "key": "ALPHA-77",
+    "fields": {
+        "summary": "Pagination stops after the first page",
+        "issuetype": {"name": "Bug"},
+        "status": {"name": "Done"},
+        "priority": {"name": "Highest"},
+        "labels": ["bug", "pagination"],
+        "assignee": {"displayName": "Ben Example"},
+        "reporter": {"displayName": "Diego Example"},
+        "created": "2026-10-05T09:00:00.000+1100",
+        "updated": "2026-10-07T16:20:00.000+1100",
+        "duedate": "2026-10-09",
+        "resolutiondate": "2026-10-07T16:20:00.000+1100",
+        "parent": {"key": "ALPHA-1"},
+        "description": {"type": "doc", "version": 1, "content": [
+            {"type": "heading", "attrs": {"level": 2}, "content": [{"type": "text", "text": "Steps"}]},
+            {"type": "orderedList", "content": [
+                {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Select 60 issues"}]}]},
+                {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Run the import"}]}]}]},
+        ]},
+        "attachment": [],
+    },
+}
+
+
+def test_jira_record_text_is_readable_and_raw_adf_is_retained():
+    """11-12: ADF description becomes readable text in record["text"]; the raw ADF stays in extensions."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    record = jira_issues_to_records([_I_SEARCH], JIRA_URL, fetched=_FETCHED).records[0]
+    assert record["text"] == "## Steps\n\n1. Select 60 issues\n2. Run the import"
+    assert record["extensions"]["description_adf"] == _I_SEARCH["fields"]["description"]
+    plain = {"key": "ALPHA-78", "fields": {"summary": "s", "description": "  Plain text body.  "}}
+    plain_record = jira_issues_to_records([plain], JIRA_URL).records[0]
+    assert plain_record["text"] == "Plain text body."
+    assert "description_adf" not in plain_record["extensions"]
+
+
+def test_jira_record_carries_every_requested_content_field():
+    """11-13: summary, type, status, priority, people, labels, timestamps, dates and URL all reach the record."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, validate_record
+    record = jira_issues_to_records([_I_SEARCH], JIRA_URL, fetched=_FETCHED).records[0]
+    assert validate_record(record) == []
+    assert (record["title"], record["kind"], record["author"]) == (
+        "Pagination stops after the first page", "Bug", "Diego Example")
+    assert (record["at"], record["updated"]) == ("2026-10-05T09:00:00.000+1100", "2026-10-07T16:20:00.000+1100")
+    assert record["url"] == f"{JIRA_URL}/browse/ALPHA-77"
+    assert record["extensions"] == {
+        "issue_id": "10077", "status": "Done", "priority": "Highest", "labels": ["bug", "pagination"],
+        "assignee": "Ben Example", "reporter": "Diego Example", "parent": "ALPHA-1",
+        "duedate": "2026-10-09", "resolutiondate": "2026-10-07T16:20:00.000+1100",
+        "description_adf": _I_SEARCH["fields"]["description"],
+    }
+
+
+def test_missing_or_unreadable_description_does_not_block_the_record():
+    """11-14: no description, an empty ADF doc or an unreadable description still gives a valid record with text ""."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    issues = [
+        {"key": "ALPHA-80", "fields": {"summary": "no description"}},
+        {"key": "ALPHA-81", "fields": {"summary": "empty doc", "description": {"type": "doc", "content": []}}},
+        {"key": "ALPHA-82", "fields": {"summary": "odd description", "description": ["not", "adf"]}},
+    ]
+    result = jira_issues_to_records(issues, JIRA_URL)
+    assert result.errors == {}
+    assert [r["text"] for r in result.records] == ["", "", ""]
+    assert [r["title"] for r in result.records] == ["no description", "empty doc", "odd description"]
