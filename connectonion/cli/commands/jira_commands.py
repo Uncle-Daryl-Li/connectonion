@@ -4,7 +4,7 @@ LLM-Note:
   Dependencies: imports from [sys, json, rich, useful_tools/jira.Jira] | imported by [cli/main.py] | tested by [tests/unit/test_jira.py]
   Data flow: CLI flags -> _jira() factory -> Jira.verify_connection()/project_items()/issue_items() -> formatted output or JSON
   State/Effects: sync writes source.yaml and daily JSONL under the output dir; Jira itself is always read-only; all auth/scope validation in tool layer
-  Errors: JiraConfigError/JiraAuthError/JiraPermissionError/ValueError -> stderr + exit 1; never exposes token
+  Errors: JiraConfigError/JiraAuthError/JiraPermissionError/ValueError -> stderr + exit 1; never exposes token | sync with items rejected by the shared record contract (F13FCAKE-16) still writes the valid records, lists every rejected item, and exits 1
 """
 
 import json
@@ -114,12 +114,16 @@ def handle_jira_sync(
 ) -> None:
     """Validate credentials, collect selected issues, write source.yaml and daily JSONL.
 
-    Full workflow: verify → issue_items → write_source_yaml → jira_issues_to_records → write_daily_jsonl.
+    Full workflow: verify → issue_items → write_source_yaml → jira_issues_to_records → append_daily_jsonl.
     Writes to output_dir (default: ~/.co/rem/docs/jira).
-    JSON output: {"written": source_yaml_path, "jsonl": jsonl_path, "issues": count, "project": key}.
+    JSON output: {"written": source_yaml_path, "jsonl": jsonl_path, "project": key, "issues": collected,
+    "mapped": records that passed the contract, "appended": records newly added to today's file
+    (already-present records are skipped), "rejected": {"jira:<key>": reason}}.
+    Rejected items never disappear silently: valid records are still written, the rejected ones are
+    listed (stderr, or "rejected" in JSON), and the command exits 1.
     """
     from ...useful_tools.jira import JiraConfigError, JiraAuthError, JiraPermissionError
-    from ...useful_tools.adapter import jira_issues_to_records, write_daily_jsonl
+    from ...useful_tools.adapter import append_daily_jsonl, jira_issues_to_records
     if output_dir is None:
         output_dir = Path.home() / ".co" / "rem" / "docs" / "jira"
     try:
@@ -128,20 +132,37 @@ def handle_jira_sync(
         issues = jira.issue_items(project_key, set(issue_keys))
         jira.write_source_yaml(output_dir, [project_key], set(issue_keys))
         adapter_result = jira_issues_to_records(issues, info["site_url"])
-        jsonl_path = write_daily_jsonl(adapter_result.records, output_dir)
+        jsonl_path, appended = append_daily_jsonl(adapter_result.records, output_dir)
     except (JiraConfigError, JiraAuthError, JiraPermissionError, ValueError) as exc:
         _handle_error(exc, as_json)
         return
     source_yaml = str(output_dir / "source.yaml")
+    rejected = adapter_result.errors
     if as_json:
         print(json.dumps({
             "written": source_yaml,
             "jsonl": str(jsonl_path),
             "project": project_key,
             "issues": len(issues),
+            "mapped": len(adapter_result.records),
+            "appended": appended,
+            "rejected": rejected,
         }))
+    else:
+        print(f"Wrote {source_yaml}")
+        print(f"Wrote {jsonl_path}")
+        print(f"Project: {project_key}  Issues collected: {len(issues)}  "
+              f"Records mapped: {len(adapter_result.records)}  Records appended: {appended}")
+        print("Example: co rem sources")
+    _exit_if_rejected(rejected, as_json)
+
+
+# Mapping errors (F13FCAKE-16) must reach the user: list each rejected item, then exit 1.
+def _exit_if_rejected(rejected: dict, as_json: bool) -> None:
+    if not rejected:
         return
-    print(f"Wrote {source_yaml}")
-    print(f"Wrote {jsonl_path}")
-    print(f"Project: {project_key}  Issues collected: {len(issues)}")
-    print("Example: co rem sources")
+    if not as_json:
+        errors.print(f"{len(rejected)} item(s) were rejected and not written:", style="red", markup=False)
+        for label, reason in rejected.items():
+            errors.print(f"  {label}: {reason}", markup=False)
+    sys.exit(1)
