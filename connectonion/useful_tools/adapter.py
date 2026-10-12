@@ -193,7 +193,8 @@ def write_daily_jsonl(records: list[dict], source_dir: Path) -> Path:
 
 
 # Same append as write_daily_jsonl, but also reports how many records were new (not deduplicated away).
-def append_daily_jsonl(records: list[dict], source_dir: Path) -> tuple[Path, int]:
+def append_daily_jsonl(records: list[dict], source_dir: Path, *,
+                       date: datetime.date | None = None) -> tuple[Path, int]:
     """Append records as JSONL under source_dir/daily/YYYY/MM/DD.jsonl.
 
     Deduplicates by (source, account, id): records whose composite key already
@@ -205,7 +206,8 @@ def append_daily_jsonl(records: list[dict], source_dir: Path) -> tuple[Path, int
     refuses to append to a corrupted file to avoid data inconsistency.
     """
     source_dir = Path(source_dir)
-    today = datetime.date.today()
+    # A collection started before midnight stays on its explicitly selected day.
+    today = date or datetime.date.today()
     daily_dir = source_dir / "daily" / str(today.year) / f"{today.month:02d}"
     daily_dir.mkdir(parents=True, exist_ok=True)
     target = daily_dir / f"{today.day:02d}.jsonl"
@@ -223,7 +225,7 @@ def append_daily_jsonl(records: list[dict], source_dir: Path) -> tuple[Path, int
                             rec.get("account", ""),
                             rec.get("id", ""),
                         ))
-                    except json.JSONDecodeError as exc:
+                    except (json.JSONDecodeError, AttributeError, TypeError) as exc:
                         raise ValueError(
                             f"Existing JSONL file {target} is corrupted at line {lineno}: {exc}. "
                             "Refusing to append to avoid data inconsistency."
@@ -445,11 +447,16 @@ def _onenote_record(page: dict, account: str, fetched: str) -> dict:
         "notebook": _parent_name(page.get("parentNotebook")),
         "url_is_api": True if not web_url and content_url else None,
     }
+    # Source details belong under extensions, keeping the shared envelope exact.
+    for name in ("scope", "media_fetch_references"):
+        if name in page:
+            values[name] = page[name]
     return make_record(
         "onenote", account, str(page.get("id") or ""), "page",
-        title=str(page.get("title") or ""), url=web_url or content_url,
+        title=str(page.get("title") or ""), text=page.get("text", ""), url=web_url or content_url,
         at=str(page.get("createdDateTime") or ""), updated=str(page.get("lastModifiedDateTime") or ""),
         extensions={name: value for name, value in values.items() if value not in ("", None)},
+        media=page.get("media"),
         fetched=fetched,
     )
 

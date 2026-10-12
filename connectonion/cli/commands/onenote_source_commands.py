@@ -1,0 +1,95 @@
+"""Read-only OneNote source CLI; imports collection code only when invoked."""
+
+import json
+from pathlib import Path
+from typing import List, Optional
+
+import typer
+
+
+def _source():
+    from ...useful_tools.onenote_source import OneNoteSource
+    return OneNoteSource()
+
+
+def _run(operation, as_json: bool, family: str | None = None) -> None:
+    from ...provider_credentials import ProviderCredentialError
+    import yaml
+    try:
+        result = operation(_source())
+    except (OSError, yaml.YAMLError):
+        result = {"error": "Could not read or write the local source files. Check --output and directory permissions.", "exit_code": 1}
+    except (ValueError, ProviderCredentialError) as error:
+        result = {"error": str(error), "exit_code": 1}
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False))
+    elif "error" in result:
+        typer.echo(result["error"], err=True)
+    elif family:
+        for row in result[family]:
+            print(f"{row['id']}  {' '.join(str(row.get('displayName') or row.get('title') or '(untitled)').split())}")
+        if not result[family]:
+            print(f"No {family} in this scope.")
+        if result.get("truncated"):
+            print(f"Listing limited to {result['limit']} pages; more pages remain. Increase --limit (maximum 1000).")
+    else:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    if "error" in result:
+        raise typer.Exit(1)
+    if result.get("errors"):
+        # Partial results have already been saved; scripts can distinguish this
+        # from success and from a fatal failure without parsing prose.
+        from .command_tips import mark_next_step_named
+        # Exit 2 is an intentional partial result, not a parser usage error.
+        # Recovery is already named in each page diagnostic.
+        mark_next_step_named()
+        raise typer.Exit(2)
+
+
+def register_onenote_source(parent, factory) -> None:
+    source_app = factory(help="Read-only OneNote collection: choose notebook, section and explicit page IDs.",
+                         no_args_is_help=True)
+    parent.add_typer(source_app, name="source")
+
+    @source_app.command("verify")
+    def verify(as_json: bool = typer.Option(False, "--json")):
+        """Verify existing co auth microsoft credentials and OneNote read access."""
+        _run(lambda source: source.verify_connection(), as_json)
+
+    @source_app.command("notebooks")
+    def notebooks(as_json: bool = typer.Option(False, "--json")):
+        """List all accessible notebooks, following pagination."""
+        _run(lambda source: {"notebooks": source.notebooks()}, as_json, "notebooks")
+
+    @source_app.command("sections")
+    def sections(notebook: str = typer.Argument(..., help="Notebook ID or unique exact name"),
+                 as_json: bool = typer.Option(False, "--json")):
+        """List all sections of the selected notebook, following pagination."""
+        _run(lambda source: {"sections": source.sections(notebook)}, as_json, "sections")
+
+    @source_app.command("pages")
+    def pages(notebook: str = typer.Argument(..., help="Notebook ID or unique exact name"),
+              section: str = typer.Argument(..., help="Section ID or unique exact name within that notebook"),
+              limit: int = typer.Option(100, "--limit", min=1, max=1000),
+              as_json: bool = typer.Option(False, "--json")):
+        """List a bounded page set and report whether later pages remain."""
+        _run(lambda source: source.pages(notebook, section, limit=limit), as_json, "pages")
+
+    @source_app.command("sync")
+    def sync(notebook: str = typer.Argument(..., help="Selected notebook ID or exact name"),
+             section: str = typer.Argument(..., help="Selected section ID or exact name"),
+             page_ids: List[str] = typer.Argument(..., help="Explicit page IDs from source pages; never imports all pages"),
+             output: Optional[Path] = typer.Option(None, "--output", help="Default: ~/.co/rem/docs/onenote"),
+             mode: str = typer.Option("daily", "--mode", help="daily or export"),
+             export_id: Optional[str] = typer.Option(None, "--export-id", help="Required for one-off export"),
+             as_json: bool = typer.Option(False, "--json")):
+        """Save chosen pages as daily records or a one-off export. Remote reads only.
+
+        Exit 0: all selected pages imported. Exit 2: partial/all page failures;
+        valid records are saved. Exit 1: authentication, scope or storage failure.
+        This writes an external import, not automatic co rem source registration.
+        """
+        from ...useful_tools.onenote_source import sync_onenote
+        directory = output or Path.home() / ".co" / "rem" / "docs" / "onenote"
+        _run(lambda source: sync_onenote(source, notebook, section, page_ids, directory,
+                                        mode=mode, export_id=export_id), as_json)
