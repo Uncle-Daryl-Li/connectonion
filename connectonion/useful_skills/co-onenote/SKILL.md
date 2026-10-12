@@ -23,7 +23,9 @@ does not establish live least-privilege consent. No separate Azure application i
 
 ## Before anything
 
-Run `co onenote ls`. If it says the Microsoft account is not connected, tell
+For source access, start with `co onenote source verify --json`. Use `co onenote ls`
+only for older browsing when its Notes.ReadWrite permission is already available.
+If it says the Microsoft account is not connected, tell
 the user to run `co auth microsoft`. Never ask them to paste a token into the
 chat.
 
