@@ -3,7 +3,7 @@
 One record shape for every co rem source integration. Jira and OneNote map
 into it, and `validate_record()` checks both against the same rules.
 Implementation: `connectonion/useful_tools/adapter.py`.
-Tests: `tests/unit/test_jira.py` (cases `16-1` … `16-24`, `11-1` … `11-30`, `12-1` … `12-30`) and
+Tests: `tests/unit/test_jira.py` (cases `16-1` … `16-24`, `11-1` … `11-30`, `12-1` … `12-38`) and
 `tests/unit/test_jira_adf.py`; `adapter.py` line and branch coverage 100%.
 
 ---
@@ -92,6 +92,9 @@ pages) and stores it on that issue's own record, matched by issue key:
 - A change value longer than 1000 characters is cut and marked; malformed history entries are
   skipped and counted under `skipped`.
 - `co jira sync --no-history` skips these reads; the records then have no `changelog` key.
+- If history was skipped, restricted or unavailable, retrying with readable history appends
+  the recovered evidence even when Jira's `updated` timestamp has not changed. An identical
+  retry appends nothing; only a new `fetched` time does not create a snapshot.
 - `--json` output reports `"history": {"ok": n, "none": n, "restricted": n, "unavailable": n}`
   (`null` with `--no-history`).
 
@@ -153,7 +156,7 @@ unusable `--export` id before contacting Jira or writing any file:
 
 | Placement | Use for | Writer | Behaviour |
 |-----------|---------|--------|-----------|
-| `daily/YYYY/MM/DD.jsonl` | ongoing changes from a sync — `co jira sync PROJECT KEY…` | `write_daily_jsonl` / `append_daily_jsonl` (F13FCAKE-18) | dated by the import day; appends, skipping a record whose `(source, account, id, updated)` is already in that day's file, so a changed item is added as a new version below the old line and existing lines (and earlier days' files) are never rewritten (F13FCAKE-12); `append_daily_jsonl` also returns how many were new |
+| `daily/YYYY/MM/DD.jsonl` | ongoing changes from a sync — `co jira sync PROJECT KEY…` | `write_daily_jsonl` / `append_daily_jsonl` (F13FCAKE-18) | dated by the import day; deduplicates `(source, account, id, updated, content hash)`, ignoring `fetched`; an edit or newly read history appends a snapshot even with the same `updated`. Existing lines and earlier days' files are never rewritten (F13FCAKE-12); `append_daily_jsonl` also returns how many were new |
 | `exports/<id>/` | a one-off import, e.g. a project's history — `co jira sync PROJECT KEY… --export <id>` | `write_export` (F13FCAKE-11 prototype) | written once, never appended; refuses an unsafe or existing id, any invalid or repeated record, and data that cannot be saved as JSON before writing anything; staged in a hidden `.<id>.partial` directory and renamed into place; if writing fails the staging directory is removed so the same id can be retried (a `.partial` left by a crash is reported with instructions to delete it) |
 
 `exports/<id>/manifest.json` example:
@@ -178,16 +181,22 @@ with the client.
 
 ### References (F13FCAKE-12)
 
-A page cites a record by file and id, for example
-`docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42`.
+A page cites a record by file, id and snapshot version, for example
+`docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42?version=<sha256>`.
 
 - `record_reference(file, record, notebook_root)` builds it: the file path relative to
-  the notebook root, always with `/`, then `#` and the record id. A file outside the
-  notebook or a record without an id raises `ValueError`.
-- `resolve_reference(reference, notebook_root)` follows it back. When a file holds
-  several versions of the same item, the newest (last) line wins. A missing file, an
-  unknown id, a reference without `#` or one pointing outside the notebook gives
-  `None`; damaged lines are skipped.
+  the notebook root, always with `/`, then `#`, the record id and `?version=<sha256>`.
+  The SHA-256 covers canonical JSON of all fields except `fetched`, including history.
+  Object key order has no effect. A file outside the notebook or a record without an id
+  raises `ValueError`.
+- `resolve_reference(reference, notebook_root)` returns the matching snapshot. Appending
+  another version or recovering history cannot move an existing citation. A missing file,
+  unknown id/version, malformed version, reference without `#` or path outside the
+  notebook gives `None`; damaged JSON lines are skipped. A missing version never falls
+  back to the latest line.
+- Legacy `file#id` references remain readable and return the first matching line. They
+  never specified a version, so any intended later snapshot is ambiguous; regenerate
+  such citations with `record_reference()` and the intended record to pin it precisely.
 - Daily files and `exports/<id>/records.jsonl` are cited the same way.
 
 ## Not in this contract yet
@@ -203,7 +212,7 @@ A page cites a record by file and id, for example
 python -m pytest tests/unit/test_jira.py -q
 ```
 
-Expected: all tests pass, including `16-1` … `16-24`, `11-1` … `11-30` and `12-1` … `12-30`.
+Expected: all tests pass, including `16-1` … `16-24`, `11-1` … `11-30` and `12-1` … `12-38`.
 
 Coverage check:
 

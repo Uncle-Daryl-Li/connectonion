@@ -2732,21 +2732,23 @@ def test_a_new_day_never_rewrites_the_previous_day(tmp_path):
 
 
 def test_record_reference_is_notebook_relative_file_and_id(tmp_path):
-    """12-23: a reference is "<notebook-relative file>#<id>" with "/" separators; outside the notebook or no id raises."""
+    """12-23: a reference carries the notebook-relative path, id and snapshot version; outside paths/no id raise."""
     from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records, record_reference
     notebook = tmp_path / "notebook"
     record = jira_issues_to_records([_I1], JIRA_URL).records[0]
     path, _ = append_daily_jsonl([record], notebook / "docs" / "jira", date=datetime.date(2026, 10, 12))
-    assert record_reference(path, record, notebook) == (
+    reference = record_reference(path, record, notebook)
+    assert reference.partition("?version=")[0] == (
         "docs/jira/daily/2026/10/12.jsonl#jira:test.atlassian.net:ALPHA-1")
+    assert "?version=" in reference
     with pytest.raises(ValueError, match="outside the notebook"):
         record_reference(tmp_path / "elsewhere.jsonl", record, notebook)
     with pytest.raises(ValueError, match="no id"):
         record_reference(path, {"title": "no id"}, notebook)
 
 
-def test_resolve_reference_returns_the_newest_version_or_none(tmp_path):
-    """12-24: the newest line for the id wins; unknown id, missing file, no "#" or a path escaping the notebook give None."""
+def test_resolve_reference_returns_the_cited_version_or_none(tmp_path):
+    """12-24: the cited snapshot wins; unknown id, missing file, no "#" or a path escaping the notebook give None."""
     from connectonion.useful_tools.adapter import (
         append_daily_jsonl, jira_issues_to_records, record_reference, resolve_reference,
     )
@@ -2760,7 +2762,8 @@ def test_resolve_reference_returns_the_newest_version_or_none(tmp_path):
     with open(path, "a", encoding="utf-8") as fh:
         fh.write("{damaged line\n")
     reference = record_reference(path, draft[0], notebook)
-    assert resolve_reference(reference, notebook) == final[0]
+    assert resolve_reference(reference, notebook) == draft[0]
+    assert resolve_reference(record_reference(path, final[0], notebook), notebook) == final[0]
     (tmp_path / "outside.jsonl").write_text(json.dumps(draft[0]) + "\n", encoding="utf-8")
     for broken in (reference.replace("ALPHA-1", "ALPHA-404"), reference.replace("12.jsonl", "13.jsonl"),
                    reference.split("#")[0], "../outside.jsonl#" + draft[0]["id"], ""):
@@ -2776,7 +2779,7 @@ def test_references_also_point_into_one_off_exports(tmp_path):
     records = jira_issues_to_records([_I1, _I2], JIRA_URL, fetched=_FETCHED).records
     export_dir = write_export(records, notebook / "docs" / "jira", "alpha-history", _SCOPE)
     reference = record_reference(export_dir / "records.jsonl", records[1], notebook)
-    assert reference == "docs/jira/exports/alpha-history/records.jsonl#jira:test.atlassian.net:ALPHA-2"
+    assert reference.partition("?version=")[0] == "docs/jira/exports/alpha-history/records.jsonl#jira:test.atlassian.net:ALPHA-2"
     assert resolve_reference(reference, notebook) == records[1]
 
 
@@ -2822,22 +2825,23 @@ def test_sync_attaches_each_issue_history_end_to_end(tmp_path):
 
 
 def test_resync_after_an_edit_keeps_both_versions_and_the_reference_trail(tmp_path):
-    """12-27: a re-sync after an edit appends the new version; the old line is unchanged; a reference resolves to the newest."""
+    """12-27: a re-sync after an edit appends a version; the old line and its citation remain unchanged."""
     from connectonion.useful_tools.adapter import record_reference, resolve_reference
     jira_dir = tmp_path / "docs" / "jira"
     args = ["ALPHA", "ALPHA-1", "--output", str(jira_dir), "--json"]
     first, _ = _sync_site(args, [_DRAFT], {"ALPHA-1": (200, [])})
     path = Path(json.loads(first.stdout)["jsonl"])
     draft_line = path.read_text(encoding="utf-8")
+    reference = record_reference(path, json.loads(draft_line), tmp_path)
     second, _ = _sync_site(args, [_FINAL], {"ALPHA-1": (200, _EDITED)})
     assert json.loads(second.stdout)["appended"] == 1
     assert path.read_text(encoding="utf-8").startswith(draft_line)
     draft, final = (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines())
     assert (draft["title"], draft["extensions"]["changelog"]["status"]) == ("Draft", "none")
     assert (final["title"], final["extensions"]["changelog"]["status"]) == ("Final", "ok")
-    reference = record_reference(path, draft, tmp_path)
-    assert reference.startswith("docs/jira/daily/") and reference.endswith("#jira:test.atlassian.net:ALPHA-1")
-    assert resolve_reference(reference, tmp_path) == final
+    assert reference.startswith("docs/jira/daily/") and "#jira:test.atlassian.net:ALPHA-1?version=" in reference
+    assert resolve_reference(reference, tmp_path) == draft
+    assert resolve_reference(record_reference(path, final, tmp_path), tmp_path) == final
 
 
 def test_no_history_skips_the_history_reads(tmp_path):
@@ -2873,3 +2877,144 @@ def test_text_summary_counts_history_and_explains_unreadable_ones(tmp_path):
     clean, _ = _sync_site(["ALPHA", "ALPHA-1", "--output", str(tmp_path / "clean")], [_I1], {"ALPHA-1": (200, [])})
     assert "History: ok 0  none 1  restricted 0  unavailable 0" in clean.stdout
     assert "were still written" not in clean.stdout
+
+
+def test_reference_keeps_its_snapshot_after_same_day_update(tmp_path):
+    """12-31: citing a draft before an edit keeps pointing to that draft after the final version is appended."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, jira_issues_to_records, record_reference, resolve_reference,
+    )
+    notebook = tmp_path / "notebook"
+    source_dir = notebook / "docs" / "jira"
+    day = datetime.date(2026, 10, 12)
+    draft = jira_issues_to_records([_DRAFT], JIRA_URL, fetched=_FETCHED).records[0]
+    final = jira_issues_to_records([_FINAL], JIRA_URL, fetched=_FETCHED).records[0]
+    path, _ = append_daily_jsonl([draft], source_dir, date=day)
+    reference = record_reference(path, draft, notebook)
+    assert resolve_reference(reference, notebook) == draft
+    append_daily_jsonl([final], source_dir, date=day)
+    assert resolve_reference(reference, notebook) == draft
+    assert record_reference(path, final, notebook) != reference
+    assert resolve_reference(record_reference(path, final, notebook), notebook) == final
+
+
+@pytest.mark.parametrize("first_status", [None, "restricted", "unavailable", "none"])
+def test_recovered_history_is_appended_without_an_issue_edit(tmp_path, first_status):
+    """12-32: retry after --no-history or an unreadable history saves new evidence even with the same updated time."""
+    from connectonion.useful_tools.adapter import record_reference, resolve_reference
+    source_dir = tmp_path / "docs" / "jira"
+    args = ["ALPHA", "ALPHA-1", "--output", str(source_dir), "--json"]
+    statuses = {"restricted": 403, "unavailable": 500, "none": 200}
+    first_args = args + ["--no-history"] if first_status is None else args
+    first_histories = {} if first_status is None else {"ALPHA-1": (statuses[first_status], [])}
+    first, _ = _sync_site(first_args, [_DRAFT], first_histories)
+    assert first.exit_code == 0, first.output
+    path = Path(json.loads(first.stdout)["jsonl"])
+    original = path.read_bytes()
+    old_record = json.loads(original)
+    reference = record_reference(path, old_record, tmp_path)
+
+    second, _ = _sync_site(args, [_DRAFT], {"ALPHA-1": (200, _EDITED)})
+    assert second.exit_code == 0, second.output
+    assert json.loads(second.stdout)["appended"] == 1
+    assert path.read_bytes().startswith(original)
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 2
+    assert records[0]["id"] == records[1]["id"]
+    assert records[0]["updated"] == records[1]["updated"]
+    assert records[1]["extensions"]["changelog"]["status"] == "ok"
+    assert records[1]["extensions"]["changelog"]["entries"]
+    assert resolve_reference(reference, tmp_path) == old_record
+    third, _ = _sync_site(args, [_DRAFT], {"ALPHA-1": (200, _EDITED)})
+    assert third.exit_code == 0, third.output
+    assert json.loads(third.stdout)["appended"] == 0
+
+
+def test_fetch_time_alone_does_not_append_or_change_the_citation(tmp_path):
+    """12-33: an identical re-read with a later fetched time deduplicates and still cites the stored snapshot."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, jira_issues_to_records, record_reference, resolve_reference,
+    )
+    first = jira_issues_to_records([_DRAFT], JIRA_URL, fetched="2026-10-12T10:00:00Z").records[0]
+    reread = jira_issues_to_records([_DRAFT], JIRA_URL, fetched="2026-10-12T11:00:00Z").records[0]
+    path, _ = append_daily_jsonl([first], tmp_path, date=datetime.date(2026, 10, 12))
+    assert append_daily_jsonl([reread], tmp_path, date=datetime.date(2026, 10, 12)) == (path, 0)
+    assert record_reference(path, first, tmp_path) == record_reference(path, reread, tmp_path)
+    assert resolve_reference(record_reference(path, reread, tmp_path), tmp_path) == first
+
+
+def test_legacy_reference_keeps_the_first_stored_record(tmp_path):
+    """12-34: the old file#id format still reads, but later appends cannot move it to a new version."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records, resolve_reference
+    draft = jira_issues_to_records([_DRAFT], JIRA_URL, fetched=_FETCHED).records[0]
+    final = jira_issues_to_records([_FINAL], JIRA_URL, fetched=_FETCHED).records[0]
+    day = datetime.date(2026, 10, 12)
+    path, _ = append_daily_jsonl([draft], tmp_path, date=day)
+    reference = f"{path.relative_to(tmp_path).as_posix()}#{draft['id']}"
+    assert resolve_reference(reference, tmp_path) == draft
+    append_daily_jsonl([final], tmp_path, date=day)
+    assert resolve_reference(reference, tmp_path) == draft
+
+
+@pytest.mark.parametrize("version", ["", "short", "g" * 64, "0" * 64])
+def test_missing_or_invalid_snapshot_never_falls_back_to_another_record(tmp_path, version):
+    """12-35: a damaged or absent version must return None even when the file contains the requested id."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, jira_issues_to_records, record_reference, resolve_reference,
+    )
+    record = jira_issues_to_records([_DRAFT], JIRA_URL, fetched=_FETCHED).records[0]
+    path, _ = append_daily_jsonl([record], tmp_path, date=datetime.date(2026, 10, 12))
+    prefix = record_reference(path, record, tmp_path).rpartition("?version=")[0]
+    assert resolve_reference(f"{prefix}?version={version}", tmp_path) is None
+
+
+def test_record_key_order_does_not_create_a_new_snapshot(tmp_path):
+    """12-36: reordered JSON objects represent the same content, so re-reading them does not duplicate evidence."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records, record_reference
+    record = jira_issues_to_records([_DRAFT], JIRA_URL, changelogs={"ALPHA-1": _outcome("ok", _EDITED)},
+                                   fetched=_FETCHED).records[0]
+    reordered = dict(reversed(list(record.items())))
+    reordered["extensions"] = dict(reversed(list(record["extensions"].items())))
+    day = datetime.date(2026, 10, 12)
+    path, _ = append_daily_jsonl([record], tmp_path, date=day)
+    assert append_daily_jsonl([reordered], tmp_path, date=day) == (path, 0)
+    assert record_reference(path, record, tmp_path) == record_reference(path, reordered, tmp_path)
+
+
+def test_more_history_at_the_same_updated_time_keeps_both_snapshots(tmp_path):
+    """12-37: history can gain entries without an issue edit; old citations and old lines stay intact."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, jira_issues_to_records, record_reference, resolve_reference,
+    )
+    histories = _EDITED + [_history("11", "2026-10-06T10:00:00Z", "priority", "Low", "High")]
+    partial = jira_issues_to_records([_DRAFT], JIRA_URL, changelogs={"ALPHA-1": _outcome("ok", _EDITED)},
+                                 fetched=_FETCHED).records[0]
+    complete = jira_issues_to_records([_DRAFT], JIRA_URL, changelogs={"ALPHA-1": _outcome("ok", histories)},
+                                  fetched=_FETCHED).records[0]
+    day = datetime.date(2026, 10, 12)
+    path, count = append_daily_jsonl([partial, complete, partial, complete], tmp_path, date=day)
+    assert count == 2
+    assert append_daily_jsonl([partial, complete], tmp_path, date=day) == (path, 0)
+    assert resolve_reference(record_reference(path, partial, tmp_path), tmp_path) == partial
+    assert resolve_reference(record_reference(path, complete, tmp_path), tmp_path) == complete
+
+
+def test_shared_writer_keeps_onenote_evidence_and_its_old_citation(tmp_path):
+    """12-38: the shared writer also preserves OneNote scope/media references when new evidence is appended."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, media_ref, onenote_pages_to_records, record_reference, resolve_reference,
+    )
+    page = dict(_ON1, scope={"sections": ["design"]}, media_fetch_references={"diagram": "attachment-1"})
+    first = onenote_pages_to_records([page], "fictional-account", fetched=_FETCHED).records[0]
+    enriched = onenote_pages_to_records(
+        [dict(page, media=[media_ref("diagram.png", "image/png", 2048)])], "fictional-account", fetched=_FETCHED,
+    ).records[0]
+    day = datetime.date(2026, 10, 12)
+    path, _ = append_daily_jsonl([first], tmp_path, date=day)
+    reference = record_reference(path, first, tmp_path)
+    assert append_daily_jsonl([enriched], tmp_path, date=day) == (path, 1)
+    assert resolve_reference(reference, tmp_path) == first
+    stored = resolve_reference(record_reference(path, enriched, tmp_path), tmp_path)
+    assert stored == enriched
+    assert stored["extensions"]["scope"] == {"sections": ["design"]}
+    assert stored["extensions"]["media_fetch_references"] == {"diagram": "attachment-1"}

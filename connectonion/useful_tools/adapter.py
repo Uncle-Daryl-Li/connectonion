@@ -17,8 +17,8 @@ LLM-Note:
   F13FCAKE-12 Jira history status:
     Jira.issue_changelogs() → per-issue outcome {status, histories, reason}; changelog_extension() turns it into
     {status, entries, reason} with entries from jira_changelog_entries() (time, author name, field from → to)
-    A changed item is appended to the daily file as a new version (dedupe key includes "updated"); older lines stay
-    record_reference() cites a stored record as "<notebook-relative file>#<id>"; resolve_reference() follows it back
+    A changed item or newly read history is appended as a new snapshot; fetched alone never creates a duplicate
+    record_reference() cites "<notebook-relative file>#<id>?version=<content hash>"; resolution keeps that snapshot
     Jira chain -- fully integrated: verify_connection -> issue_items -> issue_changelogs (co jira sync, unless --no-history)
       -> write_source_yaml -> jira_issues_to_records(changelogs=...) -> write_daily_jsonl / write_export
     OneNote chain -- adapter function implemented and tested with synthetic fixtures; live Notes.Read integration is pending authorized account credentials and OneNote team implementation
@@ -40,6 +40,7 @@ Usage:
 """
 
 import datetime
+import hashlib
 import json
 import re
 import shutil
@@ -212,10 +213,10 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
                        date: datetime.date | None = None) -> tuple[Path, int]:
     """Append records as JSONL under source_dir/daily/YYYY/MM/DD.jsonl.
 
-    Deduplicates by (source, account, id, updated): a record whose version is already in the
-    file is skipped, so a same-day re-sync neither overwrites nor duplicates entries; a changed
-    item (new "updated") is appended as a newer version below the old line, which stays as it was
-    (F13FCAKE-12). Duplicate versions within the same records list are also suppressed.
+    Deduplicates by identity, updated and a content hash excluding fetched. An unchanged
+    re-read is skipped; an edit or newly available history is appended even if updated has
+    not changed. Old lines stay untouched (F13FCAKE-12). Duplicate snapshots within the
+    same records list are also suppressed.
     Creates all intermediate directories.  Returns (path written, number of records appended).
     Raises ValueError if the existing file contains a malformed JSON line —
     refuses to append to a corrupted file to avoid data inconsistency.
@@ -257,16 +258,25 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
     return target, len(new_records)
 
 
-# Version identity in a daily file: the same item with a new "updated" time is a new version.
+# Content identity: ignore collection time, but include history so a successful retry is kept.
+def _snapshot_hash(record: dict) -> str:
+    content = {name: value for name, value in record.items() if name != "fetched"}
+    payload = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# Version identity includes evidence content, not just Jira's last-modified time.
 def _version_key(record) -> tuple:
-    return tuple(record.get(name, "") for name in ("source", "account", "id", "updated"))
+    identity = tuple(record.get(name, "") for name in ("source", "account", "id", "updated"))
+    return (*identity, _snapshot_hash(record))
 
 
-# Citation for one stored record: notebook-relative file path + "#" + record id (F13FCAKE-12).
+# Cite one immutable snapshot, so later appends cannot change the evidence behind a page.
 def record_reference(file_path: Path, record: dict, notebook_root: Path) -> str:
-    """Return "<file relative to notebook_root>#<record id>", e.g. "docs/jira/daily/2026/10/12.jsonl#jira:…".
+    """Return "<file relative to notebook_root>#<record id>?version=<sha256>".
 
     The path always uses "/" so a reference written on Windows resolves on macOS and Linux.
+    The hash covers record content except fetched; an identical re-read cites the same snapshot.
     Raises ValueError if file_path is outside notebook_root or the record has no id.
     """
     root = Path(notebook_root).resolve()
@@ -275,27 +285,33 @@ def record_reference(file_path: Path, record: dict, notebook_root: Path) -> str:
         raise ValueError(f"{file_path} is outside the notebook {notebook_root}; a reference must stay inside it.")
     if not isinstance(record, dict) or not record.get("id"):
         raise ValueError("The record has no id, so it cannot be referenced.")
-    return f"{path.relative_to(root).as_posix()}#{record['id']}"
+    return f"{path.relative_to(root).as_posix()}#{record['id']}?version={_snapshot_hash(record)}"
 
 
-# Follow a reference back to its record; the newest line for that id wins (new versions are appended below).
+# Versioned references match that snapshot; legacy file#id references keep the first matching line.
 def resolve_reference(reference: str, notebook_root: Path) -> dict | None:
     """Return the record a record_reference() points to, or None if it cannot be found.
 
-    None when the reference has no "#", points outside notebook_root, names a missing file, or no
-    line in that file carries the id. Malformed lines are skipped, so reading never raises on a damaged file.
+    Versioned references never fall back to another snapshot. Legacy file#id references resolve
+    to the first matching line, not the latest. None for a missing version/id/file or an unsafe path.
+    Malformed lines are skipped, so reading never raises on a damaged JSON line.
     """
     relative, _, wanted = str(reference).partition("#")
+    record_id, marker, version = wanted.rpartition("?version=")
+    if marker:
+        if not re.fullmatch(r"[0-9a-f]{64}", version):
+            return None
+        wanted = record_id
     root = Path(notebook_root).resolve()
     path = (root / relative).resolve()
     if not wanted or not path.is_relative_to(root) or not path.is_file():
         return None
-    found = None
     for line in path.read_text(encoding="utf-8").splitlines():
         record = _json_line(line)
         if isinstance(record, dict) and record.get("id") == wanted:
-            found = record
-    return found
+            if not marker or _snapshot_hash(record) == version:
+                return record
+    return None
 
 
 def _json_line(line: str):
