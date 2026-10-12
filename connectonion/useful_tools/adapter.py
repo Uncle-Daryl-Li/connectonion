@@ -378,18 +378,36 @@ def consume_jsonl_records(
     return AdapterResult(records=records, errors=errors)
 
 
-def jira_issues_to_records(issues: list[dict], base_url: str, *, fetched: str | None = None) -> AdapterResult:
-    """Convert raw Jira issue dicts to shared-contract records (F13FCAKE-11, F13FCAKE-16, F13FCAKE-18).
+def jira_issues_to_records(issues: list[dict], base_url: str, *, fetched: str | None = None,
+                           changelogs: dict | None = None) -> AdapterResult:
+    """Convert raw Jira issue dicts to shared-contract records (F13FCAKE-11, F13FCAKE-12, F13FCAKE-16, F13FCAKE-18).
 
     Envelope: id = "jira:<site>:<key>", external_id = issue key, kind = issue type,
     title = summary, text = description as readable text (ADF converted by jira_adf.adf_to_text),
     url = browse URL, author = reporter, at = created, updated = updated.
     Jira-only fields (status, priority, labels, people, parent, due/resolution dates, raw ADF) go under extensions;
     attachments become metadata-only media references. Token and email are never included.
+    changelogs: Jira.issue_changelogs() output keyed by issue key. When given, every record gets
+    extensions.changelog for its own key (an issue missing from it is marked "unavailable"); when
+    None, history was not requested and no changelog is added. A restricted or unavailable history
+    never removes the issue's content.
     An item that is not an object or fails validate_record() is reported in errors, not raised.
     """
     stamp = fetched or _now_utc()
-    return _collect(issues, "jira", _jira_shape_problems, lambda issue: _jira_record(issue, base_url, stamp))
+
+    def build(issue):
+        return _with_changelog(_jira_record(issue, base_url, stamp), changelogs)
+
+    return _collect(issues, "jira", _jira_shape_problems, build)
+
+
+# Attach the history read for this record's own issue key; other issues' histories never leak in.
+def _with_changelog(record: dict, changelogs: dict | None) -> dict:
+    if changelogs is None:
+        return record
+    outcome = changelogs.get(record["external_id"]) if isinstance(changelogs, dict) else None
+    record["extensions"]["changelog"] = changelog_extension(outcome)
+    return record
 
 
 def _jira_shape_problems(issue) -> list[str]:

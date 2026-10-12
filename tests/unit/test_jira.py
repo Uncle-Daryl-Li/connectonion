@@ -2622,3 +2622,71 @@ def test_changelog_extension_keeps_none_and_unreadable_distinct():
     assert restricted == {"status": "restricted", "entries": [], "reason": "Jira returned 403 for ALPHA-3"}
     for unknown in (None, {}, {"status": "maybe"}, "ok"):
         assert changelog_extension(unknown)["status"] == "unavailable"
+
+
+def _outcome(status: str, histories=None, reason: str = "") -> dict:
+    return {"status": status, "histories": histories or [], "reason": reason}
+
+
+def test_each_record_gets_the_history_of_its_own_issue():
+    """12-16: histories are matched by issue key, so ALPHA-1's changes never appear on ALPHA-2's record."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    changelogs = {
+        "ALPHA-2": _outcome("ok", [_history("20", "2026-10-06T10:00:00Z", "priority", "Low", "High")]),
+        "ALPHA-1": _outcome("ok", [_history("10", "2026-10-05T10:00:00Z", "status", "To Do", "Done")]),
+    }
+    records = jira_issues_to_records([_I1, _I2], JIRA_URL, changelogs=changelogs).records
+    by_key = {r["external_id"]: r["extensions"]["changelog"] for r in records}
+    assert [e["id"] for e in by_key["ALPHA-1"]["entries"]] == ["10"]
+    assert by_key["ALPHA-1"]["entries"][0]["changes"] == [{"field": "status", "from": "To Do", "to": "Done"}]
+    assert [e["id"] for e in by_key["ALPHA-2"]["entries"]] == ["20"]
+
+
+def test_restricted_or_unavailable_history_keeps_the_issue_content():
+    """12-17: a 403 or outage on the history still yields a full, valid record; only the changelog says why."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, validate_record
+    changelogs = {"ALPHA-77": _outcome("restricted", reason="Jira returned 403 for the change history of ALPHA-77."),
+                  "ALPHA-1": _outcome("unavailable", reason="Jira is temporarily unavailable (HTTP 503).")}
+    result = jira_issues_to_records([_I_SEARCH, _I1], JIRA_URL, changelogs=changelogs)
+    assert result.errors == {}
+    restricted, unavailable = result.records
+    assert restricted["title"] == "Pagination stops after the first page"
+    assert restricted["text"].startswith("## Steps")
+    assert restricted["extensions"]["status"] == "Done"
+    assert restricted["extensions"]["changelog"] == {
+        "status": "restricted", "entries": [], "reason": "Jira returned 403 for the change history of ALPHA-77."}
+    assert unavailable["extensions"]["changelog"]["status"] == "unavailable"
+    assert all(validate_record(r) == [] for r in result.records)
+
+
+def test_never_edited_and_unreadable_history_look_different_on_the_record():
+    """12-18: "none" (never edited) is stored differently from "unavailable" (not read), including a missing key."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    records = jira_issues_to_records([_I1, _I2], JIRA_URL, changelogs={"ALPHA-1": _outcome("none")}).records
+    never_edited, not_collected = (r["extensions"]["changelog"] for r in records)
+    assert never_edited == {"status": "none", "entries": []}
+    assert not_collected["status"] == "unavailable"
+    assert not_collected["reason"]
+
+
+def test_history_not_requested_adds_no_changelog():
+    """12-19: without changelogs (history not requested) records look exactly as in F13FCAKE-11."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    with_none = jira_issues_to_records([_I_SEARCH], JIRA_URL, fetched=_FETCHED).records[0]
+    assert "changelog" not in with_none["extensions"]
+    odd = jira_issues_to_records([_I1], JIRA_URL, changelogs=["not", "a", "dict"]).records[0]
+    assert odd["extensions"]["changelog"]["status"] == "unavailable"
+
+
+def test_records_with_history_survive_the_daily_round_trip(tmp_path):
+    """12-20: a record carrying its changelog is written to daily/ and read back unchanged and still valid."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, consume_jsonl_records, jira_issues_to_records, validate_record,
+    )
+    changelogs = {"ALPHA-1": _outcome("ok", [_history("10", "2026-10-05T10:00:00Z", "status", "To Do", "Done")])}
+    records = jira_issues_to_records([_I1], JIRA_URL, changelogs=changelogs).records
+    append_daily_jsonl(records, tmp_path)
+    read_back = consume_jsonl_records(tmp_path).records
+    assert read_back == records
+    assert validate_record(read_back[0]) == []
+    assert read_back[0]["extensions"]["changelog"]["entries"][0]["author"] == "Diego Example"
