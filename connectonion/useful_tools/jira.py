@@ -4,7 +4,7 @@ LLM-Note:
   Dependencies: imports from [os, re, pathlib, datetime, importlib.metadata, httpx, yaml, connectonion.environment.setting] | imported by [useful_tools/__init__.py, cli/commands/jira_commands.py] | tested by [tests/unit/test_jira.py]
   Data flow: Jira methods → HTTP Basic Auth (JIRA_EMAIL:JIRA_API_TOKEN) httpx requests to JIRA_URL → raw Jira REST API v3 JSON → returned as plain dicts/lists
   State/Effects: JIRA_URL and JIRA_EMAIL are read via setting() (may fall back to secret store) | JIRA_API_TOKEN is read ONLY from os.environ (never the secret store — must be a temporary shell export, never persisted) | write_source_yaml() creates source.yaml under source_dir | no blobs or derived files (metadata_only, v1)
-  Integration: exposes Jira with verify_connection(), project_items(), issue_items(), write_source_yaml() | CLI via cli/commands/jira_commands.py
+  Integration: exposes Jira with verify_connection(), project_items(), issue_items(), issue_changelog(), write_source_yaml() | CLI via cli/commands/jira_commands.py
   Errors: JiraConfigError (missing env var) | JiraAuthError (HTTP 401) | JiraPermissionError (HTTP 403) — all ValueError subclasses; never swallow; never put token in messages
 
 Jira Cloud tool: list projects, collect issues, write source.yaml for co rem.
@@ -280,6 +280,47 @@ class Jira:
 
         raise ValueError(
             f"Jira issue pagination exceeded {_MAX_PAGES} pages without exhausting nextPageToken. "
+            "Aborting to prevent an infinite loop."
+        )
+
+    # Change history of one work item (F13FCAKE-12): raw histories, oldest first, read-only.
+    def issue_changelog(self, issue_key: str) -> list[dict]:
+        """GET /rest/api/3/issue/{key}/changelog — every history entry, offset-based pagination.
+
+        Pagination: startAt / isLast / values, like project_items(); an empty page with
+        isLast=false raises ValueError (non-progressing page guard).
+        Returns the raw history dicts ({id, author, created, items: [...]}) unchanged; an issue
+        that was never edited returns []. HTTP 403 raises JiraPermissionError naming the key.
+        Raises ValueError before any request for a key that is not a plain Jira key.
+        """
+        if not isinstance(issue_key, str) or not _KEY_PATTERN.match(issue_key):
+            raise ValueError(
+                f"Invalid Jira issue key {issue_key!r}. "
+                "Keys must match [A-Z][A-Z0-9]*-<digits> (e.g. ALPHA-1). No HTTP request was made."
+            )
+        results: list[dict] = []
+        start_at = 0
+        for _ in range(_MAX_PAGES):
+            try:
+                page = self._get(f"issue/{issue_key}/changelog", startAt=start_at, maxResults=100)
+            except JiraPermissionError:
+                raise JiraPermissionError(
+                    f"Jira returned 403 for the change history of {issue_key}. "
+                    "Your account can see the issue list but not this issue's history."
+                ) from None
+            values: list[dict] = page.get("values", [])
+            is_last: bool = page.get("isLast", True)
+            if not values and not is_last:
+                raise ValueError(
+                    f"Jira changelog pagination for {issue_key} returned an empty page with isLast=false "
+                    f"(startAt={start_at}). Aborting to prevent an infinite loop."
+                )
+            results.extend(values)
+            if is_last:
+                return results
+            start_at += len(values)
+        raise ValueError(
+            f"Jira changelog pagination for {issue_key} exceeded {_MAX_PAGES} pages without reaching isLast=true. "
             "Aborting to prevent an infinite loop."
         )
 

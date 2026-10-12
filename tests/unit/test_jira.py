@@ -2268,3 +2268,95 @@ def test_empty_export_is_a_valid_outcome(tmp_path):
     manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["counts"] == {"records": 0, "by_kind": {}}
     assert manifest["sources"] == [] and manifest["accounts"] == []
+
+
+# ── F13FCAKE-12: Jira history and provenance ──
+
+def _history(entry_id: str, when: str, field: str, old: str, new: str, who: str = "Diego Example") -> dict:
+    """One raw Jira changelog history entry, as /issue/{key}/changelog returns it."""
+    return {"id": entry_id, "author": {"displayName": who, "emailAddress": "diego@example.com"},
+            "created": when, "items": [{"field": field, "fieldtype": "jira",
+                                        "fromString": old, "toString": new}]}
+
+
+def _changelog_pages(pages: list[list[dict]], status: int = 200):
+    """httpx.get stand-in for /issue/{key}/changelog: offset pages, isLast on the final one."""
+    calls: list[dict] = []
+
+    def get(url, auth=None, params=None, timeout=None):
+        calls.append({"url": url, "params": dict(params or {})})
+        index = len(calls) - 1
+        resp = MagicMock(status_code=status)
+        resp.raise_for_status = MagicMock()
+        values = pages[index] if index < len(pages) else []
+        resp.json = MagicMock(return_value={"startAt": sum(len(p) for p in pages[:index]),
+                                            "values": values, "isLast": index + 1 >= len(pages)})
+        return resp
+
+    return get, calls
+
+
+def test_issue_changelog_reads_every_page_in_order():
+    """12-1: issue_changelog() follows startAt/isLast across pages and returns all histories, oldest first."""
+    page1 = [_history("1", "2026-10-05T10:00:00.000+1100", "status", "To Do", "In Progress")]
+    page2 = [_history("2", "2026-10-06T10:00:00.000+1100", "priority", "High", "Highest")]
+    get, calls = _changelog_pages([page1, page2])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        histories = Jira().issue_changelog("ALPHA-1")
+    assert [h["id"] for h in histories] == ["1", "2"]
+    assert all(c["url"].endswith("/rest/api/3/issue/ALPHA-1/changelog") for c in calls)
+    assert [c["params"]["startAt"] for c in calls] == [0, 1]
+
+
+def test_issue_changelog_never_edited_issue_returns_empty_list():
+    """12-2: an issue with no history gives [] (a valid empty result, not an error)."""
+    get, calls = _changelog_pages([[]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        assert Jira().issue_changelog("ALPHA-2") == []
+    assert len(calls) == 1
+
+
+def test_issue_changelog_403_names_the_issue_and_hides_the_server_body():
+    """12-3: no permission for the history → JiraPermissionError naming the key, no server body, no token."""
+    get, _ = _mock_get({"/rest/api/3/issue/ALPHA-3/changelog": (403, {"errorMessages": ["raw server body"]})})
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(JiraPermissionError) as excinfo:
+            Jira().issue_changelog("ALPHA-3")
+    message = str(excinfo.value)
+    assert "ALPHA-3" in message
+    assert "raw server body" not in message
+    assert JIRA_TOKEN not in message
+
+
+def test_issue_changelog_rejects_bad_keys_and_stuck_pages():
+    """12-4: a malformed key makes no request; an empty page that is not the last aborts instead of looping."""
+    get, calls = _changelog_pages([[]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        for bad in ("alpha-1", "ALPHA-1 OR 1=1", "", None):
+            with pytest.raises(ValueError, match="Invalid Jira issue key"):
+                Jira().issue_changelog(bad)
+    assert calls == []
+
+    def stuck(url, auth=None, params=None, timeout=None):
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"values": [], "isLast": False})
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", stuck):
+        with pytest.raises(ValueError, match="empty page with isLast=false"):
+            Jira().issue_changelog("ALPHA-1")
+
+
+def test_issue_changelog_stops_after_the_page_limit():
+    """12-5: a server that never reports isLast stops after the page limit instead of looping."""
+    def endless(url, auth=None, params=None, timeout=None):
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"values": [_history("x", "2026-10-05T10:00:00Z", "status", "a", "b")],
+                                            "isLast": False})
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", endless):
+        with pytest.raises(ValueError, match="exceeded 50 pages"):
+            Jira().issue_changelog("ALPHA-1")
