@@ -70,7 +70,7 @@ exports/sprint1-demo/records.jsonl
 Use `--output PATH` for an isolated test directory. A source directory belongs
 to one account and one exact selection; use a different directory when changing
 accounts, notebooks, sections or page selections. Existing export IDs cannot be
-overwritten. Every record has an `ingestion` field identifying its mode and
+overwritten. Every record has an `extensions.ingestion` field identifying its mode and
 relative JSONL path.
 
 `source.yaml` contains driver, stable account, notebook/section/page scope,
@@ -85,16 +85,21 @@ is not claimed here. Use a new one-off export ID for a fresh independent snapsho
 
 ## Record and media contract
 
-Records use the shared F13FCAKE-18 `AdapterResult` and preserve the existing
-`source/account/id/url/date` contract, adding `title`, readable HTML-derived
-`text`, available `created`/`updated` timestamps, `scope`, `media` and `ingestion`.
-Source validation requires provenance and content fields; optional missing
+Records use the shared F13FCAKE-16 envelope and F13FCAKE-18 `AdapterResult`,
+validated by the same `adapter.validate_record()` as Jira. `id` is the global
+`source:account:external_id` identity; `external_id` retains the original page ID.
+Readable HTML-derived content is `text`, creation time is `at`, modification
+time is `updated`, and collection time is `fetched`. Scope and import
+classification live under `extensions.scope` and `extensions.ingestion`.
+See [shared record contract](../acceptance/record-contract.md). Optional missing
 metadata does not discard readable content. An absent title becomes `(untitled)`;
 an absent source link falls back to the page's Graph metadata endpoint. An empty
 page is a valid empty record. Scripts/styles are excluded from text.
 
-Each image/attachment descriptor retains available name, MIME type, byte size,
-`status: metadata_only` and HTTPS `fetch_reference`. Unknown optional values are
+Each `media` entry contains exactly `sha256` (null), `name`, `mime`, `size`,
+and `status: metadata_only`. The corresponding source descriptors, including
+kind and HTTPS `fetch_reference`, live in `extensions.media_fetch_references`
+in the same order as `media`. Unknown optional values are
 empty or null. References are not dereferenced; query strings and embedded data
 URLs are not saved. No media download, OCR, transcription, blob store or inferred
 media processing is implemented.

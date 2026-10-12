@@ -27,7 +27,10 @@ from .file_tools import (
 )
 from .gdrive import GDrive
 from .generate_image import generate_image
-from .adapter import AdapterResult, consume_records, jira_issues_to_records, onenote_pages_to_records, write_daily_jsonl
+from .adapter import (
+    AdapterResult, append_daily_jsonl, consume_records, jira_issues_to_records, make_record, media_ref,
+    onenote_pages_to_records, record_id, validate_record, write_daily_jsonl,
+)
 from .jira import Jira, JiraAuthError, JiraConfigError, JiraPermissionError
 from .youtube import YouTube
 from .get_emails import get_emails, mark_read, mark_unread

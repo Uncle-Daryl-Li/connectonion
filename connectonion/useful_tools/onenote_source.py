@@ -14,7 +14,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from ..provider_credentials import ProviderCredentialError
-from .adapter import AdapterResult, onenote_pages_to_records
+from .adapter import AdapterResult, onenote_pages_to_records, media_ref, validate_record as contract_problems
 from .onenote import TIMEOUT, _page_text
 from .outlook import Outlook
 
@@ -225,11 +225,19 @@ class OneNoteSource:
             try:
                 page = self.selected_page(page_id, scope)
                 content = self._content(page_id)
-                page.update({"text": _page_text(content), "media": media_metadata(content), "scope": scope})
+                descriptors = media_metadata(content)
+                page.update({"text": _page_text(content), "scope": scope,
+                             "title": page.get("title") or "(untitled)",
+                             "media": [media_ref(item["name"], item["mime_type"], item["size"])
+                                       for item in descriptors],
+                             "media_fetch_references": descriptors})
+                if not ((page.get("links") or {}).get("oneNoteWebUrl") or {}).get("href") and not page.get("contentUrl"):
+                    page["contentUrl"] = f"{Outlook.GRAPH_API_URL}/me/onenote/pages/{page_id}"
                 adapted = onenote_pages_to_records([page], account)
                 for record in adapted.records:
                     validate_record(record)
                 result.records.extend(adapted.records)
+                result.errors.update(adapted.errors)
             except ProviderCredentialError as error:
                 if error.code in {"reauth_required", "not_configured", "incomplete_record", "record_changed"}:
                     raise
@@ -259,17 +267,12 @@ def media_metadata(content: str) -> list[dict]:
 
 
 def validate_record(record: dict) -> None:
-    """Validate the shared adapter's provenance plus the OneNote content extension."""
+    """Validate through the same contract used by all source consumers."""
+    problems = contract_problems(record)
+    if problems:
+        raise ValueError("Invalid shared record: " + "; ".join(problems))
     if record.get("source") != "onenote":
         raise ValueError("Invalid OneNote source record.")
-    for name in ("account", "id", "url"):
-        if not isinstance(record.get(name), str) or not record[name]:
-            raise ValueError(f"OneNote record requires {name}.")
-    for name in ("date", "title", "text"):
-        if not isinstance(record.get(name), str):
-            raise ValueError(f"OneNote record requires string {name}.")
-    if not isinstance(record.get("media"), list):
-        raise ValueError("OneNote record requires media metadata.")
 
 
 def sync_onenote(source: OneNoteSource, notebook: str, section: str, page_ids: list[str], source_dir: Path,
@@ -284,7 +287,7 @@ def sync_onenote(source: OneNoteSource, notebook: str, section: str, page_ids: l
     if not result.records:
         return {"records": 0, "written": 0, "skipped": 0, "errors": result.errors,
                 "jsonl": None, "source_yaml": None, "mode": mode}
-    scope = {**result.records[0]["scope"], "pages": sorted(set(page_ids))}
+    scope = {**result.records[0]["extensions"]["scope"], "pages": sorted(set(page_ids))}
     command = ["co", "onenote", "source", "sync", notebook, section, *page_ids,
                "--mode", mode, "--output", str(source_dir)]
     if export_id:

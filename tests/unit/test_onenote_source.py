@@ -9,20 +9,64 @@ from onenote_source_fixtures import graph, BASE, DATA, HTML
 
 from connectonion.useful_tools.onenote_source import sync_onenote
 
+
+@pytest.mark.parametrize("mode", ["daily", "export"])
+def test_import_uses_shared_contract_and_common_consumer(graph, tmp_path, mode):
+    from connectonion.useful_tools.adapter import (
+        RECORD_FIELDS, MEDIA_FIELDS, consume_jsonl_records, consume_records,
+        jira_issues_to_records, validate_record, write_daily_jsonl, AdapterResult,
+    )
+    source_dir = tmp_path / "onenote"
+    result = sync_onenote(OneNoteSource(), "nb-fixture", "section-fixture", ["page-good", "page-empty"],
+                          source_dir, mode=mode, export_id="contract" if mode == "export" else None)
+    rows = [json.loads(line) for line in Path(result["jsonl"]).read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        assert not validate_record(row)
+        assert set(row) <= set(RECORD_FIELDS) | {"media"}
+        assert row["id"].endswith(":" + row["external_id"])
+        assert row["extensions"]["scope"]["section"]
+        assert row["extensions"]["ingestion"]["mode"] == mode
+        for media in row.get("media", []):
+            assert set(media) == set(MEDIA_FIELDS)
+    assert not rows[1].get("media")  # Optional empty media does not discard empty content.
+    jira_dir = tmp_path / "jira"
+    jira = jira_issues_to_records([{"key": "page-good", "fields": {"summary": "Shared consumer"}}],
+                                 "https://fixture.invalid")
+    write_daily_jsonl(jira.records, jira_dir)
+    daily = consume_jsonl_records(jira_dir, source_dir)
+    assert not daily.errors
+    if mode == "daily":
+        assert {row["source"] for row in consume_records(daily)} == {"jira", "onenote"}
+        assert len({row["id"] for row in daily.records}) == 3
+    else:
+        assert len(daily.records) == 1  # Exports are explicitly consumed, never scanned as daily.
+        assert consume_records(AdapterResult(records=rows)) == rows
+
+
+def test_shared_mapping_rejection_is_reported_without_losing_valid_page(graph, monkeypatch):
+    from connectonion.useful_tools import onenote_source
+    original = onenote_source._page_text
+    monkeypatch.setattr(onenote_source, "_page_text", lambda content: [] if content == HTML else original(content))
+    result = OneNoteSource().collect("nb-fixture", "section-fixture", ["page-good", "page-empty"])
+    assert [record["external_id"] for record in result.records] == ["page-empty"]
+    assert "onenote:page-good" in result.errors
+    assert "text" in result.errors["onenote:page-good"]
+
 def test_selected_import_preserves_content_media_and_partial_errors(graph):
     routes, calls = graph
     routes["/me/onenote/pages/page-malformed"] = ["invalid"]
     result = OneNoteSource().collect("nb-fixture", "section-fixture",
                                    ["page-good", "page-empty", "page-gone", "page-malformed", "page-outside"])
-    assert {r["id"] for r in result.records} == {"page-good", "page-empty"}
+    assert {r["external_id"] for r in result.records} == {"page-good", "page-empty"}
     assert set(result.errors) == {"page-gone", "page-malformed", "page-outside"}
     record = result.records[0]
     assert record["source"] == "onenote" and record["url"].startswith("https://example.invalid/")
-    assert record["created"] == "2026-10-01T01:00:00Z" and record["date"] == "2026-10-02T01:00:00Z"
+    assert record["at"] == "2026-10-01T01:00:00Z" and record["updated"] == "2026-10-02T01:00:00Z"
     assert "Keep & cite" in record["text"] and "do_not_include" not in record["text"]
-    assert record["media"][0]["mime_type"] == "image/png" and record["media"][0]["size"] == 42
+    assert record["media"][0]["mime"] == "image/png" and record["media"][0]["size"] == 42
     assert record["media"][1]["name"] == "fixture.txt"
-    assert all(m["status"] == "metadata_only" and m["fetch_reference"] for m in record["media"])
+    assert all(m["status"] == "metadata_only" and m["sha256"] is None for m in record["media"])
+    assert all(m["fetch_reference"] for m in record["extensions"]["media_fetch_references"])
     assert result.records[1]["text"] == "" and result.records[1]["url"].endswith("/pages/page-empty")
     assert not any("resources/" in url or "page-outside/content" in url for _, url, _ in calls)
 
@@ -37,7 +81,7 @@ def test_sync_explicit_layout_and_source_config(graph, tmp_path, mode):
     assert doc["validated_with"]["connectonion_version"] and doc["validated_with"]["path"]
     target = Path(result["jsonl"])
     record = json.loads(target.read_text(encoding="utf-8").strip())
-    assert record["ingestion"] == {"mode": mode, "path": target.relative_to(tmp_path).as_posix()}
+    assert record["extensions"]["ingestion"] == {"mode": mode, "path": target.relative_to(tmp_path).as_posix()}
     if mode == "export":
         manifest = json.loads((target.parent / "manifest.json").read_text(encoding="utf-8"))
         assert manifest["records"] == 1 and manifest["scope"] == doc["scope"]

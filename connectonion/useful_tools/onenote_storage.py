@@ -9,7 +9,7 @@ import yaml
 
 from .._version import __version__
 from ..rem.files import atomic_write
-from .adapter import AdapterResult, write_daily_jsonl
+from .adapter import AdapterResult, append_daily_jsonl, validate_record
 from .onenote_scope import source_config
 
 
@@ -34,16 +34,19 @@ def write_import(result: AdapterResult, source_dir: Path, target: Path, scope: d
                  mode: str, export_id: str | None, command: str) -> dict:
     """Save the shared record contract, selected scope and validation provenance."""
     for record in result.records:
-        record["ingestion"] = {"mode": mode, "path": target.relative_to(source_dir).as_posix()}
+        record["extensions"]["ingestion"] = {"mode": mode, "path": target.relative_to(source_dir).as_posix()}
+        problems = validate_record(record)
+        if problems:
+            raise ValueError("Invalid shared record before storage: " + "; ".join(problems))
     account = result.records[0]["account"]
     config = source_dir / "source.yaml"
     doc = source_config(source_dir, account, scope, command)
     now = doc["validated_with"]["timestamp"]
     if mode == "daily":
-        stats = {}
         # Keep classification and actual file consistent if collection crosses midnight.
         date = datetime.strptime(target.relative_to(source_dir).as_posix(), "daily/%Y/%m/%d.jsonl").date()
-        target = write_daily_jsonl(result.records, source_dir, date=date, stats=stats)
+        target, written = append_daily_jsonl(result.records, source_dir, date=date)
+        stats = {"written": written, "skipped": len(result.records) - written}
     else:
         # mkdir is exclusive so a concurrent export cannot overwrite an existing ID.
         target.parent.mkdir(parents=True, exist_ok=False)

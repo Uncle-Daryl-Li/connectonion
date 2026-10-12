@@ -663,7 +663,7 @@ def test_adapter_result_has_records_and_errors_fields():
 
 
 def test_jira_adapter_returns_contract_shape_with_provenance():
-    """18-2: jira_issues_to_records produces AdapterResult with source/account/id/url/date."""
+    """18-2: jira_issues_to_records produces AdapterResult with source/account/id/url and timestamps."""
     from connectonion.useful_tools.adapter import AdapterResult, jira_issues_to_records
     result = jira_issues_to_records([_I1, _I2], JIRA_URL)
     assert isinstance(result, AdapterResult)
@@ -673,7 +673,7 @@ def test_jira_adapter_returns_contract_shape_with_provenance():
         assert record["account"] == JIRA_URL
         assert "id" in record
         assert "url" in record
-        assert "date" in record
+        assert "updated" in record and "fetched" in record
 
 
 def test_onenote_adapter_returns_same_contract_shape_with_provenance():
@@ -687,7 +687,7 @@ def test_onenote_adapter_returns_same_contract_shape_with_provenance():
         assert record["account"] == _ONENOTE_ACCOUNT
         assert "id" in record
         assert "url" in record
-        assert "date" in record
+        assert "updated" in record and "fetched" in record
 
 
 def test_common_consumer_reads_jira_without_source_specific_branching():
@@ -733,7 +733,8 @@ def test_jira_onenote_same_remote_id_no_collision():
     assert len(all_records) == 2
     sources = {r["source"] for r in all_records}
     assert sources == {"jira", "onenote"}
-    assert sum(1 for r in all_records if r["id"] == "ABC-123") == 2
+    assert sum(1 for r in all_records if r["external_id"] == "ABC-123") == 2
+    assert len({r["id"] for r in all_records}) == 2
 
 
 def test_two_jira_accounts_same_issue_key_no_collision():
@@ -746,7 +747,8 @@ def test_two_jira_accounts_same_issue_key_no_collision():
     assert len(all_records) == 2
     accounts = {r["account"] for r in all_records}
     assert accounts == {JIRA_URL, _JIRA_URL_2}
-    assert all(r["id"] == "ABC-123" for r in all_records)
+    assert all(r["external_id"] == "ABC-123" for r in all_records)
+    assert len({r["id"] for r in all_records}) == 2
 
 
 def test_onenote_failure_does_not_corrupt_jira_records():
@@ -810,7 +812,7 @@ def test_end_to_end_jira_fixture_written_in_daily_jsonl_layout(tmp_path):
         assert rec["account"] == JIRA_URL
         assert "id" in rec
         assert "url" in rec
-        assert "date" in rec
+        assert "updated" in rec and "fetched" in rec
     assert consume_records(result) == result.records
 
 
@@ -832,7 +834,7 @@ def test_end_to_end_onenote_fixture_written_in_daily_jsonl_layout(tmp_path):
         assert rec["account"] == _ONENOTE_ACCOUNT
         assert "id" in rec
         assert "url" in rec
-        assert "date" in rec
+        assert "updated" in rec and "fetched" in rec
     assert consume_records(result) == result.records
 
 
@@ -848,7 +850,7 @@ def test_jira_issue_text_follows_blobs_derived_or_metadata_only_convention(tmp_p
     result = jira_issues_to_records(issues, JIRA_URL)
     jsonl_path = write_daily_jsonl(result.records, dest)
     line = json.loads(jsonl_path.read_text(encoding="utf-8").strip())
-    assert "summary" in line
+    assert line["title"] == "Inline summary text"
     assert "blob_hash" not in line
     assert "blob_ref" not in line
     assert JIRA_TOKEN not in jsonl_path.read_text(encoding="utf-8")
@@ -1319,7 +1321,7 @@ def test_jira_cli_sync_end_to_end_writes_both_source_yaml_and_jsonl(tmp_path):
     assert jsonl_path.exists()
     rec = json.loads(jsonl_path.read_text(encoding="utf-8").strip())
     assert rec["source"] == "jira"
-    assert rec["id"] == "ALPHA-1"
+    assert rec["external_id"] == "ALPHA-1"
     assert rec["account"] == JIRA_URL
 
 
@@ -1353,7 +1355,7 @@ def test_write_daily_jsonl_second_write_same_day_appends_not_overwrites(tmp_path
     jsonl_path = dest / "daily" / str(today.year) / f"{today.month:02d}" / f"{today.day:02d}.jsonl"
     lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2
-    ids = {json.loads(l)["id"] for l in lines}
+    ids = {json.loads(l)["external_id"] for l in lines}
     assert ids == {"ALPHA-1", "ALPHA-2"}
 
 
@@ -1589,7 +1591,7 @@ def test_adapter_f13fcake18_full_pipeline_both_chains_end_to_end_synthetic(tmp_p
         assert r["account"]
         assert r["id"]
         assert r["url"] is not None
-        assert r["date"] is not None
+        assert r["fetched"]
 
 
 def test_adapter_f13fcake18_jira_jsonl_corrupted_onenote_still_readable(tmp_path):
@@ -1646,3 +1648,367 @@ def test_adapter_f13fcake18_jira_jsonl_corrupted_onenote_still_readable(tmp_path
     assert str(jira_jsonl) in error_key
     assert "2" in error_key  # line 2 is the corrupted line
     assert "JSON" in merged.errors[error_key]
+
+
+# ── F13FCAKE-16: shared record contract (envelope, identity, extensions, validation, media) ──
+
+_I_FULL = {
+    "id": "10042",
+    "key": "ALPHA-42",
+    "fields": {
+        "summary": "Decide record format",
+        "issuetype": {"name": "Story"},
+        "status": {"name": "In Progress"},
+        "priority": {"name": "High"},
+        "labels": ["records", "sprint-1"],
+        "assignee": {"displayName": "Alice Example", "emailAddress": "alice@example.com"},
+        "reporter": {"displayName": "Bob Example", "emailAddress": "bob@example.com"},
+        "parent": {"key": "ALPHA-7"},
+        "created": "2026-10-01T09:00:00.000+1000",
+        "updated": "2026-10-02T10:30:00.000+1000",
+        "description": {"type": "doc", "version": 1, "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Use JSON Lines."}]}]},
+        "attachment": [{"filename": "diagram.png", "mimeType": "image/png", "size": 2048,
+                        "content": "https://test.atlassian.net/secure/attachment/1/diagram.png"}],
+    },
+}
+_ON_FULL = {
+    "id": "page-9",
+    "title": "Architecture notes",
+    "createdDateTime": "2026-09-30T01:00:00Z",
+    "lastModifiedDateTime": "2026-10-02T02:00:00Z",
+    "links": {"oneNoteWebUrl": {"href": "https://onenote.example/page-9"}},
+    "parentSection": {"displayName": "Design"},
+    "parentNotebook": {"displayName": "CAKE"},
+}
+_FETCHED = "2026-10-12T00:00:00Z"
+
+
+def test_jira_record_has_full_shared_envelope():
+    """16-1: a Jira issue maps to every envelope field with the documented meaning."""
+    from connectonion.useful_tools.adapter import RECORD_FIELDS, jira_issues_to_records
+    result = jira_issues_to_records([_I_FULL], JIRA_URL, fetched=_FETCHED)
+    assert result.errors == {}
+    record = result.records[0]
+    assert set(RECORD_FIELDS) <= set(record)
+    assert record["id"] == "jira:test.atlassian.net:ALPHA-42"
+    assert record["external_id"] == "ALPHA-42"
+    assert record["kind"] == "Story"
+    assert record["title"] == "Decide record format"
+    assert record["url"] == f"{JIRA_URL}/browse/ALPHA-42"
+    assert record["author"] == "Bob Example"
+    assert record["at"] == "2026-10-01T09:00:00.000+1000"
+    assert record["updated"] == "2026-10-02T10:30:00.000+1000"
+    assert record["fetched"] == _FETCHED
+
+
+def test_onenote_record_has_same_shared_envelope():
+    """16-2: a OneNote page maps to the same envelope as a Jira issue."""
+    from connectonion.useful_tools.adapter import RECORD_FIELDS, onenote_pages_to_records
+    result = onenote_pages_to_records([_ON_FULL], _ONENOTE_ACCOUNT, fetched=_FETCHED)
+    assert result.errors == {}
+    record = result.records[0]
+    assert set(RECORD_FIELDS) <= set(record)
+    assert record["id"] == "onenote:graph.microsoft.com/v1.0:page-9"
+    assert record["external_id"] == "page-9"
+    assert record["kind"] == "page"
+    assert record["title"] == "Architecture notes"
+    assert record["url"] == "https://onenote.example/page-9"
+    assert record["at"] == "2026-09-30T01:00:00Z"
+    assert record["updated"] == "2026-10-02T02:00:00Z"
+    assert record["extensions"] == {"section": "Design", "notebook": "CAKE"}
+
+
+def test_identity_includes_source_account_and_external_id():
+    """16-3: same external id across sources or Jira sites yields distinct record ids."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, onenote_pages_to_records, record_id
+    issue = {"key": "ABC-1", "fields": {"summary": "x"}}
+    page = {"id": "ABC-1", "title": "x"}
+    ids = {
+        jira_issues_to_records([issue], JIRA_URL).records[0]["id"],
+        jira_issues_to_records([issue], _JIRA_URL_2).records[0]["id"],
+        onenote_pages_to_records([page], _ONENOTE_ACCOUNT).records[0]["id"],
+    }
+    assert len(ids) == 3
+    assert record_id("jira", "https://test.atlassian.net/", "ABC-1") == "jira:test.atlassian.net:ABC-1"
+
+
+def test_source_specific_fields_live_under_extensions_only():
+    """16-4: status, priority, labels, people, parent and raw ADF stay under extensions."""
+    from connectonion.useful_tools.adapter import RECORD_FIELDS, jira_issues_to_records
+    record = jira_issues_to_records([_I_FULL], JIRA_URL, fetched=_FETCHED).records[0]
+    assert set(record) <= set(RECORD_FIELDS) | {"media"}
+    ext = record["extensions"]
+    assert ext["issue_id"] == "10042"
+    assert ext["status"] == "In Progress"
+    assert ext["priority"] == "High"
+    assert ext["labels"] == ["records", "sprint-1"]
+    assert ext["assignee"] == "Alice Example"
+    assert ext["reporter"] == "Bob Example"
+    assert ext["parent"] == "ALPHA-7"
+    assert ext["description_adf"]["type"] == "doc"
+    assert record["text"] == ""  # ADF → text is F13FCAKE-11
+
+
+def test_missing_optional_fields_still_produce_valid_records():
+    """16-5: an issue with only a key is valid; empty extras are left out of extensions."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, validate_record
+    result = jira_issues_to_records([{"key": "ALPHA-5"}], JIRA_URL)
+    assert result.errors == {}
+    record = result.records[0]
+    assert validate_record(record) == []
+    assert record["kind"] == "issue"
+    assert record["extensions"] == {}
+    assert "media" not in record
+
+
+def test_validate_record_reports_each_contract_violation():
+    """16-6: validate_record names missing fields, wrong types, bad id and top-level extras."""
+    from connectonion.useful_tools.adapter import make_record, validate_record
+    good = make_record("jira", JIRA_URL, "ALPHA-1", "Task", fetched=_FETCHED)
+    assert validate_record(good) == []
+    bad = dict(good, external_id="", title=7, extensions=[], status="Done")
+    bad["id"] = "ALPHA-1"
+    problems = " | ".join(validate_record(bad))
+    assert "missing required field 'external_id'" in problems
+    assert "field 'title' must be a string" in problems
+    assert "field 'extensions' must be an object" in problems
+    assert "field 'id' must be" in problems
+    assert "unknown top-level field 'status'" in problems
+    assert validate_record("not a record") == ["record is not an object"]
+
+
+def test_malformed_items_are_isolated_with_mapping_error():
+    """16-7: bad items go to errors with a clear reason; valid items in the same batch survive."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, onenote_pages_to_records
+    result = jira_issues_to_records(
+        [_I1, "not-an-issue", {"key": "ALPHA-9", "fields": "broken"}, {"fields": {"summary": "no key"}}],
+        JIRA_URL,
+    )
+    assert [r["external_id"] for r in result.records] == ["ALPHA-1"]
+    assert result.errors["jira:item-1"] == "mapping error: item is not an object"
+    assert result.errors["jira:ALPHA-9"] == "mapping error: 'fields' is not an object"
+    assert "missing required field 'external_id'" in result.errors["jira:item-3"]
+    pages = onenote_pages_to_records([_ON1, None, {"title": "no id"}], _ONENOTE_ACCOUNT)
+    assert [r["external_id"] for r in pages.records] == ["page-1"]
+    assert set(pages.errors) == {"onenote:item-1", "onenote:item-2"}
+
+
+def test_media_uses_hash_reference_or_metadata_only():
+    """16-8: attachments become metadata-only media refs; a stored blob must carry its sha256."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, make_record, media_ref, validate_record
+    record = jira_issues_to_records([_I_FULL], JIRA_URL, fetched=_FETCHED).records[0]
+    assert record["media"] == [{"sha256": None, "name": "diagram.png", "mime": "image/png",
+                                "size": 2048, "status": "metadata_only"}]
+    stored = media_ref("a.png", "image/png", 10, sha256="ab" * 32, status="stored")
+    assert validate_record(make_record("jira", JIRA_URL, "A-1", "Task", media=[stored])) == []
+    unhashed = media_ref("a.png", status="stored")
+    problems = validate_record(make_record("jira", JIRA_URL, "A-1", "Task", media=[unhashed]))
+    assert any("no sha256" in p for p in problems)
+
+
+def test_records_never_contain_emails_or_tokens():
+    """16-9: people are kept by display name only; account emails and tokens never enter a record."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    text = json.dumps(jira_issues_to_records([_I_FULL], JIRA_URL).records)
+    assert "alice@example.com" not in text
+    assert "bob@example.com" not in text
+    assert JIRA_TOKEN not in text
+
+
+def test_onenote_api_url_fallback_is_flagged():
+    """16-10: without a web link the Graph contentUrl is used and flagged as an API URL."""
+    from connectonion.useful_tools.adapter import onenote_pages_to_records
+    page = {"id": "page-3", "title": "t", "contentUrl": "https://graph.microsoft.com/v1.0/me/onenote/pages/page-3/content"}
+    record = onenote_pages_to_records([page], _ONENOTE_ACCOUNT).records[0]
+    assert record["url"].endswith("/page-3/content")
+    assert record["extensions"]["url_is_api"] is True
+
+
+def test_contract_records_round_trip_through_daily_layout(tmp_path):
+    """16-11: records from both sources keep the full envelope after write_daily_jsonl + consume_jsonl_records."""
+    from connectonion.useful_tools.adapter import (
+        consume_jsonl_records, jira_issues_to_records, onenote_pages_to_records,
+        validate_record, write_daily_jsonl,
+    )
+    jira_dir = tmp_path / ".co" / "rem" / "docs" / "jira"
+    onenote_dir = tmp_path / ".co" / "rem" / "docs" / "onenote"
+    write_daily_jsonl(jira_issues_to_records([_I_FULL], JIRA_URL).records, jira_dir)
+    write_daily_jsonl(onenote_pages_to_records([_ON_FULL], _ONENOTE_ACCOUNT).records, onenote_dir)
+    merged = consume_jsonl_records(jira_dir, onenote_dir)
+    assert merged.errors == {}
+    assert len(merged.records) == 2
+    assert all(validate_record(r) == [] for r in merged.records)
+
+
+def test_validate_record_rejects_malformed_media():
+    """16-12: media must be a list of exact refs with a known status."""
+    from connectonion.useful_tools.adapter import make_record, media_ref, validate_record
+    base = make_record("jira", JIRA_URL, "A-1", "Task", fetched=_FETCHED)
+    assert validate_record(dict(base, media="diagram.png")) == ["field 'media' must be a list"]
+    missing_key = {"name": "a.png", "mime": "image/png", "size": 1, "status": "metadata_only"}
+    extra_key = dict(media_ref("a.png"), bytes="...")
+    problems = validate_record(dict(base, media=[missing_key, extra_key, "a.png"]))
+    assert problems == [f"media[{i}] must have exactly: sha256, name, mime, size, status" for i in range(3)]
+    unknown = media_ref("a.png", status="downloaded")
+    assert validate_record(dict(base, media=[unknown])) == ["media[0] has unknown status 'downloaded'"]
+
+
+def test_jira_mapping_handles_plain_text_and_odd_field_shapes():
+    """16-13: plain-string description becomes text; creator stands in for reporter; odd shapes are ignored."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, validate_record
+    issue = {"key": "ALPHA-50", "fields": {
+        "summary": "Plain text issue",
+        "description": "Already plain text.",
+        "creator": {"displayName": "Gabe Example"},
+        "status": "Done",                 # not an object
+        "labels": "single-label",         # not a list
+        "assignee": ["not", "a", "person"],
+        "parent": "ALPHA-1",              # not an object
+        "attachment": ["not-an-object", {"filename": "a.txt", "mimeType": "text/plain", "size": 3}],
+    }}
+    result = jira_issues_to_records([issue], JIRA_URL, fetched=_FETCHED)
+    assert result.errors == {}
+    record = result.records[0]
+    assert validate_record(record) == []
+    assert record["text"] == "Already plain text."
+    assert record["author"] == "Gabe Example"
+    assert record["extensions"] == {}
+    assert [m["name"] for m in record["media"]] == ["a.txt"]
+
+
+def test_onenote_mapping_without_any_link_or_parents():
+    """16-14: no web link and no content URL → empty url, no url_is_api flag; odd links shape is ignored."""
+    from connectonion.useful_tools.adapter import onenote_pages_to_records
+    page = {"id": "page-7", "title": "Loose page", "links": "not-an-object",
+            "parentSection": "Design", "parentNotebook": None}
+    record = onenote_pages_to_records([page], _ONENOTE_ACCOUNT, fetched=_FETCHED).records[0]
+    assert record["url"] == ""
+    assert record["extensions"] == {}
+
+
+def test_fetched_defaults_to_one_utc_timestamp_per_batch():
+    """16-15: without an explicit fetched value every record in a batch shares one UTC 'Z' timestamp."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    records = jira_issues_to_records([_I1, _I2, _I3], JIRA_URL).records
+    stamps = {r["fetched"] for r in records}
+    assert len(stamps) == 1
+    stamp = stamps.pop()
+    assert stamp.endswith("Z")
+    parsed = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    assert parsed.tzinfo is not None
+
+
+def test_daily_layout_skips_blank_lines_and_reads_a_given_date(tmp_path):
+    """16-16: blank lines in a daily file are ignored by writer and reader; an explicit date reads that day's file."""
+    from connectonion.useful_tools.adapter import consume_jsonl_records, jira_issues_to_records, write_daily_jsonl
+    dest = tmp_path / "jira"
+    first = write_daily_jsonl(jira_issues_to_records([_I1], JIRA_URL).records, dest)
+    first.write_text(first.read_text(encoding="utf-8") + "\n   \n", encoding="utf-8")
+    write_daily_jsonl(jira_issues_to_records([_I2], JIRA_URL).records, dest)
+    today = consume_jsonl_records(dest, date=datetime.date.today())
+    assert today.errors == {}
+    assert [r["external_id"] for r in today.records] == ["ALPHA-1", "ALPHA-2"]
+    assert consume_jsonl_records(dest, date=datetime.date(2000, 1, 1)).records == []
+
+
+def test_bad_items_with_the_same_key_are_all_reported():
+    """16-17: two bad items sharing a key both stay in errors; the second label carries its position."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    bad = {"key": "ALPHA-9", "fields": "broken"}
+    result = jira_issues_to_records([bad, _I1, dict(bad)], JIRA_URL)
+    assert [r["external_id"] for r in result.records] == ["ALPHA-1"]
+    assert set(result.errors) == {"jira:ALPHA-9", "jira:ALPHA-9#2"}
+    assert all(v == "mapping error: 'fields' is not an object" for v in result.errors.values())
+
+
+def test_validate_record_requires_every_envelope_field_even_optional_ones():
+    """16-18: dropping an optional envelope field (text, extensions, …) is a contract violation, not a valid record."""
+    from connectonion.useful_tools.adapter import RECORD_FIELDS, make_record, validate_record
+    good = make_record("jira", JIRA_URL, "ALPHA-1", "Task", fetched=_FETCHED)
+    stripped = {k: v for k, v in good.items() if k not in ("text", "extensions")}
+    assert validate_record(stripped) == ["missing field 'text'", "missing field 'extensions'"]
+    for name in RECORD_FIELDS:
+        partial = {k: v for k, v in good.items() if k != name}
+        assert f"missing field '{name}'" in validate_record(partial)
+    assert validate_record(dict(good, text="", extensions={})) == []
+
+
+def _sync_with(issues, extra_args):
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.verify_connection.return_value = {
+            "accountId": "abc", "displayName": "Alice", "site_url": JIRA_URL,
+        }
+        mock_jira.return_value.issue_items.return_value = issues
+        mock_jira.return_value.write_source_yaml = MagicMock()
+        return CliRunner().invoke(app, ["jira", "sync", "ALPHA", "ALPHA-1", "ALPHA-9", *extra_args])
+
+
+def test_jira_cli_sync_json_reports_rejected_items_and_exits_nonzero(tmp_path):
+    """16-19: a rejected item is listed in JSON "rejected", only valid records are mapped and appended, exit code is 1."""
+    result = _sync_with([_I1, {"key": "ALPHA-9", "fields": "broken"}], ["--output", str(tmp_path), "--json"])
+    assert result.exit_code == 1, result.output
+    data = json.loads(result.stdout)
+    assert data["issues"] == 2
+    assert data["mapped"] == 1
+    assert data["appended"] == 1
+    assert data["rejected"] == {"jira:ALPHA-9": "mapping error: 'fields' is not an object"}
+    lines = Path(data["jsonl"]).read_text(encoding="utf-8").strip().splitlines()
+    assert [json.loads(line)["external_id"] for line in lines] == ["ALPHA-1"]
+    assert JIRA_TOKEN not in result.stdout
+
+
+def test_jira_cli_sync_text_mode_lists_rejected_items_on_stderr(tmp_path):
+    """16-20: human output still reports what was written, names each rejected item on stderr, exits 1."""
+    result = _sync_with([_I1, {"key": "ALPHA-9", "fields": "broken"}], ["--output", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "Records mapped: 1  Records appended: 1" in result.stdout
+    assert "1 item(s) were rejected" in result.stderr
+    assert "jira:ALPHA-9" in result.stderr
+
+
+def test_jira_cli_sync_with_no_rejections_still_exits_zero(tmp_path):
+    """16-21: the clean path is unchanged: rejected is empty and exit code is 0."""
+    result = _sync_with([_I1], ["--output", str(tmp_path), "--json"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["rejected"] == {}
+    assert data["mapped"] == 1
+    assert data["appended"] == 1
+
+
+def test_onenote_records_from_two_users_do_not_collide_when_account_is_per_user():
+    """16-22: the same page id read for two users gets two ids once account names the user, not the Graph URL."""
+    from connectonion.useful_tools.adapter import onenote_pages_to_records
+    page = {"id": "page-1", "title": "Same page id"}
+    alice = onenote_pages_to_records([page], "onenote-user:alice-object-id").records[0]
+    bob = onenote_pages_to_records([page], "onenote-user:bob-object-id").records[0]
+    assert alice["id"] != bob["id"]
+    assert alice["external_id"] == bob["external_id"] == "page-1"
+    shared = onenote_pages_to_records([page], _ONENOTE_ACCOUNT).records[0]
+    assert shared["id"] == "onenote:graph.microsoft.com/v1.0:page-1"  # fixture placeholder: not per user
+
+
+def test_jira_cli_sync_same_day_resync_reports_zero_appended(tmp_path):
+    """16-23: a second sync on the same day maps the item again but appends nothing; the summary says so."""
+    first = json.loads(_sync_with([_I1], ["--output", str(tmp_path), "--json"]).stdout)
+    second_run = _sync_with([_I1], ["--output", str(tmp_path), "--json"])
+    second = json.loads(second_run.stdout)
+    assert (first["mapped"], first["appended"]) == (1, 1)
+    assert (second["mapped"], second["appended"]) == (1, 0)
+    assert second_run.exit_code == 0
+    assert len(Path(second["jsonl"]).read_text(encoding="utf-8").strip().splitlines()) == 1
+    text_run = _sync_with([_I1], ["--output", str(tmp_path)])
+    assert "Records mapped: 1  Records appended: 0" in text_run.stdout
+
+
+def test_append_daily_jsonl_counts_only_new_records(tmp_path):
+    """16-24: append_daily_jsonl returns the same path as write_daily_jsonl plus the number really appended."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records, write_daily_jsonl
+    records = jira_issues_to_records([_I1, _I2], JIRA_URL).records
+    path, appended = append_daily_jsonl(records, tmp_path)
+    assert appended == 2
+    assert append_daily_jsonl(records, tmp_path) == (path, 0)
+    assert write_daily_jsonl(records, tmp_path) == path
