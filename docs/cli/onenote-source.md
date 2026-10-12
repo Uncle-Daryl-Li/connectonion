@@ -2,7 +2,7 @@
 
 ## Baseline and authentication
 
-- Implementation branch: `F13FCAKE-13`.
+- Implementation branch: `F13FCAKE-15`, depending on `F13FCAKE-13`.
 - Starting revision: `d69aecda` (`origin/develop` at implementation time).
 - Tested source version: ConnectOnion `1.9.2b10`, Python `3.13.5`, Windows.
 - This baseline is newer than the task's original `1.9.0a39` example; no 1.8.x
@@ -31,7 +31,7 @@ Offline fixture success does not establish live consent support.
 python -m pytest tests/unit/test_onenote_source_auth.py tests/unit/test_onenote.py tests/unit/test_provider_credentials.py -q
 ```
 
-Discovery and selection are added by F13FCAKE-15; page import is added by F13FCAKE-14. This branch exposes `co onenote source verify` only.
+This branch adds notebook/section discovery, bounded page selection and scope configuration on top of F13FCAKE-13 verification. Page content import and configuration persistence are added by F13FCAKE-14.
 
 ## Choose the exact scope
 
