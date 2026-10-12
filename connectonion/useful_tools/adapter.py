@@ -5,13 +5,14 @@ LLM-Note:
   Data flow: raw tool output (Jira issues / OneNote pages) → *_to_records() → make_record() envelope → validate_record() → AdapterResult (valid records + per-item errors) → write_daily_jsonl stores under daily/YYYY/MM/DD.jsonl
   State/Effects: write_daily_jsonl() / append_daily_jsonl() create directories and write files (append_daily_jsonl also returns how many records were new); all other functions are pure
   Integration: RECORD_FIELDS is the #1833 envelope every source writes; record_id() is the shared identity rule; make_record() / media_ref() build records; validate_record() is the one contract check for every source; AdapterResult is the shared result type; consume_records() is the in-memory consumer; consume_jsonl_records() reads from disk across multiple source directories; jira_issues_to_records() and onenote_pages_to_records() are the converter functions
-  Errors: write_daily_jsonl() raises ValueError if the existing JSONL file contains a malformed line (refuses to append to a corrupted file) | consume_jsonl_records() never raises — malformed lines are recorded in AdapterResult.errors keyed by "file:lineno" | converters never raise on bad input — an invalid or malformed item is left out of records and reported in AdapterResult.errors keyed by "<source>:<item>"
+  Errors: write_daily_jsonl() raises ValueError if the existing JSONL file contains a malformed line (refuses to append to a corrupted file) | consume_jsonl_records() never raises — malformed lines are recorded in AdapterResult.errors keyed by "file:lineno" | converters never raise on bad input — an invalid, malformed or duplicate item is left out of records and reported in AdapterResult.errors keyed by "<source>:<item>"
   F13FCAKE-16 contract status:
     Envelope, identity, extensions, media references and validation implemented for both sources; documented in docs/acceptance/record-contract.md
     OneNote page HTML is not fetched here; readable text conversion is F13FCAKE-14
   F13FCAKE-11 Jira content status:
     Jira.issue_items() requests jira.ISSUE_FIELDS; description ADF → record["text"] via jira_adf.adf_to_text(),
     raw ADF kept under extensions.description_adf; due and resolution dates kept under extensions
+    The same item twice in one batch (e.g. overlapping pages) yields one record; the repeat is reported in errors
   F13FCAKE-18 prototype status:
     Jira chain -- fully integrated: verify_connection -> issue_items -> write_source_yaml -> jira_issues_to_records -> write_daily_jsonl
     OneNote chain -- adapter function implemented and tested with synthetic fixtures; live Notes.Read integration is pending authorized account credentials and OneNote team implementation
@@ -136,15 +137,24 @@ def _media_problems(media) -> list[str]:
 # Map every item, keep only valid records; malformed or invalid items are reported, not raised.
 def _collect(items: list, source: str, shape_problems, build) -> AdapterResult:
     result = AdapterResult()
+    seen: set[str] = set()
     for index, item in enumerate(items):
         problems = shape_problems(item)
         record = None if problems else build(item)
-        problems = problems or validate_record(record)
+        problems = problems or validate_record(record) or _duplicate_problem(record, seen)
         if problems:
             result.errors[_error_label(result.errors, source, item, index)] = "mapping error: " + "; ".join(problems)
         else:
+            seen.add(record["id"])
             result.records.append(record)
     return result
+
+
+# A source that returns the same item twice (e.g. a repeated page) must not yield two records.
+def _duplicate_problem(record: dict, seen: set[str]) -> list[str]:
+    if record["id"] in seen:
+        return [f"duplicate of an earlier item in this batch ({record['id']}); the first copy was kept"]
+    return []
 
 
 # Error labels stay unique: a second bad item with the same key gets "#<position>" instead of overwriting.

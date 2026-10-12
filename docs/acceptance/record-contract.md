@@ -84,9 +84,13 @@ input. Each item is mapped and checked; a valid record goes to
 "jira:ALPHA-9":  "mapping error: 'fields' is not an object"
 "jira:item-3":   "mapping error: missing required field 'external_id'; ..."
 "jira:ALPHA-9#4": "mapping error: ..."   (a second bad item with the same key: "#<position>")
+"jira:ALPHA-50":  "mapping error: duplicate of an earlier item in this batch (jira:<site>:ALPHA-50); the first copy was kept"
 ```
 
 Every rejected item gets its own entry; valid items in the same batch are unaffected.
+The same item twice in one batch (for example a server repeating an issue on the
+next page) produces one record; the repeat is reported, so pagination can neither
+duplicate nor silently drop items (F13FCAKE-11).
 
 `co jira sync` never hides them: it still writes the valid records, prints
 `Records mapped: N  Records appended: M`, lists each rejected item on stderr

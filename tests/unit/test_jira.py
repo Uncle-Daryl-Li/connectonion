@@ -2059,3 +2059,86 @@ def test_missing_or_unreadable_description_does_not_block_the_record():
     assert result.errors == {}
     assert [r["text"] for r in result.records] == ["", "", ""]
     assert [r["title"] for r in result.records] == ["no description", "empty doc", "odd description"]
+
+
+def _paged_search(pages: list[list[dict]]):
+    """httpx.get stand-in: /search/jql returns the given pages in order, chained by nextPageToken."""
+    calls: list[dict] = []
+
+    def get(url, auth=None, params=None, timeout=None):
+        calls.append(dict(params or {}))
+        index = len(calls) - 1
+        body = {"issues": pages[index]}
+        if index + 1 < len(pages):
+            body["nextPageToken"] = f"page-{index + 2}"
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value=body)
+        return resp
+
+    return get, calls
+
+
+def _issues(first: int, last: int) -> list[dict]:
+    return [{"id": str(10000 + n), "key": f"ALPHA-{n}", "fields": {"summary": f"Issue {n}"}}
+            for n in range(first, last + 1)]
+
+
+def test_duplicate_items_in_one_batch_are_reported_not_stored_twice():
+    """11-15: the same issue twice in one batch gives one record; the repeat is reported, keeping the first copy."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    result = jira_issues_to_records([_I1, _I2, dict(_I1)], JIRA_URL)
+    assert [r["external_id"] for r in result.records] == ["ALPHA-1", "ALPHA-2"]
+    assert result.errors == {"jira:ALPHA-1": "mapping error: duplicate of an earlier item in this batch "
+                                             "(jira:test.atlassian.net:ALPHA-1); the first copy was kept"}
+
+
+def test_sixty_issues_over_two_pages_map_to_sixty_unique_records(tmp_path):
+    """11-16: issue_items + mapping + daily write over 2 pages (50 + 10): nothing duplicated, nothing missing."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records
+    wanted = {f"ALPHA-{n}" for n in range(1, 61)}
+    get, calls = _paged_search([_issues(1, 50), _issues(51, 60)])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        issues = Jira().issue_items("ALPHA", wanted)
+    assert len(calls) == 2
+    result = jira_issues_to_records(issues, JIRA_URL)
+    assert result.errors == {}
+    assert {r["external_id"] for r in result.records} == wanted
+    assert len({r["id"] for r in result.records}) == 60
+    _, appended = append_daily_jsonl(result.records, tmp_path)
+    assert appended == 60
+
+
+def test_overlapping_pages_do_not_create_duplicate_records(tmp_path):
+    """11-17: a server that repeats an issue on the next page yields 60 records and reports the repeat."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records
+    wanted = {f"ALPHA-{n}" for n in range(1, 61)}
+    get, _ = _paged_search([_issues(1, 50), _issues(50, 60)])  # ALPHA-50 appears on both pages
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        issues = Jira().issue_items("ALPHA", wanted)
+    assert len(issues) == 61
+    result = jira_issues_to_records(issues, JIRA_URL)
+    assert len(result.records) == 60
+    assert {r["external_id"] for r in result.records} == wanted
+    assert list(result.errors) == ["jira:ALPHA-50"]
+    assert "the first copy was kept" in result.errors["jira:ALPHA-50"]
+    _, appended = append_daily_jsonl(result.records, tmp_path)
+    assert appended == 60
+
+
+def test_sync_reports_a_repeated_issue_instead_of_hiding_it(tmp_path):
+    """11-18: co jira sync lists the repeated issue under "rejected", appends each issue once and exits 1."""
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.verify_connection.return_value = {
+            "accountId": "abc", "displayName": "Alice", "site_url": JIRA_URL,
+        }
+        mock_jira.return_value.issue_items.return_value = [_I1, _I2, dict(_I2)]
+        mock_jira.return_value.write_source_yaml = MagicMock()
+        result = CliRunner().invoke(app, ["jira", "sync", "ALPHA", "ALPHA-1", "ALPHA-2",
+                                          "--output", str(tmp_path), "--json"])
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert (data["issues"], data["mapped"], data["appended"]) == (3, 2, 2)
+    assert list(data["rejected"]) == ["jira:ALPHA-2"]
