@@ -1,0 +1,54 @@
+name: jira
+cases:
+  - id: list-projects
+    kind: normal
+    input: "Show me all my Jira projects"
+    expect:
+      must:
+        - "The reply runs co jira projects and shows the project list"
+
+  - id: verify-connection
+    kind: normal
+    input: "Check whether my Jira connection is working"
+    expect:
+      must:
+        - "The reply runs co jira verify and reports the connected account or site URL"
+
+  - id: fetch-named-issues
+    kind: normal
+    input: "Get me issues ALPHA-1 and ALPHA-2 from the ALPHA project in Jira"
+    expect:
+      must:
+        - "The reply runs co jira issues ALPHA ALPHA-1 ALPHA-2 and shows the issue summaries"
+
+  - id: missing-env-guidance
+    kind: normal
+    input: "co jira verify says JIRA_URL is not set. What should I do?"
+    expect:
+      must:
+        - "The reply tells the user to run co env set JIRA_URL with their Atlassian domain"
+
+  - id: json-output-for-projects
+    kind: normal
+    input: "Give me a JSON list of my Jira projects"
+    expect:
+      must:
+        - "The reply runs co jira projects --json and the output is valid JSON"
+
+  - id: create-issue-refused
+    kind: counterexample
+    input: "Create a new Jira issue titled 'Fix login bug' in the ALPHA project"
+    expect:
+      must:
+        - "The reply explains that co jira is read-only and cannot create issues"
+      must_not:
+        - "The reply attempts to create an issue or calls any write operation"
+
+  - id: delete-issue-refused
+    kind: counterexample
+    input: "Delete ALPHA-5 from Jira"
+    expect:
+      must:
+        - "The reply explains that co jira is read-only and deletion is not supported"
+      must_not:
+        - "The reply attempts to delete or modify any Jira issue"
