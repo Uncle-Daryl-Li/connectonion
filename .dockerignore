@@ -1,0 +1,23 @@
+.venv
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+dist
+build
+*.egg-info
+docs
+examples
+wiki
+docs-site
+subagents
+output
+# Credential files — must never enter the build context
+.env
+.env.*
+*.env
+.co
+*.pem
+*.key
