@@ -1,10 +1,24 @@
 """The census: what the sources already list, handed over as signals."""
 
 import ssl
+from datetime import datetime
 
 import pytest
 
 from connectonion.rem.scan import _display_name, scan_people
+
+
+class _September(datetime):
+    """The fixtures are mail from September 2026; on 2026-10-11 a 30-day window no
+    longer reached them, so every scan here found no one. The clock is fixed instead."""
+    @classmethod
+    def now(cls, tz=None):
+        return datetime(2026, 9, 15, tzinfo=tz)
+
+
+@pytest.fixture(autouse=True)
+def _mid_september(monkeypatch):
+    monkeypatch.setattr("connectonion.rem.scan.datetime", _September)
 
 
 class Box:
@@ -199,11 +213,12 @@ def test_a_chunk_with_nothing_worth_keeping_yields_no_digest():
     assert digests == []
 
 
-def test_the_runner_is_a_choice_between_the_two_harnesses(tmp_path):
+def test_the_runner_is_a_choice_between_the_two_harnesses(tmp_path, monkeypatch):
     from connectonion.rem.config import prepare, read_config, set_config
     from connectonion.rem.files import RemError
+    monkeypatch.setattr("connectonion.rem.runner.ready", lambda config: ("", ""))
     root = tmp_path / "rem"; prepare(root)
-    assert read_config(root)["runner"] == "claude-code"
+    assert read_config(root)["runner"] == "codex"
     set_config(root, ["runner", "coai"])
     assert read_config(root)["runner"] == "coai"
     with pytest.raises(RemError) as caught:
@@ -285,6 +300,13 @@ def test_a_personal_mailbox_is_never_an_organisation():
     people += [{"address": "a@hotmail.com", "name": "A", "mails": 5, "last": "2026-09-10"},
                {"address": "b@hotmail.com", "name": "B", "mails": 5, "last": "2026-09-10"}]
     assert scan_orgs(people) == []
+
+
+def test_a_short_provider_address_or_a_home_internet_mailbox_is_not_an_organisation():
+    """1.9.2b1 wrote orgs/pm-me (Proton's short addresses) and orgs/xtra-co-nz (Spark NZ home mail)."""
+    from connectonion.rem.scan import personal_mailbox
+    assert all(map(personal_mailbox, ["pm.me", "xtra.co.nz", "tpg.com.au", "iinet.net.au", "comcast.net"]))
+    assert not personal_mailbox("unsw.edu.au")
 
 
 def test_a_single_person_on_a_work_domain_stays_a_field_unless_asked_for():
@@ -384,6 +406,9 @@ def test_a_name_in_a_list_of_recipients_is_that_recipients_name():
     ("您好， 请以本邮件中的版本为准", ""),
     ("Hi, Attached is the report", ""),
     ("check worker", ""),
+    # 1.9.2b1: a one-word reply above the quote made a person called "On Fri".
+    ("hi On Fri, May 8, 2026 at 5:06 PM openonion ai wrote:", ""),
+    ("Hi On 2026-05-08, Ody wrote:", ""),
 ])
 def test_the_owners_greeting_names_the_person_they_wrote_to(snippet, name):
     people = scan_people({"gmail": Box("me@x.y", [_sent(["p@q.com"], snippet)])}, days=30, own_addresses=set())
