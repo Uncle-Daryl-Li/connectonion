@@ -626,6 +626,8 @@ def test_jira_cli_sync_writes_selected_scope_to_source_yaml(tmp_path):
             })
         elif url.endswith("/search/jql"):
             response.json = MagicMock(return_value={"issues": [_I1]})
+        elif url.endswith("/issue/ALPHA-1/changelog"):  # history is read by default since F13FCAKE-12
+            response.json = MagicMock(return_value={"values": [], "isLast": True})
         else:
             raise AssertionError(f"Unexpected GET {url!r}")
         return response
@@ -2776,3 +2778,98 @@ def test_references_also_point_into_one_off_exports(tmp_path):
     reference = record_reference(export_dir / "records.jsonl", records[1], notebook)
     assert reference == "docs/jira/exports/alpha-history/records.jsonl#jira:test.atlassian.net:ALPHA-2"
     assert resolve_reference(reference, notebook) == records[1]
+
+
+def _sync_site(args: list[str], issues: list[dict], histories: dict):
+    """Run co jira sync against the real Jira tool; only HTTP is faked: /myself, one search page, each issue's history.
+
+    histories: {issue key: (http status, raw histories)}. Returns (result, calls).
+    """
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    routes = {"/rest/api/3/myself": (200, {"accountId": "abc", "displayName": "Alice"}),
+              "/rest/api/3/search/jql": (200, {"issues": issues})}
+    for key, (status, values) in histories.items():
+        routes[f"/rest/api/3/issue/{key}/changelog"] = (status, {"values": values, "isLast": True})
+    get, calls = _mock_get(routes)
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = CliRunner().invoke(app, ["jira", "sync", *args])
+    return result, calls
+
+
+_EDITED = [_history("10", "2026-10-05T10:00:00.000+1100", "status", "To Do", "Done")]
+
+
+def test_sync_attaches_each_issue_history_end_to_end(tmp_path):
+    """12-26: co jira sync puts ok / none / restricted history on the right records; a 403 keeps the issue; exit 0."""
+    from connectonion.useful_tools.adapter import consume_jsonl_records, validate_record
+    result, calls = _sync_site(
+        ["ALPHA", "ALPHA-1", "ALPHA-2", "ALPHA-3", "--output", str(tmp_path), "--json"], [_I1, _I2, _I3],
+        {"ALPHA-1": (200, _EDITED), "ALPHA-2": (200, []), "ALPHA-3": (403, [])})
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["history"] == {"ok": 1, "none": 1, "restricted": 1, "unavailable": 0}
+    assert data["rejected"] == {}
+    by_key = {r["external_id"]: r for r in consume_jsonl_records(tmp_path).records}
+    assert by_key["ALPHA-1"]["extensions"]["changelog"]["entries"][0]["changes"] == [
+        {"field": "status", "from": "To Do", "to": "Done"}]
+    assert by_key["ALPHA-2"]["extensions"]["changelog"] == {"status": "none", "entries": []}
+    assert by_key["ALPHA-3"]["extensions"]["changelog"]["status"] == "restricted"
+    assert by_key["ALPHA-3"]["title"] == "Third issue"
+    assert all(validate_record(r) == [] for r in by_key.values())
+    assert sum(c["url"].endswith("/changelog") for c in calls) == 3
+    assert JIRA_TOKEN not in result.output and "diego@example.com" not in json.dumps(list(by_key.values()))
+
+
+def test_resync_after_an_edit_keeps_both_versions_and_the_reference_trail(tmp_path):
+    """12-27: a re-sync after an edit appends the new version; the old line is unchanged; a reference resolves to the newest."""
+    from connectonion.useful_tools.adapter import record_reference, resolve_reference
+    jira_dir = tmp_path / "docs" / "jira"
+    args = ["ALPHA", "ALPHA-1", "--output", str(jira_dir), "--json"]
+    first, _ = _sync_site(args, [_DRAFT], {"ALPHA-1": (200, [])})
+    path = Path(json.loads(first.stdout)["jsonl"])
+    draft_line = path.read_text(encoding="utf-8")
+    second, _ = _sync_site(args, [_FINAL], {"ALPHA-1": (200, _EDITED)})
+    assert json.loads(second.stdout)["appended"] == 1
+    assert path.read_text(encoding="utf-8").startswith(draft_line)
+    draft, final = (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines())
+    assert (draft["title"], draft["extensions"]["changelog"]["status"]) == ("Draft", "none")
+    assert (final["title"], final["extensions"]["changelog"]["status"]) == ("Final", "ok")
+    reference = record_reference(path, draft, tmp_path)
+    assert reference.startswith("docs/jira/daily/") and reference.endswith("#jira:test.atlassian.net:ALPHA-1")
+    assert resolve_reference(reference, tmp_path) == final
+
+
+def test_no_history_skips_the_history_reads(tmp_path):
+    """12-28: --no-history makes no changelog request; records carry no changelog; the summary says so."""
+    result, calls = _sync_site(["ALPHA", "ALPHA-1", "--output", str(tmp_path), "--json", "--no-history"], [_I1], {})
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["history"] is None
+    record = json.loads(Path(data["jsonl"]).read_text(encoding="utf-8"))
+    assert "changelog" not in record["extensions"]
+    assert not any(c["url"].endswith("/changelog") for c in calls)
+    text, _ = _sync_site(["ALPHA", "ALPHA-1", "--output", str(tmp_path), "--no-history"], [_I1], {})
+    assert "History: not requested (--no-history)" in text.stdout
+
+
+def test_authentication_failure_while_reading_history_writes_nothing(tmp_path):
+    """12-29: a 401 on the history stops the whole sync before source.yaml or any record is written; exit 1."""
+    result, _ = _sync_site(["ALPHA", "ALPHA-1", "ALPHA-2", "--output", str(tmp_path), "--json"], [_I1, _I2],
+                           {"ALPHA-1": (401, []), "ALPHA-2": (200, [])})
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["exit_code"] == 1
+    assert JIRA_TOKEN not in result.output
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_text_summary_counts_history_and_explains_unreadable_ones(tmp_path):
+    """12-30: the text summary lists each history status and says unreadable history did not drop the issue."""
+    result, _ = _sync_site(["ALPHA", "ALPHA-1", "ALPHA-2", "--output", str(tmp_path)], [_I1, _I2],
+                           {"ALPHA-1": (200, _EDITED), "ALPHA-2": (500, [])})
+    assert result.exit_code == 0, result.output
+    assert "History: ok 1  none 0  restricted 0  unavailable 1" in result.stdout
+    assert "were still written" in result.stdout
+    clean, _ = _sync_site(["ALPHA", "ALPHA-1", "--output", str(tmp_path / "clean")], [_I1], {"ALPHA-1": (200, [])})
+    assert "History: ok 0  none 1  restricted 0  unavailable 0" in clean.stdout
+    assert "were still written" not in clean.stdout

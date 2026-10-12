@@ -19,7 +19,8 @@ LLM-Note:
     {status, entries, reason} with entries from jira_changelog_entries() (time, author name, field from → to)
     A changed item is appended to the daily file as a new version (dedupe key includes "updated"); older lines stay
     record_reference() cites a stored record as "<notebook-relative file>#<id>"; resolve_reference() follows it back
-    Jira chain -- fully integrated: verify_connection -> issue_items -> write_source_yaml -> jira_issues_to_records -> write_daily_jsonl
+    Jira chain -- fully integrated: verify_connection -> issue_items -> issue_changelogs (co jira sync, unless --no-history)
+      -> write_source_yaml -> jira_issues_to_records(changelogs=...) -> write_daily_jsonl / write_export
     OneNote chain -- adapter function implemented and tested with synthetic fixtures; live Notes.Read integration is pending authorized account credentials and OneNote team implementation
 
 Common adapter contract for co rem integrations.

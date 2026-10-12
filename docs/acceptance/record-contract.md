@@ -3,7 +3,8 @@
 One record shape for every co rem source integration. Jira and OneNote map
 into it, and `validate_record()` checks both against the same rules.
 Implementation: `connectonion/useful_tools/adapter.py`.
-Tests: `tests/unit/test_jira.py` (cases `16-1` … `16-24`); `adapter.py` line and branch coverage 100%.
+Tests: `tests/unit/test_jira.py` (cases `16-1` … `16-24`, `11-1` … `11-30`, `12-1` … `12-30`) and
+`tests/unit/test_jira_adf.py`; `adapter.py` line and branch coverage 100%.
 
 ---
 
@@ -56,11 +57,43 @@ are left out.
 
 | Source | Keys |
 |--------|------|
-| Jira | `issue_id`, `status`, `priority`, `labels`, `assignee`, `reporter`, `parent`, `duedate`, `resolutiondate`, `description_adf` (the raw ADF, kept so nothing in the original is lost) |
+| Jira | `issue_id`, `status`, `priority`, `labels`, `assignee`, `reporter`, `parent`, `duedate`, `resolutiondate`, `description_adf` (the raw ADF, kept so nothing in the original is lost), `changelog` (see below) |
 | OneNote | `section`, `notebook`, `url_is_api` (true when `url` is the Graph content URL, not a web link) |
 
 People are stored by display name only. Account emails and tokens never enter
 a record.
+
+### Jira change history (F13FCAKE-12)
+
+`co jira sync` reads each issue's changelog (`/rest/api/3/issue/{key}/changelog`, all
+pages) and stores it on that issue's own record, matched by issue key:
+
+```json
+"changelog": {
+  "status": "ok",
+  "entries": [
+    {"id": "10", "at": "2026-10-05T10:00:00.000+1100", "author": "Diego Example",
+     "changes": [{"field": "status", "from": "To Do", "to": "Done"}]}
+  ]
+}
+```
+
+| `status` | Meaning | Issue content |
+|----------|---------|---------------|
+| `ok` | history read, at least one entry (oldest first) | kept |
+| `none` | history read, the issue was never edited | kept |
+| `restricted` | Jira returned 403 for this issue's history; `reason` says so | kept |
+| `unavailable` | anything else for this issue (rate limit, 5xx, network, missing outcome); `reason` says why | kept |
+
+- "Never edited" (`none`) and "could not read" (`restricted` / `unavailable`) are never mixed up.
+- A history problem on one issue never drops that issue or any other; the sync still exits 0.
+- An authentication or configuration failure is not per issue: it stops the sync before
+  `source.yaml` or any record is written.
+- A change value longer than 1000 characters is cut and marked; malformed history entries are
+  skipped and counted under `skipped`.
+- `co jira sync --no-history` skips these reads; the records then have no `changelog` key.
+- `--json` output reports `"history": {"ok": n, "none": n, "restricted": n, "unavailable": n}`
+  (`null` with `--no-history`).
 
 ## Media (#1938)
 
@@ -161,7 +194,6 @@ A page cites a record by file and id, for example
 
 | Item | Story |
 |------|-------|
-| Changelog under `extensions.changelog` collected by `co jira sync` | F13FCAKE-12 |
 | Who owns the production `exports/` writer (prototype here) | confirm on #1938 |
 | OneNote page HTML → text, per-user `account` value | F13FCAKE-14 / F13FCAKE-15 |
 
@@ -171,7 +203,7 @@ A page cites a record by file and id, for example
 python -m pytest tests/unit/test_jira.py -q
 ```
 
-Expected: all tests pass, including `16-1` … `16-24`.
+Expected: all tests pass, including `16-1` … `16-24`, `11-1` … `11-30` and `12-1` … `12-30`.
 
 Coverage check:
 
