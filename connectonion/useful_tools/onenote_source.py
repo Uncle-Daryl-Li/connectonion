@@ -1,14 +1,45 @@
-"""Read-only OneNote connection using the existing Microsoft credential flow."""
+"""Read-only, explicitly scoped OneNote collection for co rem.
 
+Uses the Microsoft credential record and Outlook's refresh/retry implementation.
+Graph traffic is GET-only; page media are described, never fetched. Source config
+is an import declaration, not automatic registration with rem's runtime registry.
+"""
+
+import math
+import time
+from email.utils import parsedate_to_datetime
+from pathlib import Path
 from urllib.parse import quote, urlsplit
+
 import httpx
+
 from ..provider_credentials import ProviderCredentialError
-from .onenote import TIMEOUT
+from .adapter import AdapterResult, onenote_pages_to_records
+from .onenote import TIMEOUT, _page_text
 from .outlook import Outlook
 
+READ_SCOPES = {"Notes.Read", "Notes.Read.All", "Notes.ReadWrite", "Notes.ReadWrite.All"}
 MAX_PAGES = 1000
 MAX_SELECTED = 1000
-READ_SCOPES = {"Notes.Read", "Notes.Read.All", "Notes.ReadWrite", "Notes.ReadWrite.All"}
+CONTENT_RETRIES = 2
+MAX_CONTENT_RETRY_WAIT = 30
+TRANSIENT_CONTENT_STATUSES = {429, 503, 504}
+
+
+def _retry_delay(header: str | None, attempt: int) -> float:
+    """Honor Retry-After seconds or HTTP-date; otherwise use exponential backoff."""
+    if header:
+        try:
+            wait = float(header)
+        except ValueError:
+            try:
+                wait = parsedate_to_datetime(header).timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError):
+                return 2 ** attempt
+        if math.isfinite(wait) and wait >= 0:
+            return wait
+    return 2 ** attempt
+
 
 def _id(value: str) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > 2048:
@@ -26,7 +57,7 @@ def _named(rows: list[dict], value: str, kind: str) -> dict:
 
 
 class OneNoteSource:
-    """Read-only connection; accepts existing compatible Microsoft grants."""
+    """Read-only source; existing broader Microsoft grants are accepted, never requested."""
 
     def __init__(self):
         # Do not instantiate Outlook's mail tools or require Mail scopes.
@@ -134,3 +165,128 @@ class OneNoteSource:
                 or (page.get("parentSection") or {}).get("id") != scope["section"]):
             raise ValueError("Page is outside the selected notebook/section or has malformed scope metadata.")
         return page
+
+    def _content(self, page_id: str) -> str:
+        """HTML GET with bounded transient retries and at most one auth refresh."""
+        url = f"{Outlook.GRAPH_API_URL}/me/onenote/pages/{_id(page_id)}/content"
+        try:
+            response = self._content_response(url)
+        except httpx.RequestError:
+            raise ProviderCredentialError("unavailable", "Could not read the OneNote page. Retry the source command.",
+                                          "co onenote source verify") from None
+        if response.status_code != 200:
+            code = {401: "reauth_required", 403: "permission_denied", 404: "not_found"}.get(response.status_code, "unavailable")
+            if response.status_code in TRANSIENT_CONTENT_STATUSES:
+                raise ProviderCredentialError(code,
+                    f"OneNote page unavailable (HTTP {response.status_code}); retries exhausted. "
+                    "Wait before retrying the import; honor Retry-After if provided.",
+                    "co onenote source sync --help", status=response.status_code)
+            raise ProviderCredentialError(code, f"OneNote page unavailable (HTTP {response.status_code}).",
+                                          (self._graph._credentials.auth_command if response.status_code == 401
+                                           else "co onenote source pages --help"), status=response.status_code)
+        if "text/html" not in response.headers.get("Content-Type", "").lower():
+            raise ValueError("OneNote returned non-HTML page content; page skipped.")
+        return response.text
+
+    def _content_response(self, url: str) -> httpx.Response:
+        """Only retry safe HTML GETs; the refresh does not reset the retry budget."""
+        refreshed = False
+        for attempt in range(CONTENT_RETRIES + 1):
+            response = httpx.request("GET", url,
+                headers={"Authorization": f"Bearer {self._graph._get_access_token()}"},
+                timeout=TIMEOUT, follow_redirects=False)
+            if response.status_code == 401 and not refreshed:
+                self._graph._access_token = self._graph._refresh_via_backend(self._graph._credentials.get("REFRESH_TOKEN"))
+                refreshed = True
+                response = httpx.request("GET", url,
+                    headers={"Authorization": f"Bearer {self._graph._get_access_token()}"},
+                    timeout=TIMEOUT, follow_redirects=False)
+            if response.status_code not in TRANSIENT_CONTENT_STATUSES or attempt == CONTENT_RETRIES:
+                return response
+            wait = _retry_delay(response.headers.get("Retry-After"), attempt)
+            if wait > MAX_CONTENT_RETRY_WAIT:
+                raise ProviderCredentialError("unavailable",
+                    f"OneNote page unavailable (HTTP {response.status_code}); Retry-After exceeds "
+                    f"the {MAX_CONTENT_RETRY_WAIT}s automatic wait limit. Wait before retrying the import; "
+                    "honor the server's Retry-After.", "co onenote source sync --help", status=response.status_code)
+            time.sleep(wait)
+
+    def collect(self, notebook: str, section: str, page_ids: list[str]) -> AdapterResult:
+        """Import only explicit pages whose current parent matches the selected scope."""
+        selected = list(dict.fromkeys(page_ids))
+        if not selected or len(selected) > MAX_SELECTED:
+            raise ValueError(f"Select between 1 and {MAX_SELECTED} page IDs; use co onenote source pages.")
+        for page_id in selected:
+            _id(page_id)
+        scope = self.scope(notebook, section)
+        account = self.verify_connection()["account"]
+        result = AdapterResult()
+        for page_id in selected:
+            try:
+                page = self.selected_page(page_id, scope)
+                content = self._content(page_id)
+                page.update({"text": _page_text(content), "media": media_metadata(content), "scope": scope})
+                adapted = onenote_pages_to_records([page], account)
+                for record in adapted.records:
+                    validate_record(record)
+                result.records.extend(adapted.records)
+            except ProviderCredentialError as error:
+                if error.code in {"reauth_required", "not_configured", "incomplete_record", "record_changed"}:
+                    raise
+                result.errors[page_id] = str(error)
+            except (ValueError, TypeError, AttributeError):
+                result.errors[page_id] = "Page has invalid metadata, content or scope; relist with co onenote source pages."
+        return result
+
+
+def media_metadata(content: str) -> list[dict]:
+    """Extract attachment/image descriptors only; HTML parsing performs no network I/O."""
+    from bs4 import BeautifulSoup
+    media = []
+    for element in BeautifulSoup(content, "html.parser").find_all(["img", "object"]):
+        image = element.name == "img"
+        size = element.get("data-size")
+        reference = element.get("data-fullres-src") or element.get("src" if image else "data") or ""
+        # Do not persist embedded binary data, JavaScript, or query credentials.
+        parsed = urlsplit(reference)
+        reference = parsed._replace(query="", fragment="").geturl() if parsed.scheme == "https" else ""
+        media.append({"kind": "image" if image else "attachment",
+                      "name": element.get("alt" if image else "data-attachment") or "",
+                      "mime_type": element.get("data-fullres-src-type" if image else "type") or element.get("data-src-type") or "",
+                      "size": int(size) if isinstance(size, str) and size.isdigit() else None,
+                      "status": "metadata_only", "fetch_reference": reference})
+    return media
+
+
+def validate_record(record: dict) -> None:
+    """Validate the shared adapter's provenance plus the OneNote content extension."""
+    if record.get("source") != "onenote":
+        raise ValueError("Invalid OneNote source record.")
+    for name in ("account", "id", "url"):
+        if not isinstance(record.get(name), str) or not record[name]:
+            raise ValueError(f"OneNote record requires {name}.")
+    for name in ("date", "title", "text"):
+        if not isinstance(record.get(name), str):
+            raise ValueError(f"OneNote record requires string {name}.")
+    if not isinstance(record.get("media"), list):
+        raise ValueError("OneNote record requires media metadata.")
+
+
+def sync_onenote(source: OneNoteSource, notebook: str, section: str, page_ids: list[str], source_dir: Path,
+                 *, mode: str = "daily", export_id: str | None = None) -> dict:
+    """Collect and persist an explicitly classified import; see onenote_storage."""
+    from .onenote_storage import prepare_import, write_import
+    import shlex
+    source_dir = Path(source_dir)
+    target = prepare_import(source_dir, mode, export_id)
+    result = source.collect(notebook, section, page_ids)
+    # No file should imply a successful import if all selected pages failed.
+    if not result.records:
+        return {"records": 0, "written": 0, "skipped": 0, "errors": result.errors,
+                "jsonl": None, "source_yaml": None, "mode": mode}
+    scope = {**result.records[0]["scope"], "pages": sorted(set(page_ids))}
+    command = ["co", "onenote", "source", "sync", notebook, section, *page_ids,
+               "--mode", mode, "--output", str(source_dir)]
+    if export_id:
+        command.extend(["--export-id", export_id])
+    return write_import(result, source_dir, target, scope, mode, export_id, shlex.join(command))

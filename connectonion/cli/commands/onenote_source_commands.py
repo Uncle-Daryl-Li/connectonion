@@ -1,6 +1,8 @@
 """Read-only OneNote source CLI; imports collection code only when invoked."""
 
 import json
+from pathlib import Path
+from typing import List, Optional
 
 import typer
 
@@ -73,3 +75,21 @@ def register_onenote_source(parent, factory) -> None:
         """List a bounded page set and report whether later pages remain."""
         _run(lambda source: source.pages(notebook, section, limit=limit), as_json, "pages")
 
+    @source_app.command("sync")
+    def sync(notebook: str = typer.Argument(..., help="Selected notebook ID or exact name"),
+             section: str = typer.Argument(..., help="Selected section ID or exact name"),
+             page_ids: List[str] = typer.Argument(..., help="Explicit page IDs from source pages; never imports all pages"),
+             output: Optional[Path] = typer.Option(None, "--output", help="Default: ~/.co/rem/docs/onenote"),
+             mode: str = typer.Option("daily", "--mode", help="daily or export"),
+             export_id: Optional[str] = typer.Option(None, "--export-id", help="Required for one-off export"),
+             as_json: bool = typer.Option(False, "--json")):
+        """Save chosen pages as daily records or a one-off export. Remote reads only.
+
+        Exit 0: all selected pages imported. Exit 2: partial/all page failures;
+        valid records are saved. Exit 1: authentication, scope or storage failure.
+        This writes an external import, not automatic co rem source registration.
+        """
+        from ...useful_tools.onenote_source import sync_onenote
+        directory = output or Path.home() / ".co" / "rem" / "docs" / "onenote"
+        _run(lambda source: sync_onenote(source, notebook, section, page_ids, directory,
+                                        mode=mode, export_id=export_id), as_json)

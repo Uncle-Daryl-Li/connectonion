@@ -7,7 +7,7 @@ import pytest
 BASE = "https://graph.microsoft.com/v1.0"
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "onenote"
 DATA = json.loads((FIXTURES / "pages.json").read_text(encoding="utf-8"))
-HTML = ""
+HTML = (FIXTURES / "page.html").read_text(encoding="utf-8")
 
 @pytest.fixture
 def graph(monkeypatch):

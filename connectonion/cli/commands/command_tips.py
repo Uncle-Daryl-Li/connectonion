@@ -114,7 +114,8 @@ NEXT = {
     "co onenote source verify": "co onenote source notebooks",
     "co onenote source notebooks": "co onenote source sections --help",
     "co onenote source sections": "co onenote source pages --help",
-    "co onenote source pages": "co onenote source pages --help",
+    "co onenote source pages": "co onenote source sync --help",
+    "co onenote source sync": "co onenote source pages --help",
     # -- top level --
     "co ai": HANDLER,                 # the answer is the output
     "co announce": "Give subscribers the address they follow:  co keys",

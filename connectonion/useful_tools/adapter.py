@@ -52,7 +52,8 @@ def consume_records(result: AdapterResult) -> list[dict]:
     return result.records
 
 
-def write_daily_jsonl(records: list[dict], source_dir: Path) -> Path:
+def write_daily_jsonl(records: list[dict], source_dir: Path, *,
+                      date: datetime.date | None = None, stats: dict | None = None) -> Path:
     """Append records as JSONL under source_dir/daily/YYYY/MM/DD.jsonl.
 
     Deduplicates by (source, account, id): records whose composite key already
@@ -62,9 +63,11 @@ def write_daily_jsonl(records: list[dict], source_dir: Path) -> Path:
     Creates all intermediate directories.  Returns the path written.
     Raises ValueError if the existing file contains a malformed JSON line —
     refuses to append to a corrupted file to avoid data inconsistency.
+    Optional date pins a collection started before midnight to its chosen day.
+    Optional stats receives written/skipped counts after a successful write.
     """
     source_dir = Path(source_dir)
-    today = datetime.date.today()
+    today = date or datetime.date.today()
     daily_dir = source_dir / "daily" / str(today.year) / f"{today.month:02d}"
     daily_dir.mkdir(parents=True, exist_ok=True)
     target = daily_dir / f"{today.day:02d}.jsonl"
@@ -82,7 +85,7 @@ def write_daily_jsonl(records: list[dict], source_dir: Path) -> Path:
                             rec.get("account", ""),
                             rec.get("id", ""),
                         ))
-                    except json.JSONDecodeError as exc:
+                    except (json.JSONDecodeError, AttributeError, TypeError) as exc:
                         raise ValueError(
                             f"Existing JSONL file {target} is corrupted at line {lineno}: {exc}. "
                             "Refusing to append to avoid data inconsistency."
@@ -100,6 +103,8 @@ def write_daily_jsonl(records: list[dict], source_dir: Path) -> Path:
         for record in new_records:
             json.dump(record, fh, ensure_ascii=False)
             fh.write("\n")
+    if stats is not None:
+        stats.update(written=len(new_records), skipped=len(records) - len(new_records))
     return target
 
 
@@ -176,11 +181,21 @@ def onenote_pages_to_records(pages: list[dict], account: str) -> AdapterResult:
         web_url = ((page.get("links") or {}).get("oneNoteWebUrl") or {}).get("href", "")
         if not web_url:
             web_url = page.get("contentUrl", "")
-        records.append({
+        record = {
             "source": "onenote",
             "account": account,
             "id": page_id,
-            "url": web_url,
-            "date": page.get("lastModifiedDateTime", ""),
-        })
+            "url": web_url or f"https://graph.microsoft.com/v1.0/me/onenote/pages/{page_id}",
+            "date": page.get("lastModifiedDateTime") or page.get("createdDateTime") or "",
+        }
+        # Preserve the source collector's content extension without changing the
+        # legacy metadata-only adapter shape used by other integrations.
+        for key in ("text", "media", "scope"):
+            if key in page:
+                record[key] = page[key]
+        if "text" in page:
+            record["title"] = page.get("title") or "(untitled)"
+            record["created"] = page.get("createdDateTime") or ""
+            record["updated"] = page.get("lastModifiedDateTime") or ""
+        records.append(record)
     return AdapterResult(records=records)
