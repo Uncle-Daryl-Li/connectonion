@@ -1870,6 +1870,73 @@ def test_bad_items_with_the_same_key_are_all_reported():
     assert all(v == "mapping error: 'fields' is not an object" for v in result.errors.values())
 
 
+def test_validate_record_requires_every_envelope_field_even_optional_ones():
+    """16-18: dropping an optional envelope field (text, extensions, …) is a contract violation, not a valid record."""
+    from connectonion.useful_tools.adapter import RECORD_FIELDS, make_record, validate_record
+    good = make_record("jira", JIRA_URL, "ALPHA-1", "Task", fetched=_FETCHED)
+    stripped = {k: v for k, v in good.items() if k not in ("text", "extensions")}
+    assert validate_record(stripped) == ["missing field 'text'", "missing field 'extensions'"]
+    for name in RECORD_FIELDS:
+        partial = {k: v for k, v in good.items() if k != name}
+        assert f"missing field '{name}'" in validate_record(partial)
+    assert validate_record(dict(good, text="", extensions={})) == []
+
+
+def _sync_with(issues, extra_args):
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    with patch("connectonion.cli.commands.jira_commands._jira") as mock_jira:
+        mock_jira.return_value.verify_connection.return_value = {
+            "accountId": "abc", "displayName": "Alice", "site_url": JIRA_URL,
+        }
+        mock_jira.return_value.issue_items.return_value = issues
+        mock_jira.return_value.write_source_yaml = MagicMock()
+        return CliRunner().invoke(app, ["jira", "sync", "ALPHA", "ALPHA-1", "ALPHA-9", *extra_args])
+
+
+def test_jira_cli_sync_json_reports_rejected_items_and_exits_nonzero(tmp_path):
+    """16-19: a rejected item is listed in JSON "rejected", only valid records are written, exit code is 1."""
+    result = _sync_with([_I1, {"key": "ALPHA-9", "fields": "broken"}], ["--output", str(tmp_path), "--json"])
+    assert result.exit_code == 1, result.output
+    data = json.loads(result.stdout)
+    assert data["issues"] == 2
+    assert data["records"] == 1
+    assert data["rejected"] == {"jira:ALPHA-9": "mapping error: 'fields' is not an object"}
+    lines = Path(data["jsonl"]).read_text(encoding="utf-8").strip().splitlines()
+    assert [json.loads(line)["external_id"] for line in lines] == ["ALPHA-1"]
+    assert JIRA_TOKEN not in result.stdout
+
+
+def test_jira_cli_sync_text_mode_lists_rejected_items_on_stderr(tmp_path):
+    """16-20: human output still reports what was written, names each rejected item on stderr, exits 1."""
+    result = _sync_with([_I1, {"key": "ALPHA-9", "fields": "broken"}], ["--output", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "Records written: 1" in result.stdout
+    assert "1 item(s) were rejected" in result.stderr
+    assert "jira:ALPHA-9" in result.stderr
+
+
+def test_jira_cli_sync_with_no_rejections_still_exits_zero(tmp_path):
+    """16-21: the clean path is unchanged: rejected is empty and exit code is 0."""
+    result = _sync_with([_I1], ["--output", str(tmp_path), "--json"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["rejected"] == {}
+    assert data["records"] == 1
+
+
+def test_onenote_records_from_two_users_do_not_collide_when_account_is_per_user():
+    """16-22: the same page id read for two users gets two ids once account names the user, not the Graph URL."""
+    from connectonion.useful_tools.adapter import onenote_pages_to_records
+    page = {"id": "page-1", "title": "Same page id"}
+    alice = onenote_pages_to_records([page], "onenote-user:alice-object-id").records[0]
+    bob = onenote_pages_to_records([page], "onenote-user:bob-object-id").records[0]
+    assert alice["id"] != bob["id"]
+    assert alice["external_id"] == bob["external_id"] == "page-1"
+    shared = onenote_pages_to_records([page], _ONENOTE_ACCOUNT).records[0]
+    assert shared["id"] == "onenote:graph.microsoft.com/v1.0:page-1"  # fixture placeholder: not per user
+
+
 # ── F13FCAKE-11: Jira work-item content import ──
 
 def test_issue_items_requests_the_full_content_field_set():
