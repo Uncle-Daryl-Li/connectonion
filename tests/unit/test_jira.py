@@ -1868,3 +1868,32 @@ def test_bad_items_with_the_same_key_are_all_reported():
     assert [r["external_id"] for r in result.records] == ["ALPHA-1"]
     assert set(result.errors) == {"jira:ALPHA-9", "jira:ALPHA-9#2"}
     assert all(v == "mapping error: 'fields' is not an object" for v in result.errors.values())
+
+
+# ── F13FCAKE-11: Jira work-item content import ──
+
+def test_issue_items_requests_the_full_content_field_set():
+    """11-1: every /search/jql page asks for ISSUE_FIELDS, so content does not depend on server defaults."""
+    from connectonion.useful_tools.jira import ISSUE_FIELDS
+    received_params: list[dict] = []
+
+    def get(url, auth=None, params=None, timeout=None):
+        received_params.append(dict(params or {}))
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        page = {"issues": [_I1]} if len(received_params) == 1 else {"issues": [_I2]}
+        if len(received_params) == 1:
+            page["nextPageToken"] = "page-2"
+        resp.json = MagicMock(return_value=page)
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        issues = Jira().issue_items("ALPHA", {"ALPHA-1", "ALPHA-2"})
+
+    assert [i["key"] for i in issues] == ["ALPHA-1", "ALPHA-2"]
+    assert len(received_params) == 2
+    for params in received_params:
+        assert params["fields"].split(",") == list(ISSUE_FIELDS)
+    for needed in ("summary", "description", "issuetype", "status", "priority", "labels",
+                   "assignee", "reporter", "created", "updated", "attachment"):
+        assert needed in ISSUE_FIELDS

@@ -41,6 +41,11 @@ _KEY_PATTERN = re.compile(r'^[A-Z][A-Z0-9]*-\d+$')
 
 _MAX_PAGES = 50
 
+# Fields requested from /search/jql so every collected item carries the content F13FCAKE-11 maps.
+ISSUE_FIELDS = ("summary", "description", "issuetype", "status", "priority", "labels",
+                "assignee", "reporter", "creator", "created", "updated", "duedate",
+                "resolutiondate", "parent", "attachment")
+
 class Jira:
     """Read-only Jira Cloud integration: project listing, issue collection, source.yaml."""
 
@@ -187,6 +192,7 @@ class Jira:
         """GET /rest/api/3/search/jql — selected issues, cursor-based pagination.
 
         Pagination: nextPageToken (absent = last page); startAt is silently ignored by server.
+        Fields: requests ISSUE_FIELDS explicitly, so content does not depend on the server's default field set.
         JQL is server-scoped: project = project_key AND key IN (selected_issue_keys).
 
         Raises ValueError before any HTTP request when:
@@ -231,7 +237,7 @@ class Jira:
         seen_tokens: set[str] = set()
 
         for _ in range(_MAX_PAGES):
-            params: dict = {"jql": jql, "maxResults": max_results}
+            params: dict = {"jql": jql, "maxResults": max_results, "fields": ",".join(ISSUE_FIELDS)}
             if next_token is not None:
                 params["nextPageToken"] = next_token
             try:
