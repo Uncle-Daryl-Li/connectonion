@@ -29,7 +29,7 @@ from .gdrive import GDrive
 from .generate_image import generate_image
 from .adapter import (
     AdapterResult, append_daily_jsonl, consume_records, jira_issues_to_records, make_record, media_ref,
-    onenote_pages_to_records, record_id, validate_record, write_daily_jsonl,
+    onenote_pages_to_records, record_id, validate_record, write_daily_jsonl, write_export,
 )
 from .jira import Jira, JiraAuthError, JiraConfigError, JiraPermissionError
 from .youtube import YouTube

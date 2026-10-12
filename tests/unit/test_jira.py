@@ -2142,3 +2142,77 @@ def test_sync_reports_a_repeated_issue_instead_of_hiding_it(tmp_path):
     data = json.loads(result.stdout)
     assert (data["issues"], data["mapped"], data["appended"]) == (3, 2, 2)
     assert list(data["rejected"]) == ["jira:ALPHA-2"]
+
+
+_SCOPE = {"projects": ["ALPHA"], "issues": "all", "reason": "first import of project history"}
+
+
+def test_write_export_writes_records_and_manifest(tmp_path):
+    """11-19: a one-off import lands in exports/<id>/ as records.jsonl plus a manifest of scope and counts."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, validate_record, write_export
+    records = jira_issues_to_records([_I_SEARCH, _I1, _I2], JIRA_URL, fetched=_FETCHED).records
+    export_dir = write_export(records, tmp_path / "jira", "ALPHA-history-2026-10-12", _SCOPE)
+    assert export_dir == tmp_path / "jira" / "exports" / "ALPHA-history-2026-10-12"
+    assert sorted(f.name for f in export_dir.iterdir()) == ["manifest.json", "records.jsonl"]
+    lines = (export_dir / "records.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    stored = [json.loads(line) for line in lines]
+    assert [r["external_id"] for r in stored] == ["ALPHA-77", "ALPHA-1", "ALPHA-2"]
+    assert all(validate_record(r) == [] for r in stored)
+    manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["export_id"] == "ALPHA-history-2026-10-12"
+    assert manifest["scope"] == _SCOPE
+    assert manifest["sources"] == ["jira"]
+    assert manifest["accounts"] == [JIRA_URL]
+    assert manifest["counts"] == {"records": 3, "by_kind": {"Bug": 1, "issue": 2}}
+    assert manifest["files"] == ["records.jsonl"]
+    assert manifest["created"].endswith("Z")
+    assert not (tmp_path / "jira" / "daily").exists()  # an export never touches daily/
+
+
+def test_write_export_refuses_invalid_or_duplicate_records_and_writes_nothing(tmp_path):
+    """11-20: one invalid record or a repeated id stops the whole export before any file is written."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, write_export
+    good = jira_issues_to_records([_I1, _I2], JIRA_URL).records
+    broken = dict(good[1])
+    del broken["text"]
+    with pytest.raises(ValueError, match=r"missing field 'text'.*Nothing was written"):
+        write_export([good[0], broken], tmp_path, "bad-record", _SCOPE)
+    with pytest.raises(ValueError, match="duplicate id in this export"):
+        write_export([good[0], good[0]], tmp_path, "dup-record", _SCOPE)
+    with pytest.raises(ValueError, match="record 0: record is not an object"):
+        write_export(["not a record"], tmp_path, "not-a-record", _SCOPE)
+    assert not (tmp_path / "exports").exists()
+
+
+def test_write_export_reports_at_most_five_problems(tmp_path):
+    """11-21: a large bad batch names the first five problems and counts the rest."""
+    from connectonion.useful_tools.adapter import write_export
+    with pytest.raises(ValueError, match=r"; … 2 more\. Nothing was written"):
+        write_export(["a", "b", "c", "d", "e", "f", "g"], tmp_path, "many", _SCOPE)
+
+
+def test_write_export_refuses_unsafe_ids_and_existing_exports(tmp_path):
+    """11-22: export ids cannot escape exports/, and an existing export is never overwritten or appended to."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, write_export
+    records = jira_issues_to_records([_I1], JIRA_URL).records
+    for bad_id in ("", "../outside", "a/b", ".hidden", "with space", "x" * 65, None):
+        with pytest.raises(ValueError, match="Invalid export id"):
+            write_export(records, tmp_path, bad_id, _SCOPE)
+    first = write_export(records, tmp_path, "once", _SCOPE)
+    before = (first / "records.jsonl").read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="already exists"):
+        write_export(jira_issues_to_records([_I2], JIRA_URL).records, tmp_path, "once", _SCOPE)
+    assert (first / "records.jsonl").read_text(encoding="utf-8") == before
+    (tmp_path / "exports" / ".stale.partial").mkdir()
+    with pytest.raises(ValueError, match="already exists"):
+        write_export(records, tmp_path, "stale", _SCOPE)
+
+
+def test_empty_export_is_a_valid_outcome(tmp_path):
+    """11-23: an export with no records is written with a manifest that says 0, not treated as a failure."""
+    from connectonion.useful_tools.adapter import write_export
+    export_dir = write_export([], tmp_path, "empty-scope", {"projects": ["ALPHA"], "issues": []})
+    assert (export_dir / "records.jsonl").read_text(encoding="utf-8") == ""
+    manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["counts"] == {"records": 0, "by_kind": {}}
+    assert manifest["sources"] == [] and manifest["accounts"] == []

@@ -111,18 +111,42 @@ Records are placed under `~/.co/rem/docs/<source>/`:
   exports/<id>/records.jsonl        one-off import: records
 ```
 
-The prototype writer (`write_daily_jsonl`, F13FCAKE-18; `append_daily_jsonl` also
-returns how many records were new) writes `daily/` only,
-dated by the import day, and skips a record whose `(source, account, id)`
-already exists in that day's file. A page cites a record by file and id, for
-example `docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42`.
+Every item is placed explicitly by the caller (F13FCAKE-11):
+
+| Placement | Use for | Writer | Behaviour |
+|-----------|---------|--------|-----------|
+| `daily/YYYY/MM/DD.jsonl` | ongoing changes from a sync | `write_daily_jsonl` / `append_daily_jsonl` (F13FCAKE-18) | dated by the import day; appends, skipping a record whose `(source, account, id)` is already in that day's file; `append_daily_jsonl` also returns how many were new |
+| `exports/<id>/` | a one-off import, e.g. a project's history | `write_export` (F13FCAKE-11 prototype) | written once, never appended; refuses an unsafe or existing id and any invalid or repeated record before writing anything; staged in a hidden `.<id>.partial` directory and renamed into place |
+
+`exports/<id>/manifest.json` example:
+
+```json
+{
+  "export_id": "ALPHA-history-2026-10-12",
+  "created": "2026-10-12T05:00:00Z",
+  "scope": {"projects": ["ALPHA"], "issues": "all"},
+  "sources": ["jira"],
+  "accounts": ["https://example.atlassian.net"],
+  "counts": {"records": 3, "by_kind": {"Bug": 1, "Story": 2}},
+  "files": ["records.jsonl"],
+  "contract": "#1833 shared record envelope — docs/acceptance/record-contract.md"
+}
+```
+
+An export id may contain letters, digits, `.`, `_` and `-` (max 64). An empty
+export (0 records) is a valid outcome. These are prototype writers for the
+client's layout; the general storage, blob, quota and eviction engines stay
+with the client.
+
+A page cites a record by file and id, for example
+`docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42`.
 
 ## Not in this contract yet
 
 | Item | Story |
 |------|-------|
 | Changelog under `extensions.changelog`, new version on update (`updated` in the dedupe key) | F13FCAKE-12 |
-| `exports/` writer and the daily-vs-exports decision per item | F13FCAKE-11 / F13FCAKE-14, writer ownership to confirm on #1938 |
+| Who owns the production `exports/` writer (prototype here); a `co jira sync --export <id>` option | confirm on #1938; CLI option with F13FCAKE-18 |
 | OneNote page HTML → text, per-user `account` value | F13FCAKE-14 / F13FCAKE-15 |
 
 ## Verify
