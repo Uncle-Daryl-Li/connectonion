@@ -14,8 +14,14 @@ LLM-Note:
     raw ADF kept under extensions.description_adf; due and resolution dates kept under extensions
     The same item twice in one batch (e.g. overlapping pages) yields one record; the repeat is reported in errors
     Placement is explicit: ongoing changes → write_daily_jsonl(); a one-off project import → write_export() (prototype writer)
-  F13FCAKE-18 prototype status:
-    Jira chain -- fully integrated: verify_connection -> issue_items -> write_source_yaml -> jira_issues_to_records -> write_daily_jsonl
+  F13FCAKE-12 Jira history status:
+    Jira.issue_changelogs() → per-issue outcome {status, histories, reason}; changelog_extension() turns it into
+    {status, entries, reason} with entries from jira_changelog_entries() (time, author name, field from → to)
+    co jira sync appends with keep_versions=True: a changed item or newly read history is appended as a new snapshot;
+      fetched alone never creates a duplicate. Other sources (OneNote) keep the default one-line-per-id-per-day rule
+    record_reference() cites "<notebook-relative file>#<id>?version=<content hash>"; resolution keeps that snapshot
+    Jira chain -- fully integrated: verify_connection -> issue_items -> issue_changelogs (co jira sync, unless --no-history)
+      -> write_source_yaml -> jira_issues_to_records(changelogs=...) -> write_daily_jsonl / write_export
     OneNote chain -- adapter function implemented and tested with synthetic fixtures; live Notes.Read integration is pending authorized account credentials and OneNote team implementation
 
 Common adapter contract for co rem integrations.
@@ -35,6 +41,7 @@ Usage:
 """
 
 import datetime
+import hashlib
 import json
 import re
 import shutil
@@ -204,13 +211,15 @@ def write_daily_jsonl(records: list[dict], source_dir: Path) -> Path:
 
 # Same append as write_daily_jsonl, but also reports how many records were new (not deduplicated away).
 def append_daily_jsonl(records: list[dict], source_dir: Path, *,
-                       date: datetime.date | None = None) -> tuple[Path, int]:
+                       date: datetime.date | None = None, keep_versions: bool = False) -> tuple[Path, int]:
     """Append records as JSONL under source_dir/daily/YYYY/MM/DD.jsonl.
 
-    Deduplicates by (source, account, id): records whose composite key already
-    exists in the file are skipped so that a second write on the same day
-    does not overwrite or duplicate entries from the first write.  Duplicate
-    keys within the same records list are also suppressed.
+    Default (every source): deduplicates by (source, account, id), so an id already in that
+    day's file is skipped even if its content changed — the OneNote import relies on this.
+    keep_versions=True (co jira sync, F13FCAKE-12): deduplicates by identity, updated and a
+    content hash excluding fetched, so an edit or newly available history is appended as a new
+    snapshot even if updated has not changed, while an unchanged re-read is still skipped.
+    Old lines stay untouched either way. Duplicates within the same records list are also suppressed.
     Creates all intermediate directories.  Returns (path written, number of records appended).
     Raises ValueError if the existing file contains a malformed JSON line —
     refuses to append to a corrupted file to avoid data inconsistency.
@@ -230,11 +239,7 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
                 if line:
                     try:
                         rec = json.loads(line)
-                        existing_keys.add((
-                            rec.get("source", ""),
-                            rec.get("account", ""),
-                            rec.get("id", ""),
-                        ))
+                        existing_keys.add(_dedupe_key(rec, keep_versions))
                     except (json.JSONDecodeError, AttributeError, TypeError) as exc:
                         raise ValueError(
                             f"Existing JSONL file {target} is corrupted at line {lineno}: {exc}. "
@@ -244,7 +249,7 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
     seen_keys: set[tuple] = set(existing_keys)
     new_records: list[dict] = []
     for r in records:
-        key = (r.get("source", ""), r.get("account", ""), r.get("id", ""))
+        key = _dedupe_key(r, keep_versions)
         if key not in seen_keys:
             seen_keys.add(key)
             new_records.append(r)
@@ -254,6 +259,71 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
             json.dump(record, fh, ensure_ascii=False)
             fh.write("\n")
     return target, len(new_records)
+
+
+# Content identity: ignore collection time, but include history so a successful retry is kept.
+def _snapshot_hash(record: dict) -> str:
+    content = {name: value for name, value in record.items() if name != "fetched"}
+    payload = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# Same item = same (source, account, id); with keep_versions each distinct snapshot of it counts separately.
+def _dedupe_key(record, keep_versions: bool) -> tuple:
+    identity = tuple(record.get(name, "") for name in ("source", "account", "id"))
+    if not keep_versions:
+        return identity
+    return (*identity, record.get("updated", ""), _snapshot_hash(record))
+
+
+# Cite one immutable snapshot, so later appends cannot change the evidence behind a page.
+def record_reference(file_path: Path, record: dict, notebook_root: Path) -> str:
+    """Return "<file relative to notebook_root>#<record id>?version=<sha256>".
+
+    The path always uses "/" so a reference written on Windows resolves on macOS and Linux.
+    The hash covers record content except fetched; an identical re-read cites the same snapshot.
+    Raises ValueError if file_path is outside notebook_root or the record has no id.
+    """
+    root = Path(notebook_root).resolve()
+    path = Path(file_path).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError(f"{file_path} is outside the notebook {notebook_root}; a reference must stay inside it.")
+    if not isinstance(record, dict) or not record.get("id"):
+        raise ValueError("The record has no id, so it cannot be referenced.")
+    return f"{path.relative_to(root).as_posix()}#{record['id']}?version={_snapshot_hash(record)}"
+
+
+# Versioned references match that snapshot; legacy file#id references keep the first matching line.
+def resolve_reference(reference: str, notebook_root: Path) -> dict | None:
+    """Return the record a record_reference() points to, or None if it cannot be found.
+
+    Versioned references never fall back to another snapshot. Legacy file#id references resolve
+    to the first matching line, not the latest. None for a missing version/id/file or an unsafe path.
+    Malformed lines are skipped, so reading never raises on a damaged JSON line.
+    """
+    relative, _, wanted = str(reference).partition("#")
+    record_id, marker, version = wanted.rpartition("?version=")
+    if marker:
+        if not re.fullmatch(r"[0-9a-f]{64}", version):
+            return None
+        wanted = record_id
+    root = Path(notebook_root).resolve()
+    path = (root / relative).resolve()
+    if not wanted or not path.is_relative_to(root) or not path.is_file():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        record = _json_line(line)
+        if isinstance(record, dict) and record.get("id") == wanted:
+            if not marker or _snapshot_hash(record) == version:
+                return record
+    return None
+
+
+def _json_line(line: str):
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
 
 
 # One-off import (#1938): a validated snapshot in exports/<id>/, written once and never appended to.
@@ -376,18 +446,36 @@ def consume_jsonl_records(
     return AdapterResult(records=records, errors=errors)
 
 
-def jira_issues_to_records(issues: list[dict], base_url: str, *, fetched: str | None = None) -> AdapterResult:
-    """Convert raw Jira issue dicts to shared-contract records (F13FCAKE-11, F13FCAKE-16, F13FCAKE-18).
+def jira_issues_to_records(issues: list[dict], base_url: str, *, fetched: str | None = None,
+                           changelogs: dict | None = None) -> AdapterResult:
+    """Convert raw Jira issue dicts to shared-contract records (F13FCAKE-11, F13FCAKE-12, F13FCAKE-16, F13FCAKE-18).
 
     Envelope: id = "jira:<site>:<key>", external_id = issue key, kind = issue type,
     title = summary, text = description as readable text (ADF converted by jira_adf.adf_to_text),
     url = browse URL, author = reporter, at = created, updated = updated.
     Jira-only fields (status, priority, labels, people, parent, due/resolution dates, raw ADF) go under extensions;
     attachments become metadata-only media references. Token and email are never included.
+    changelogs: Jira.issue_changelogs() output keyed by issue key. When given, every record gets
+    extensions.changelog for its own key (an issue missing from it is marked "unavailable"); when
+    None, history was not requested and no changelog is added. A restricted or unavailable history
+    never removes the issue's content.
     An item that is not an object or fails validate_record() is reported in errors, not raised.
     """
     stamp = fetched or _now_utc()
-    return _collect(issues, "jira", _jira_shape_problems, lambda issue: _jira_record(issue, base_url, stamp))
+
+    def build(issue):
+        return _with_changelog(_jira_record(issue, base_url, stamp), changelogs)
+
+    return _collect(issues, "jira", _jira_shape_problems, build)
+
+
+# Attach the history read for this record's own issue key; other issues' histories never leak in.
+def _with_changelog(record: dict, changelogs: dict | None) -> dict:
+    if changelogs is None:
+        return record
+    outcome = changelogs.get(record["external_id"]) if isinstance(changelogs, dict) else None
+    record["extensions"]["changelog"] = changelog_extension(outcome)
+    return record
 
 
 def _jira_shape_problems(issue) -> list[str]:
@@ -450,6 +538,68 @@ def _display_name(person) -> str:
 
 def _list(value) -> list:
     return value if isinstance(value, list) else []
+
+
+# History outcomes a record may carry (F13FCAKE-12); mirrors jira.CHANGELOG_STATUSES.
+CHANGELOG_STATUSES = ("ok", "none", "restricted", "unavailable")
+CHANGE_VALUE_CHARS = 1000
+
+
+# Raw Jira histories → readable entries: when, who (display name only), which field changed from what to what.
+def jira_changelog_entries(histories: list) -> tuple[list[dict], int]:
+    """Return (entries oldest first, number of malformed histories skipped).
+
+    Entry: {"id", "at", "author", "changes": [{"field", "from", "to"}]}. Only the human-readable
+    values (fromString / toString) are kept; Jira's internal ids and account emails are dropped.
+    A value longer than CHANGE_VALUE_CHARS is cut and marked. A history that is not an object or
+    has no readable change is skipped and counted, never raised.
+    """
+    entries, skipped = [], 0
+    for history in _list(histories):
+        entry = _changelog_entry(history)
+        if entry is None:
+            skipped += 1
+        else:
+            entries.append(entry)
+    return sorted(entries, key=lambda entry: entry["at"]), skipped
+
+
+def _changelog_entry(history) -> dict | None:
+    if not isinstance(history, dict):
+        return None
+    changes = [{"field": str(item.get("field") or ""),
+                "from": _change_value(item.get("fromString")),
+                "to": _change_value(item.get("toString"))}
+               for item in _list(history.get("items")) if isinstance(item, dict) and item.get("field")]
+    if not changes:
+        return None
+    return {"id": str(history.get("id") or ""), "at": str(history.get("created") or ""),
+            "author": _display_name(history.get("author")), "changes": changes}
+
+
+def _change_value(value) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= CHANGE_VALUE_CHARS:
+        return text
+    return text[:CHANGE_VALUE_CHARS] + f" … [{len(text) - CHANGE_VALUE_CHARS} more characters]"
+
+
+# One issue's history outcome → the extensions.changelog value stored on its record.
+def changelog_extension(outcome) -> dict:
+    """{"status", "entries", "reason"?, "skipped"?} from a Jira.issue_changelogs() outcome.
+
+    "none" (never edited) and "restricted"/"unavailable" (could not read) stay distinct; a missing or
+    unrecognised outcome becomes "unavailable" so an unknown state is never reported as "no history".
+    """
+    if not isinstance(outcome, dict) or outcome.get("status") not in CHANGELOG_STATUSES:
+        return {"status": "unavailable", "entries": [], "reason": "history outcome missing or unrecognised"}
+    entries, skipped = jira_changelog_entries(outcome.get("histories"))
+    extension = {"status": outcome["status"], "entries": entries}
+    if outcome.get("reason"):
+        extension["reason"] = str(outcome["reason"])
+    if skipped:
+        extension["skipped"] = skipped
+    return extension
 
 
 def onenote_pages_to_records(pages: list[dict], account: str, *, fetched: str | None = None) -> AdapterResult:

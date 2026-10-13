@@ -3,7 +3,8 @@
 One record shape for every co rem source integration. Jira and OneNote map
 into it, and `validate_record()` checks both against the same rules.
 Implementation: `connectonion/useful_tools/adapter.py`.
-Tests: `tests/unit/test_jira.py` (cases `16-1` … `16-24`); `adapter.py` line and branch coverage 100%.
+Tests: `tests/unit/test_jira.py` (cases `16-1` … `16-24`, `11-1` … `11-30`, `12-1` … `12-38`) and
+`tests/unit/test_jira_adf.py`; `adapter.py` line and branch coverage 100%.
 
 ---
 
@@ -56,11 +57,46 @@ are left out.
 
 | Source | Keys |
 |--------|------|
-| Jira | `issue_id`, `status`, `priority`, `labels`, `assignee`, `reporter`, `parent`, `duedate`, `resolutiondate`, `description_adf` (the raw ADF, kept so nothing in the original is lost) |
+| Jira | `issue_id`, `status`, `priority`, `labels`, `assignee`, `reporter`, `parent`, `duedate`, `resolutiondate`, `description_adf` (the raw ADF, kept so nothing in the original is lost), `changelog` (see below) |
 | OneNote | `section`, `notebook`, `url_is_api` (true when `url` is the Graph content URL, not a web link) |
 
 People are stored by display name only. Account emails and tokens never enter
 a record.
+
+### Jira change history (F13FCAKE-12)
+
+`co jira sync` reads each issue's changelog (`/rest/api/3/issue/{key}/changelog`, all
+pages) and stores it on that issue's own record, matched by issue key:
+
+```json
+"changelog": {
+  "status": "ok",
+  "entries": [
+    {"id": "10", "at": "2026-10-05T10:00:00.000+1100", "author": "Diego Example",
+     "changes": [{"field": "status", "from": "To Do", "to": "Done"}]}
+  ]
+}
+```
+
+| `status` | Meaning | Issue content |
+|----------|---------|---------------|
+| `ok` | history read, at least one entry (oldest first) | kept |
+| `none` | history read, the issue was never edited | kept |
+| `restricted` | Jira returned 403 for this issue's history; `reason` says so | kept |
+| `unavailable` | anything else for this issue (rate limit, 5xx, network, missing outcome); `reason` says why | kept |
+
+- "Never edited" (`none`) and "could not read" (`restricted` / `unavailable`) are never mixed up.
+- A history problem on one issue never drops that issue or any other; the sync still exits 0.
+- An authentication or configuration failure is not per issue: it stops the sync before
+  `source.yaml` or any record is written.
+- A change value longer than 1000 characters is cut and marked; malformed history entries are
+  skipped and counted under `skipped`.
+- `co jira sync --no-history` skips these reads; the records then have no `changelog` key.
+- If history was skipped, restricted or unavailable, retrying `co jira sync` with readable history appends
+  the recovered evidence even when Jira's `updated` timestamp has not changed. An identical
+  retry appends nothing; only a new `fetched` time does not create a snapshot.
+- `--json` output reports `"history": {"ok": n, "none": n, "restricted": n, "unavailable": n}`
+  (`null` with `--no-history`).
 
 ## Media (#1938)
 
@@ -120,7 +156,7 @@ unusable `--export` id before contacting Jira or writing any file:
 
 | Placement | Use for | Writer | Behaviour |
 |-----------|---------|--------|-----------|
-| `daily/YYYY/MM/DD.jsonl` | ongoing changes from a sync — `co jira sync PROJECT KEY…` | `write_daily_jsonl` / `append_daily_jsonl` (F13FCAKE-18) | dated by the import day; appends, skipping a record whose `(source, account, id)` is already in that day's file; `append_daily_jsonl` also returns how many were new |
+| `daily/YYYY/MM/DD.jsonl` | ongoing changes from a sync — `co jira sync PROJECT KEY…` | `write_daily_jsonl` / `append_daily_jsonl` (F13FCAKE-18) | dated by the import day; existing lines and earlier days' files are never rewritten. Default (every source, including the OneNote import): one line per `(source, account, id)` per day, so a page that changed later the same day is skipped. `co jira sync` opts in with `keep_versions=True` (F13FCAKE-12): deduplicates `(source, account, id, updated, content hash)`, ignoring `fetched`, so an edit or newly read history appends a snapshot even with the same `updated`. `append_daily_jsonl` also returns how many were new |
 | `exports/<id>/` | a one-off import, e.g. a project's history — `co jira sync PROJECT KEY… --export <id>` | `write_export` (F13FCAKE-11 prototype) | written once, never appended; refuses an unsafe or existing id, any invalid or repeated record, and data that cannot be saved as JSON before writing anything; staged in a hidden `.<id>.partial` directory and renamed into place; if writing fails the staging directory is removed so the same id can be retried (a `.partial` left by a crash is reported with instructions to delete it) |
 
 `exports/<id>/manifest.json` example:
@@ -143,14 +179,30 @@ export (0 records) is a valid outcome. These are prototype writers for the
 client's layout; the general storage, blob, quota and eviction engines stay
 with the client.
 
-A page cites a record by file and id, for example
-`docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42`.
+### References (F13FCAKE-12)
+
+A page cites a record by file, id and snapshot version, for example
+`docs/jira/daily/2026/10/07.jsonl#jira:example.atlassian.net:DEMO-42?version=<sha256>`.
+
+- `record_reference(file, record, notebook_root)` builds it: the file path relative to
+  the notebook root, always with `/`, then `#`, the record id and `?version=<sha256>`.
+  The SHA-256 covers canonical JSON of all fields except `fetched`, including history.
+  Object key order has no effect. A file outside the notebook or a record without an id
+  raises `ValueError`.
+- `resolve_reference(reference, notebook_root)` returns the matching snapshot. Appending
+  another version or recovering history cannot move an existing citation. A missing file,
+  unknown id/version, malformed version, reference without `#` or path outside the
+  notebook gives `None`; damaged JSON lines are skipped. A missing version never falls
+  back to the latest line.
+- Legacy `file#id` references remain readable and return the first matching line. They
+  never specified a version, so any intended later snapshot is ambiguous; regenerate
+  such citations with `record_reference()` and the intended record to pin it precisely.
+- Daily files and `exports/<id>/records.jsonl` are cited the same way.
 
 ## Not in this contract yet
 
 | Item | Story |
 |------|-------|
-| Changelog under `extensions.changelog`, new version on update (`updated` in the dedupe key) | F13FCAKE-12 |
 | Who owns the production `exports/` writer (prototype here) | confirm on #1938 |
 | OneNote page HTML → text, per-user `account` value | F13FCAKE-14 / F13FCAKE-15 |
 
@@ -160,7 +212,7 @@ A page cites a record by file and id, for example
 python -m pytest tests/unit/test_jira.py -q
 ```
 
-Expected: all tests pass, including `16-1` … `16-24`.
+Expected: all tests pass, including `16-1` … `16-24`, `11-1` … `11-30` and `12-1` … `12-38`.
 
 Coverage check:
 

@@ -626,6 +626,8 @@ def test_jira_cli_sync_writes_selected_scope_to_source_yaml(tmp_path):
             })
         elif url.endswith("/search/jql"):
             response.json = MagicMock(return_value={"issues": [_I1]})
+        elif url.endswith("/issue/ALPHA-1/changelog"):  # history is read by default since F13FCAKE-12
+            response.json = MagicMock(return_value={"values": [], "isLast": True})
         else:
             raise AssertionError(f"Unexpected GET {url!r}")
         return response
@@ -2383,3 +2385,637 @@ def test_empty_export_is_a_valid_outcome(tmp_path):
     manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["counts"] == {"records": 0, "by_kind": {}}
     assert manifest["sources"] == [] and manifest["accounts"] == []
+
+
+# ── F13FCAKE-12: Jira history and provenance ──
+
+def _history(entry_id: str, when: str, field: str, old: str, new: str, who: str = "Diego Example") -> dict:
+    """One raw Jira changelog history entry, as /issue/{key}/changelog returns it."""
+    return {"id": entry_id, "author": {"displayName": who, "emailAddress": "diego@example.com"},
+            "created": when, "items": [{"field": field, "fieldtype": "jira",
+                                        "fromString": old, "toString": new}]}
+
+
+def _changelog_pages(pages: list[list[dict]], status: int = 200):
+    """httpx.get stand-in for /issue/{key}/changelog: offset pages, isLast on the final one."""
+    calls: list[dict] = []
+
+    def get(url, auth=None, params=None, timeout=None):
+        calls.append({"url": url, "params": dict(params or {})})
+        index = len(calls) - 1
+        resp = MagicMock(status_code=status)
+        resp.raise_for_status = MagicMock()
+        values = pages[index] if index < len(pages) else []
+        resp.json = MagicMock(return_value={"startAt": sum(len(p) for p in pages[:index]),
+                                            "values": values, "isLast": index + 1 >= len(pages)})
+        return resp
+
+    return get, calls
+
+
+def test_issue_changelog_reads_every_page_in_order():
+    """12-1: issue_changelog() follows startAt/isLast across pages and returns all histories, oldest first."""
+    page1 = [_history("1", "2026-10-05T10:00:00.000+1100", "status", "To Do", "In Progress")]
+    page2 = [_history("2", "2026-10-06T10:00:00.000+1100", "priority", "High", "Highest")]
+    get, calls = _changelog_pages([page1, page2])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        histories = Jira().issue_changelog("ALPHA-1")
+    assert [h["id"] for h in histories] == ["1", "2"]
+    assert all(c["url"].endswith("/rest/api/3/issue/ALPHA-1/changelog") for c in calls)
+    assert [c["params"]["startAt"] for c in calls] == [0, 1]
+
+
+def test_issue_changelog_never_edited_issue_returns_empty_list():
+    """12-2: an issue with no history gives [] (a valid empty result, not an error)."""
+    get, calls = _changelog_pages([[]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        assert Jira().issue_changelog("ALPHA-2") == []
+    assert len(calls) == 1
+
+
+def test_issue_changelog_403_names_the_issue_and_hides_the_server_body():
+    """12-3: no permission for the history → JiraPermissionError naming the key, no server body, no token."""
+    get, _ = _mock_get({"/rest/api/3/issue/ALPHA-3/changelog": (403, {"errorMessages": ["raw server body"]})})
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(JiraPermissionError) as excinfo:
+            Jira().issue_changelog("ALPHA-3")
+    message = str(excinfo.value)
+    assert "ALPHA-3" in message
+    assert "raw server body" not in message
+    assert JIRA_TOKEN not in message
+
+
+def test_issue_changelog_rejects_bad_keys_and_stuck_pages():
+    """12-4: a malformed key makes no request; an empty page that is not the last aborts instead of looping."""
+    get, calls = _changelog_pages([[]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        for bad in ("alpha-1", "ALPHA-1 OR 1=1", "", None):
+            with pytest.raises(ValueError, match="Invalid Jira issue key"):
+                Jira().issue_changelog(bad)
+    assert calls == []
+
+    def stuck(url, auth=None, params=None, timeout=None):
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"values": [], "isLast": False})
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", stuck):
+        with pytest.raises(ValueError, match="empty page with isLast=false"):
+            Jira().issue_changelog("ALPHA-1")
+
+
+def test_issue_changelog_stops_after_the_page_limit():
+    """12-5: a server that never reports isLast stops after the page limit instead of looping."""
+    def endless(url, auth=None, params=None, timeout=None):
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"values": [_history("x", "2026-10-05T10:00:00Z", "status", "a", "b")],
+                                            "isLast": False})
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", endless):
+        with pytest.raises(ValueError, match="exceeded 50 pages"):
+            Jira().issue_changelog("ALPHA-1")
+
+
+def _changelog_by_key(responses: dict):
+    """httpx.get stand-in routing /issue/{key}/changelog to (status, values) per key; one page each."""
+    calls: list[str] = []
+
+    def get(url, auth=None, params=None, timeout=None):
+        key = url.rstrip("/").split("/issue/")[1].split("/")[0]
+        calls.append(key)
+        status, values = responses[key]
+        resp = MagicMock(status_code=status)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"values": values, "isLast": True})
+        return resp
+
+    return get, calls
+
+
+def test_issue_changelogs_classifies_each_issue_independently():
+    """12-6: ok / none / restricted / unavailable per issue; a 403 or 500 on one issue does not stop the others."""
+    from connectonion.useful_tools.jira import CHANGELOG_STATUSES
+    edited = [_history("1", "2026-10-05T10:00:00.000+1100", "status", "To Do", "Done")]
+    get, calls = _changelog_by_key({
+        "ALPHA-1": (200, edited),
+        "ALPHA-2": (200, []),
+        "ALPHA-3": (403, {"errorMessages": ["raw server body"]}),
+        "ALPHA-4": (500, []),
+    })
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        outcomes = Jira().issue_changelogs({"ALPHA-4", "ALPHA-2", "ALPHA-1", "ALPHA-3"})
+    assert list(outcomes) == ["ALPHA-1", "ALPHA-2", "ALPHA-3", "ALPHA-4"]
+    assert calls == ["ALPHA-1", "ALPHA-2", "ALPHA-3", "ALPHA-4"]
+    assert {k: v["status"] for k, v in outcomes.items()} == {
+        "ALPHA-1": "ok", "ALPHA-2": "none", "ALPHA-3": "restricted", "ALPHA-4": "unavailable"}
+    assert set(v["status"] for v in outcomes.values()) == set(CHANGELOG_STATUSES)
+    assert outcomes["ALPHA-1"]["histories"] == edited
+    assert outcomes["ALPHA-2"] == {"status": "none", "histories": [], "reason": ""}
+    assert "ALPHA-3" in outcomes["ALPHA-3"]["reason"]
+    assert "HTTP 500" in outcomes["ALPHA-4"]["reason"]
+
+
+def test_no_history_is_distinguishable_from_unreadable_history():
+    """12-7: "never edited" (none) and "could not read" (restricted/unavailable) are different outcomes."""
+    get, _ = _changelog_by_key({"ALPHA-1": (200, []), "ALPHA-2": (403, {}), "ALPHA-3": (429, [])})
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        outcomes = Jira().issue_changelogs(["ALPHA-1", "ALPHA-2", "ALPHA-3"])
+    assert [outcomes[k]["status"] for k in ("ALPHA-1", "ALPHA-2", "ALPHA-3")] == ["none", "restricted", "unavailable"]
+    assert outcomes["ALPHA-1"]["reason"] == ""
+    assert outcomes["ALPHA-2"]["reason"] and outcomes["ALPHA-3"]["reason"]
+    assert "rate limit" in outcomes["ALPHA-3"]["reason"]
+
+
+def test_issue_changelogs_reasons_never_leak_secrets_or_server_bodies():
+    """12-8: restricted / unavailable reasons contain the key and guidance, never the token, email or body."""
+    get, _ = _changelog_by_key({"ALPHA-1": (403, {"errorMessages": ["raw server body"]}),
+                                "ALPHA-2": (503, {"message": "raw outage body"})})
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        outcomes = Jira().issue_changelogs(["ALPHA-1", "ALPHA-2"])
+    text = json.dumps(outcomes)
+    for secret in (JIRA_TOKEN, JIRA_EMAIL, "raw server body", "raw outage body"):
+        assert secret not in text
+
+
+def test_authentication_failure_stops_the_whole_history_run():
+    """12-9: a 401 is not per item — issue_changelogs raises JiraAuthError instead of marking every issue."""
+    get, calls = _changelog_by_key({"ALPHA-1": (401, []), "ALPHA-2": (200, [])})
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(JiraAuthError):
+            Jira().issue_changelogs(["ALPHA-1", "ALPHA-2"])
+    assert calls == ["ALPHA-1"]
+
+
+def test_bad_key_in_a_history_batch_is_unavailable_without_a_request():
+    """12-10: an invalid key is reported as unavailable for that key only; no request is made for it."""
+    get, calls = _changelog_by_key({"ALPHA-1": (200, [])})
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        outcomes = Jira().issue_changelogs(["ALPHA-1", "not a key"])
+    assert outcomes["ALPHA-1"]["status"] == "none"
+    assert outcomes["not a key"]["status"] == "unavailable"
+    assert "Invalid Jira issue key" in outcomes["not a key"]["reason"]
+    assert calls == ["ALPHA-1"]
+
+
+def test_changelog_entries_are_readable_and_oldest_first():
+    """12-11: raw histories become {id, at, author, changes[field, from, to]}, sorted oldest first, no emails or ids."""
+    from connectonion.useful_tools.adapter import jira_changelog_entries
+    later = _history("2", "2026-10-06T10:00:00.000+1100", "priority", "High", "Highest", who="Ben Example")
+    earlier = _history("1", "2026-10-05T10:00:00.000+1100", "status", "To Do", "In Progress")
+    earlier["items"][0].update({"from": "10000", "to": "3"})
+    entries, skipped = jira_changelog_entries([later, earlier])
+    assert skipped == 0
+    assert entries == [
+        {"id": "1", "at": "2026-10-05T10:00:00.000+1100", "author": "Diego Example",
+         "changes": [{"field": "status", "from": "To Do", "to": "In Progress"}]},
+        {"id": "2", "at": "2026-10-06T10:00:00.000+1100", "author": "Ben Example",
+         "changes": [{"field": "priority", "from": "High", "to": "Highest"}]},
+    ]
+    assert "diego@example.com" not in json.dumps(entries)
+
+
+def test_changelog_entry_keeps_every_field_changed_in_one_edit():
+    """12-12: one history with several items keeps them all; null values (field set or cleared) become ""."""
+    from connectonion.useful_tools.adapter import jira_changelog_entries
+    history = {"id": "7", "created": "2026-10-07T09:00:00Z", "author": {"displayName": "Elena Example"},
+               "items": [{"field": "assignee", "fromString": None, "toString": "Ben Example"},
+                         {"field": "labels", "fromString": "draft", "toString": None}]}
+    entries, _ = jira_changelog_entries([history])
+    assert entries[0]["changes"] == [{"field": "assignee", "from": "", "to": "Ben Example"},
+                                     {"field": "labels", "from": "draft", "to": ""}]
+
+
+def test_malformed_histories_are_skipped_and_counted():
+    """12-13: non-objects, histories without items and items without a field are skipped and counted, not raised."""
+    from connectonion.useful_tools.adapter import jira_changelog_entries
+    good = _history("1", "2026-10-05T10:00:00Z", "status", "To Do", "Done")
+    broken = ["not a history", {"id": "x", "items": "nope"}, {"id": "y", "items": [{"fromString": "a"}, "z"]}]
+    entries, skipped = jira_changelog_entries([good, *broken])
+    assert [e["id"] for e in entries] == ["1"]
+    assert skipped == 3
+    assert jira_changelog_entries("not a list") == ([], 0)
+    no_author = {"id": "2", "items": [{"field": "status", "toString": "Done"}]}
+    assert jira_changelog_entries([no_author])[0][0]["author"] == ""
+
+
+def test_long_change_values_are_cut_and_marked():
+    """12-14: a huge value (e.g. a description edit) is cut to CHANGE_VALUE_CHARS with a visible marker."""
+    from connectonion.useful_tools.adapter import CHANGE_VALUE_CHARS, jira_changelog_entries
+    big = "x" * (CHANGE_VALUE_CHARS + 250)
+    entries, _ = jira_changelog_entries([_history("1", "2026-10-05T10:00:00Z", "description", "short", big)])
+    change = entries[0]["changes"][0]
+    assert change["from"] == "short"
+    assert change["to"] == "x" * CHANGE_VALUE_CHARS + " … [250 more characters]"
+
+
+def test_changelog_extension_keeps_none_and_unreadable_distinct():
+    """12-15: ok / none / restricted / unavailable survive into the record value; unknown outcomes become unavailable."""
+    from connectonion.useful_tools.adapter import CHANGELOG_STATUSES, changelog_extension
+    from connectonion.useful_tools.jira import CHANGELOG_STATUSES as TOOL_STATUSES
+    assert CHANGELOG_STATUSES == TOOL_STATUSES
+    edited = [_history("1", "2026-10-05T10:00:00Z", "status", "To Do", "Done"), "broken"]
+    ok = changelog_extension({"status": "ok", "histories": edited, "reason": ""})
+    assert ok["status"] == "ok" and len(ok["entries"]) == 1 and ok["skipped"] == 1 and "reason" not in ok
+    assert changelog_extension({"status": "none", "histories": [], "reason": ""}) == {"status": "none", "entries": []}
+    restricted = changelog_extension({"status": "restricted", "histories": [], "reason": "Jira returned 403 for ALPHA-3"})
+    assert restricted == {"status": "restricted", "entries": [], "reason": "Jira returned 403 for ALPHA-3"}
+    for unknown in (None, {}, {"status": "maybe"}, "ok"):
+        assert changelog_extension(unknown)["status"] == "unavailable"
+
+
+def _outcome(status: str, histories=None, reason: str = "") -> dict:
+    return {"status": status, "histories": histories or [], "reason": reason}
+
+
+def test_each_record_gets_the_history_of_its_own_issue():
+    """12-16: histories are matched by issue key, so ALPHA-1's changes never appear on ALPHA-2's record."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    changelogs = {
+        "ALPHA-2": _outcome("ok", [_history("20", "2026-10-06T10:00:00Z", "priority", "Low", "High")]),
+        "ALPHA-1": _outcome("ok", [_history("10", "2026-10-05T10:00:00Z", "status", "To Do", "Done")]),
+    }
+    records = jira_issues_to_records([_I1, _I2], JIRA_URL, changelogs=changelogs).records
+    by_key = {r["external_id"]: r["extensions"]["changelog"] for r in records}
+    assert [e["id"] for e in by_key["ALPHA-1"]["entries"]] == ["10"]
+    assert by_key["ALPHA-1"]["entries"][0]["changes"] == [{"field": "status", "from": "To Do", "to": "Done"}]
+    assert [e["id"] for e in by_key["ALPHA-2"]["entries"]] == ["20"]
+
+
+def test_restricted_or_unavailable_history_keeps_the_issue_content():
+    """12-17: a 403 or outage on the history still yields a full, valid record; only the changelog says why."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, validate_record
+    changelogs = {"ALPHA-77": _outcome("restricted", reason="Jira returned 403 for the change history of ALPHA-77."),
+                  "ALPHA-1": _outcome("unavailable", reason="Jira is temporarily unavailable (HTTP 503).")}
+    result = jira_issues_to_records([_I_SEARCH, _I1], JIRA_URL, changelogs=changelogs)
+    assert result.errors == {}
+    restricted, unavailable = result.records
+    assert restricted["title"] == "Pagination stops after the first page"
+    assert restricted["text"].startswith("## Steps")
+    assert restricted["extensions"]["status"] == "Done"
+    assert restricted["extensions"]["changelog"] == {
+        "status": "restricted", "entries": [], "reason": "Jira returned 403 for the change history of ALPHA-77."}
+    assert unavailable["extensions"]["changelog"]["status"] == "unavailable"
+    assert all(validate_record(r) == [] for r in result.records)
+
+
+def test_never_edited_and_unreadable_history_look_different_on_the_record():
+    """12-18: "none" (never edited) is stored differently from "unavailable" (not read), including a missing key."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    records = jira_issues_to_records([_I1, _I2], JIRA_URL, changelogs={"ALPHA-1": _outcome("none")}).records
+    never_edited, not_collected = (r["extensions"]["changelog"] for r in records)
+    assert never_edited == {"status": "none", "entries": []}
+    assert not_collected["status"] == "unavailable"
+    assert not_collected["reason"]
+
+
+def test_history_not_requested_adds_no_changelog():
+    """12-19: without changelogs (history not requested) records look exactly as in F13FCAKE-11."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    with_none = jira_issues_to_records([_I_SEARCH], JIRA_URL, fetched=_FETCHED).records[0]
+    assert "changelog" not in with_none["extensions"]
+    odd = jira_issues_to_records([_I1], JIRA_URL, changelogs=["not", "a", "dict"]).records[0]
+    assert odd["extensions"]["changelog"]["status"] == "unavailable"
+
+
+def test_records_with_history_survive_the_daily_round_trip(tmp_path):
+    """12-20: a record carrying its changelog is written to daily/ and read back unchanged and still valid."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, consume_jsonl_records, jira_issues_to_records, validate_record,
+    )
+    changelogs = {"ALPHA-1": _outcome("ok", [_history("10", "2026-10-05T10:00:00Z", "status", "To Do", "Done")])}
+    records = jira_issues_to_records([_I1], JIRA_URL, changelogs=changelogs).records
+    append_daily_jsonl(records, tmp_path)
+    read_back = consume_jsonl_records(tmp_path).records
+    assert read_back == records
+    assert validate_record(read_back[0]) == []
+    assert read_back[0]["extensions"]["changelog"]["entries"][0]["author"] == "Diego Example"
+
+
+def _version(updated: str, summary: str) -> dict:
+    return {"id": "10001", "key": "ALPHA-1", "fields": {"summary": summary, "updated": updated}}
+
+
+_DRAFT = _version("2026-10-12T09:00:00.000+0000", "Draft")
+_FINAL = _version("2026-10-12T15:30:00.000+0000", "Final")
+
+
+def test_changed_item_is_appended_as_a_new_version_and_old_lines_stay(tmp_path):
+    """12-21: the same issue with a new "updated" is appended below; the same version is skipped; line 1 is untouched."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records
+    day = datetime.date(2026, 10, 12)
+    draft = jira_issues_to_records([_DRAFT], JIRA_URL).records
+    final = jira_issues_to_records([_FINAL], JIRA_URL).records
+    path, _ = append_daily_jsonl(draft, tmp_path, date=day, keep_versions=True)
+    original = path.read_text(encoding="utf-8")
+    assert append_daily_jsonl(final, tmp_path, date=day, keep_versions=True) == (path, 1)
+    assert append_daily_jsonl(final + draft, tmp_path, date=day, keep_versions=True) == (path, 0)
+    stored = path.read_text(encoding="utf-8")
+    assert stored.startswith(original)
+    assert [json.loads(line)["title"] for line in stored.splitlines()] == ["Draft", "Final"]
+    assert {json.loads(line)["id"] for line in stored.splitlines()} == {"jira:test.atlassian.net:ALPHA-1"}
+
+
+def test_a_new_day_never_rewrites_the_previous_day(tmp_path):
+    """12-22: a change synced the next day goes into that day's file; the previous day's file is byte-for-byte unchanged."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records
+    draft = jira_issues_to_records([_DRAFT], JIRA_URL).records
+    final = jira_issues_to_records([_FINAL], JIRA_URL).records
+    yesterday, _ = append_daily_jsonl(draft, tmp_path, date=datetime.date(2026, 10, 11), keep_versions=True)
+    before = yesterday.read_bytes()
+    today, appended = append_daily_jsonl(final, tmp_path, date=datetime.date(2026, 10, 12), keep_versions=True)
+    assert appended == 1
+    assert yesterday.read_bytes() == before
+    assert today.relative_to(tmp_path).as_posix() == "daily/2026/10/12.jsonl"
+
+
+def test_record_reference_is_notebook_relative_file_and_id(tmp_path):
+    """12-23: a reference carries the notebook-relative path, id and snapshot version; outside paths/no id raise."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records, record_reference
+    notebook = tmp_path / "notebook"
+    record = jira_issues_to_records([_I1], JIRA_URL).records[0]
+    path, _ = append_daily_jsonl([record], notebook / "docs" / "jira", date=datetime.date(2026, 10, 12))
+    reference = record_reference(path, record, notebook)
+    assert reference.partition("?version=")[0] == (
+        "docs/jira/daily/2026/10/12.jsonl#jira:test.atlassian.net:ALPHA-1")
+    assert "?version=" in reference
+    with pytest.raises(ValueError, match="outside the notebook"):
+        record_reference(tmp_path / "elsewhere.jsonl", record, notebook)
+    with pytest.raises(ValueError, match="no id"):
+        record_reference(path, {"title": "no id"}, notebook)
+
+
+def test_resolve_reference_returns_the_cited_version_or_none(tmp_path):
+    """12-24: the cited snapshot wins; unknown id, missing file, no "#" or a path escaping the notebook give None."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, jira_issues_to_records, record_reference, resolve_reference,
+    )
+    notebook = tmp_path / "notebook"
+    jira_dir = notebook / "docs" / "jira"
+    day = datetime.date(2026, 10, 12)
+    draft = jira_issues_to_records([_DRAFT], JIRA_URL).records
+    final = jira_issues_to_records([_FINAL], JIRA_URL).records
+    path, _ = append_daily_jsonl(draft, jira_dir, date=day, keep_versions=True)
+    append_daily_jsonl(final, jira_dir, date=day, keep_versions=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write("{damaged line\n")
+    reference = record_reference(path, draft[0], notebook)
+    assert resolve_reference(reference, notebook) == draft[0]
+    assert resolve_reference(record_reference(path, final[0], notebook), notebook) == final[0]
+    (tmp_path / "outside.jsonl").write_text(json.dumps(draft[0]) + "\n", encoding="utf-8")
+    for broken in (reference.replace("ALPHA-1", "ALPHA-404"), reference.replace("12.jsonl", "13.jsonl"),
+                   reference.split("#")[0], "../outside.jsonl#" + draft[0]["id"], ""):
+        assert resolve_reference(broken, notebook) is None
+
+
+def test_references_also_point_into_one_off_exports(tmp_path):
+    """12-25: a record in exports/<id>/records.jsonl is cited and resolved the same way as a daily record."""
+    from connectonion.useful_tools.adapter import (
+        jira_issues_to_records, record_reference, resolve_reference, write_export,
+    )
+    notebook = tmp_path / "notebook"
+    records = jira_issues_to_records([_I1, _I2], JIRA_URL, fetched=_FETCHED).records
+    export_dir = write_export(records, notebook / "docs" / "jira", "alpha-history", _SCOPE)
+    reference = record_reference(export_dir / "records.jsonl", records[1], notebook)
+    assert reference.partition("?version=")[0] == "docs/jira/exports/alpha-history/records.jsonl#jira:test.atlassian.net:ALPHA-2"
+    assert resolve_reference(reference, notebook) == records[1]
+
+
+def _sync_site(args: list[str], issues: list[dict], histories: dict):
+    """Run co jira sync against the real Jira tool; only HTTP is faked: /myself, one search page, each issue's history.
+
+    histories: {issue key: (http status, raw histories)}. Returns (result, calls).
+    """
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+    routes = {"/rest/api/3/myself": (200, {"accountId": "abc", "displayName": "Alice"}),
+              "/rest/api/3/search/jql": (200, {"issues": issues})}
+    for key, (status, values) in histories.items():
+        routes[f"/rest/api/3/issue/{key}/changelog"] = (status, {"values": values, "isLast": True})
+    get, calls = _mock_get(routes)
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = CliRunner().invoke(app, ["jira", "sync", *args])
+    return result, calls
+
+
+_EDITED = [_history("10", "2026-10-05T10:00:00.000+1100", "status", "To Do", "Done")]
+
+
+def test_sync_attaches_each_issue_history_end_to_end(tmp_path):
+    """12-26: co jira sync puts ok / none / restricted history on the right records; a 403 keeps the issue; exit 0."""
+    from connectonion.useful_tools.adapter import consume_jsonl_records, validate_record
+    result, calls = _sync_site(
+        ["ALPHA", "ALPHA-1", "ALPHA-2", "ALPHA-3", "--output", str(tmp_path), "--json"], [_I1, _I2, _I3],
+        {"ALPHA-1": (200, _EDITED), "ALPHA-2": (200, []), "ALPHA-3": (403, [])})
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["history"] == {"ok": 1, "none": 1, "restricted": 1, "unavailable": 0}
+    assert data["rejected"] == {}
+    by_key = {r["external_id"]: r for r in consume_jsonl_records(tmp_path).records}
+    assert by_key["ALPHA-1"]["extensions"]["changelog"]["entries"][0]["changes"] == [
+        {"field": "status", "from": "To Do", "to": "Done"}]
+    assert by_key["ALPHA-2"]["extensions"]["changelog"] == {"status": "none", "entries": []}
+    assert by_key["ALPHA-3"]["extensions"]["changelog"]["status"] == "restricted"
+    assert by_key["ALPHA-3"]["title"] == "Third issue"
+    assert all(validate_record(r) == [] for r in by_key.values())
+    assert sum(c["url"].endswith("/changelog") for c in calls) == 3
+    assert JIRA_TOKEN not in result.output and "diego@example.com" not in json.dumps(list(by_key.values()))
+
+
+def test_resync_after_an_edit_keeps_both_versions_and_the_reference_trail(tmp_path):
+    """12-27: a re-sync after an edit appends a version; the old line and its citation remain unchanged."""
+    from connectonion.useful_tools.adapter import record_reference, resolve_reference
+    jira_dir = tmp_path / "docs" / "jira"
+    args = ["ALPHA", "ALPHA-1", "--output", str(jira_dir), "--json"]
+    first, _ = _sync_site(args, [_DRAFT], {"ALPHA-1": (200, [])})
+    path = Path(json.loads(first.stdout)["jsonl"])
+    draft_line = path.read_text(encoding="utf-8")
+    reference = record_reference(path, json.loads(draft_line), tmp_path)
+    second, _ = _sync_site(args, [_FINAL], {"ALPHA-1": (200, _EDITED)})
+    assert json.loads(second.stdout)["appended"] == 1
+    assert path.read_text(encoding="utf-8").startswith(draft_line)
+    draft, final = (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines())
+    assert (draft["title"], draft["extensions"]["changelog"]["status"]) == ("Draft", "none")
+    assert (final["title"], final["extensions"]["changelog"]["status"]) == ("Final", "ok")
+    assert reference.startswith("docs/jira/daily/") and "#jira:test.atlassian.net:ALPHA-1?version=" in reference
+    assert resolve_reference(reference, tmp_path) == draft
+    assert resolve_reference(record_reference(path, final, tmp_path), tmp_path) == final
+
+
+def test_no_history_skips_the_history_reads(tmp_path):
+    """12-28: --no-history makes no changelog request; records carry no changelog; the summary says so."""
+    result, calls = _sync_site(["ALPHA", "ALPHA-1", "--output", str(tmp_path), "--json", "--no-history"], [_I1], {})
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["history"] is None
+    record = json.loads(Path(data["jsonl"]).read_text(encoding="utf-8"))
+    assert "changelog" not in record["extensions"]
+    assert not any(c["url"].endswith("/changelog") for c in calls)
+    text, _ = _sync_site(["ALPHA", "ALPHA-1", "--output", str(tmp_path), "--no-history"], [_I1], {})
+    assert "History: not requested (--no-history)" in text.stdout
+
+
+def test_authentication_failure_while_reading_history_writes_nothing(tmp_path):
+    """12-29: a 401 on the history stops the whole sync before source.yaml or any record is written; exit 1."""
+    result, _ = _sync_site(["ALPHA", "ALPHA-1", "ALPHA-2", "--output", str(tmp_path), "--json"], [_I1, _I2],
+                           {"ALPHA-1": (401, []), "ALPHA-2": (200, [])})
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["exit_code"] == 1
+    assert JIRA_TOKEN not in result.output
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_text_summary_counts_history_and_explains_unreadable_ones(tmp_path):
+    """12-30: the text summary lists each history status and says unreadable history did not drop the issue."""
+    result, _ = _sync_site(["ALPHA", "ALPHA-1", "ALPHA-2", "--output", str(tmp_path)], [_I1, _I2],
+                           {"ALPHA-1": (200, _EDITED), "ALPHA-2": (500, [])})
+    assert result.exit_code == 0, result.output
+    assert "History: ok 1  none 0  restricted 0  unavailable 1" in result.stdout
+    assert "were still written" in result.stdout
+    clean, _ = _sync_site(["ALPHA", "ALPHA-1", "--output", str(tmp_path / "clean")], [_I1], {"ALPHA-1": (200, [])})
+    assert "History: ok 0  none 1  restricted 0  unavailable 0" in clean.stdout
+    assert "were still written" not in clean.stdout
+
+
+def test_reference_keeps_its_snapshot_after_same_day_update(tmp_path):
+    """12-31: citing a draft before an edit keeps pointing to that draft after the final version is appended."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, jira_issues_to_records, record_reference, resolve_reference,
+    )
+    notebook = tmp_path / "notebook"
+    source_dir = notebook / "docs" / "jira"
+    day = datetime.date(2026, 10, 12)
+    draft = jira_issues_to_records([_DRAFT], JIRA_URL, fetched=_FETCHED).records[0]
+    final = jira_issues_to_records([_FINAL], JIRA_URL, fetched=_FETCHED).records[0]
+    path, _ = append_daily_jsonl([draft], source_dir, date=day, keep_versions=True)
+    reference = record_reference(path, draft, notebook)
+    assert resolve_reference(reference, notebook) == draft
+    append_daily_jsonl([final], source_dir, date=day, keep_versions=True)
+    assert resolve_reference(reference, notebook) == draft
+    assert record_reference(path, final, notebook) != reference
+    assert resolve_reference(record_reference(path, final, notebook), notebook) == final
+
+
+@pytest.mark.parametrize("first_status", [None, "restricted", "unavailable", "none"])
+def test_recovered_history_is_appended_without_an_issue_edit(tmp_path, first_status):
+    """12-32: retry after --no-history or an unreadable history saves new evidence even with the same updated time."""
+    from connectonion.useful_tools.adapter import record_reference, resolve_reference
+    source_dir = tmp_path / "docs" / "jira"
+    args = ["ALPHA", "ALPHA-1", "--output", str(source_dir), "--json"]
+    statuses = {"restricted": 403, "unavailable": 500, "none": 200}
+    first_args = args + ["--no-history"] if first_status is None else args
+    first_histories = {} if first_status is None else {"ALPHA-1": (statuses[first_status], [])}
+    first, _ = _sync_site(first_args, [_DRAFT], first_histories)
+    assert first.exit_code == 0, first.output
+    path = Path(json.loads(first.stdout)["jsonl"])
+    original = path.read_bytes()
+    old_record = json.loads(original)
+    reference = record_reference(path, old_record, tmp_path)
+
+    second, _ = _sync_site(args, [_DRAFT], {"ALPHA-1": (200, _EDITED)})
+    assert second.exit_code == 0, second.output
+    assert json.loads(second.stdout)["appended"] == 1
+    assert path.read_bytes().startswith(original)
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 2
+    assert records[0]["id"] == records[1]["id"]
+    assert records[0]["updated"] == records[1]["updated"]
+    assert records[1]["extensions"]["changelog"]["status"] == "ok"
+    assert records[1]["extensions"]["changelog"]["entries"]
+    assert resolve_reference(reference, tmp_path) == old_record
+    third, _ = _sync_site(args, [_DRAFT], {"ALPHA-1": (200, _EDITED)})
+    assert third.exit_code == 0, third.output
+    assert json.loads(third.stdout)["appended"] == 0
+
+
+def test_fetch_time_alone_does_not_append_or_change_the_citation(tmp_path):
+    """12-33: an identical re-read with a later fetched time deduplicates and still cites the stored snapshot."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, jira_issues_to_records, record_reference, resolve_reference,
+    )
+    first = jira_issues_to_records([_DRAFT], JIRA_URL, fetched="2026-10-12T10:00:00Z").records[0]
+    reread = jira_issues_to_records([_DRAFT], JIRA_URL, fetched="2026-10-12T11:00:00Z").records[0]
+    path, _ = append_daily_jsonl([first], tmp_path, date=datetime.date(2026, 10, 12), keep_versions=True)
+    assert append_daily_jsonl([reread], tmp_path, date=datetime.date(2026, 10, 12), keep_versions=True) == (path, 0)
+    assert record_reference(path, first, tmp_path) == record_reference(path, reread, tmp_path)
+    assert resolve_reference(record_reference(path, reread, tmp_path), tmp_path) == first
+
+
+def test_legacy_reference_keeps_the_first_stored_record(tmp_path):
+    """12-34: the old file#id format still reads, but later appends cannot move it to a new version."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records, resolve_reference
+    draft = jira_issues_to_records([_DRAFT], JIRA_URL, fetched=_FETCHED).records[0]
+    final = jira_issues_to_records([_FINAL], JIRA_URL, fetched=_FETCHED).records[0]
+    day = datetime.date(2026, 10, 12)
+    path, _ = append_daily_jsonl([draft], tmp_path, date=day, keep_versions=True)
+    reference = f"{path.relative_to(tmp_path).as_posix()}#{draft['id']}"
+    assert resolve_reference(reference, tmp_path) == draft
+    append_daily_jsonl([final], tmp_path, date=day, keep_versions=True)
+    assert resolve_reference(reference, tmp_path) == draft
+
+
+@pytest.mark.parametrize("version", ["", "short", "g" * 64, "0" * 64])
+def test_missing_or_invalid_snapshot_never_falls_back_to_another_record(tmp_path, version):
+    """12-35: a damaged or absent version must return None even when the file contains the requested id."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, jira_issues_to_records, record_reference, resolve_reference,
+    )
+    record = jira_issues_to_records([_DRAFT], JIRA_URL, fetched=_FETCHED).records[0]
+    path, _ = append_daily_jsonl([record], tmp_path, date=datetime.date(2026, 10, 12), keep_versions=True)
+    prefix = record_reference(path, record, tmp_path).rpartition("?version=")[0]
+    assert resolve_reference(f"{prefix}?version={version}", tmp_path) is None
+
+
+def test_record_key_order_does_not_create_a_new_snapshot(tmp_path):
+    """12-36: reordered JSON objects represent the same content, so re-reading them does not duplicate evidence."""
+    from connectonion.useful_tools.adapter import append_daily_jsonl, jira_issues_to_records, record_reference
+    record = jira_issues_to_records([_DRAFT], JIRA_URL, changelogs={"ALPHA-1": _outcome("ok", _EDITED)},
+                                   fetched=_FETCHED).records[0]
+    reordered = dict(reversed(list(record.items())))
+    reordered["extensions"] = dict(reversed(list(record["extensions"].items())))
+    day = datetime.date(2026, 10, 12)
+    path, _ = append_daily_jsonl([record], tmp_path, date=day, keep_versions=True)
+    assert append_daily_jsonl([reordered], tmp_path, date=day, keep_versions=True) == (path, 0)
+    assert record_reference(path, record, tmp_path) == record_reference(path, reordered, tmp_path)
+
+
+def test_more_history_at_the_same_updated_time_keeps_both_snapshots(tmp_path):
+    """12-37: history can gain entries without an issue edit; old citations and old lines stay intact."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, jira_issues_to_records, record_reference, resolve_reference,
+    )
+    histories = _EDITED + [_history("11", "2026-10-06T10:00:00Z", "priority", "Low", "High")]
+    partial = jira_issues_to_records([_DRAFT], JIRA_URL, changelogs={"ALPHA-1": _outcome("ok", _EDITED)},
+                                 fetched=_FETCHED).records[0]
+    complete = jira_issues_to_records([_DRAFT], JIRA_URL, changelogs={"ALPHA-1": _outcome("ok", histories)},
+                                  fetched=_FETCHED).records[0]
+    day = datetime.date(2026, 10, 12)
+    path, count = append_daily_jsonl([partial, complete, partial, complete], tmp_path, date=day, keep_versions=True)
+    assert count == 2
+    assert append_daily_jsonl([partial, complete], tmp_path, date=day, keep_versions=True) == (path, 0)
+    assert resolve_reference(record_reference(path, partial, tmp_path), tmp_path) == partial
+    assert resolve_reference(record_reference(path, complete, tmp_path), tmp_path) == complete
+
+
+def test_shared_writer_keeps_onenote_same_day_rule_and_its_citation(tmp_path):
+    """12-38: by default a changed same-day OneNote page is skipped (its import rule); versions are opt-in only."""
+    from connectonion.useful_tools.adapter import (
+        append_daily_jsonl, media_ref, onenote_pages_to_records, record_reference, resolve_reference,
+    )
+    page = dict(_ON1, scope={"sections": ["design"]}, media_fetch_references={"diagram": "attachment-1"})
+    first = onenote_pages_to_records([page], "fictional-account", fetched=_FETCHED).records[0]
+    enriched = onenote_pages_to_records(
+        [dict(page, media=[media_ref("diagram.png", "image/png", 2048)])], "fictional-account", fetched=_FETCHED,
+    ).records[0]
+    day = datetime.date(2026, 10, 12)
+    path, _ = append_daily_jsonl([first], tmp_path, date=day)
+    reference = record_reference(path, first, tmp_path)
+    assert append_daily_jsonl([enriched], tmp_path, date=day) == (path, 0)
+    assert resolve_reference(reference, tmp_path) == first
+    assert first["extensions"]["scope"] == {"sections": ["design"]}
+    assert first["extensions"]["media_fetch_references"] == {"diagram": "attachment-1"}
+    assert append_daily_jsonl([enriched], tmp_path, date=day, keep_versions=True) == (path, 1)
+    assert resolve_reference(reference, tmp_path) == first
+    assert resolve_reference(record_reference(path, enriched, tmp_path), tmp_path) == enriched

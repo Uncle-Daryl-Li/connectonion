@@ -2521,7 +2521,8 @@ def _jira_issues(
 @jira_app.command(
     "sync",
     epilog="Example:  co jira sync ALPHA ALPHA-1 ALPHA-2  |  co jira sync ALPHA ALPHA-1 --output ~/my/dir --json"
-           "  |  co jira sync ALPHA ALPHA-1 ALPHA-2 --export ALPHA-history-2026-10-12",
+           "  |  co jira sync ALPHA ALPHA-1 ALPHA-2 --export ALPHA-history-2026-10-12"
+           "  |  co jira sync ALPHA ALPHA-1 --no-history",
 )
 def _jira_sync(
     project_key: str = typer.Argument(..., help="Jira project key, e.g. ALPHA"),
@@ -2538,15 +2539,21 @@ def _jira_sync(
         help="One-off import: write exports/<ID>/ (records.jsonl + manifest.json) instead of today's daily file",
         show_default=False,
     ),
+    history: bool = typer.Option(
+        True,
+        "--history/--no-history",
+        help="Also read each issue's change history (one extra read per issue); --no-history skips it",
+    ),
     as_json: bool = typer.Option(False, "--json", help="Output result as JSON"),
 ):
-    """Verify credentials, collect selected issues, write source.yaml and the records for co rem.
+    """Verify credentials, collect selected issues and their history, write source.yaml and the records for co rem.
 
-    Runs the full workflow: verify → issue_items → write_source_yaml → records → daily/ (ongoing)
-    or exports/<ID>/ with --export (one-off import).
+    Runs the full workflow: verify → issue_items → change history → write_source_yaml → records → daily/
+    (ongoing) or exports/<ID>/ with --export (one-off import).
     """
     from .commands.jira_commands import handle_jira_sync
-    handle_jira_sync(project_key, issue_keys, output_dir=output, as_json=as_json, export_id=export)
+    handle_jira_sync(project_key, issue_keys, output_dir=output, as_json=as_json, export_id=export,
+                     history=history)
 
 
 # OneNote (#1887): the notebooks `co auth microsoft` grants since 1.8.9.
