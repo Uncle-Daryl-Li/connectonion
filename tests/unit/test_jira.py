@@ -1963,10 +1963,11 @@ def test_jira_cli_sync_json_reports_rejected_items_and_exits_nonzero(tmp_path):
 
 
 def test_jira_cli_sync_text_mode_lists_rejected_items_on_stderr(tmp_path):
-    """16-20: human output still reports what was written, names each rejected item on stderr, exits 1."""
+    """16-20: a failed human import reports retained counts and rejected items on stderr only, exits 1."""
     result = _sync_with([_I1, {"key": "ALPHA-9", "fields": "broken"}], ["--output", str(tmp_path)])
     assert result.exit_code == 1
-    assert "Records mapped: 1  Records appended: 1" in result.stdout
+    assert result.stdout == ""
+    assert "Records mapped: 1  Records appended: 1" in result.stderr
     assert "1 item(s) were rejected" in result.stderr
     assert "jira:ALPHA-9" in result.stderr
 

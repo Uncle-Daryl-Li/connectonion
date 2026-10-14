@@ -26,6 +26,15 @@ MAX_CONTENT_RETRY_WAIT = 30
 TRANSIENT_CONTENT_STATUSES = {429, 503, 504}
 
 
+class InterruptedOneNoteImport(ProviderCredentialError):
+    """A fatal credential failure with valid records collected before the stop."""
+
+    def __init__(self, cause: ProviderCredentialError, partial_result: AdapterResult):
+        super().__init__(cause.code, str(cause).split("\nNext:", 1)[0], cause.next_command, cause.status)
+        self.partial_result = partial_result
+        self.saved_results = {}
+
+
 def _retry_delay(header: str | None, attempt: int) -> float:
     """Honor Retry-After seconds or HTTP-date; otherwise use exponential backoff."""
     if header:
@@ -80,6 +89,10 @@ class OneNoteSource:
                                           "co onenote source verify") from None
         except (TypeError, ValueError) as error:
             if isinstance(error, ProviderCredentialError):
+                if error.code == "provider_unavailable":
+                    raise ProviderCredentialError(error.code,
+                        "Microsoft OneNote is unavailable; wait before retrying and honor Retry-After if provided.",
+                        "co onenote source verify", status=error.status) from error
                 raise
             raise ValueError("OneNote returned malformed metadata. Retry the source command.") from None
         if not isinstance(result, dict):
@@ -172,10 +185,14 @@ class OneNoteSource:
         try:
             response = self._content_response(url)
         except httpx.RequestError:
-            raise ProviderCredentialError("unavailable", "Could not read the OneNote page. Retry the source command.",
+            raise ProviderCredentialError("unavailable", "Could not read the OneNote page. Check your network connection and retry the source command.",
                                           "co onenote source verify") from None
         if response.status_code != 200:
             code = {401: "reauth_required", 403: "permission_denied", 404: "not_found"}.get(response.status_code, "unavailable")
+            if response.status_code == 403:
+                raise ProviderCredentialError(code,
+                    "OneNote page permission denied (HTTP 403). Check your account's read access to the selected page.",
+                    "co onenote source pages --help", status=403)
             if response.status_code in TRANSIENT_CONTENT_STATUSES:
                 raise ProviderCredentialError(code,
                     f"OneNote page unavailable (HTTP {response.status_code}); retries exhausted. "
@@ -196,7 +213,12 @@ class OneNoteSource:
                 headers={"Authorization": f"Bearer {self._graph._get_access_token()}"},
                 timeout=TIMEOUT, follow_redirects=False)
             if response.status_code == 401 and not refreshed:
-                self._graph._access_token = self._graph._refresh_via_backend(self._graph._credentials.get("REFRESH_TOKEN"))
+                refresh_token = self._graph._credentials.get("REFRESH_TOKEN")
+                if not refresh_token:
+                    # Let _content report the 401 and login recovery; do not
+                    # attempt a broker refresh with an incomplete credential.
+                    return response
+                self._graph._access_token = self._graph._refresh_via_backend(refresh_token)
                 refreshed = True
                 response = httpx.request("GET", url,
                     headers={"Authorization": f"Bearer {self._graph._get_access_token()}"},
@@ -221,7 +243,7 @@ class OneNoteSource:
         scope = self.scope(notebook, section)
         account = self.verify_connection()["account"]
         result = AdapterResult()
-        for page_id in selected:
+        for index, page_id in enumerate(selected):
             try:
                 page = self.selected_page(page_id, scope)
                 content = self._content(page_id)
@@ -240,6 +262,10 @@ class OneNoteSource:
                 result.errors.update(adapted.errors)
             except ProviderCredentialError as error:
                 if error.code in {"reauth_required", "not_configured", "incomplete_record", "record_changed"}:
+                    if result.records:
+                        for pending in selected[index:]:
+                            result.errors[pending] = f"Not imported because OneNote authentication stopped: {error}"
+                        raise InterruptedOneNoteImport(error, result) from error
                     raise
                 result.errors[page_id] = str(error)
             except (ValueError, TypeError, AttributeError):
@@ -282,7 +308,12 @@ def sync_onenote(source: OneNoteSource, notebook: str, section: str, page_ids: l
     import shlex
     source_dir = Path(source_dir)
     target = prepare_import(source_dir, mode, export_id)
-    result = source.collect(notebook, section, page_ids)
+    interrupted = None
+    try:
+        result = source.collect(notebook, section, page_ids)
+    except InterruptedOneNoteImport as error:
+        result = error.partial_result
+        interrupted = error
     # No file should imply a successful import if all selected pages failed.
     if not result.records:
         return {"records": 0, "written": 0, "skipped": 0, "errors": result.errors,
@@ -292,4 +323,12 @@ def sync_onenote(source: OneNoteSource, notebook: str, section: str, page_ids: l
                "--mode", mode, "--output", str(source_dir)]
     if export_id:
         command.extend(["--export-id", export_id])
-    return write_import(result, source_dir, target, scope, mode, export_id, shlex.join(command))
+    summary = write_import(result, source_dir, target, scope, mode, export_id, shlex.join(command))
+    if interrupted is not None:
+        retry = "After co auth microsoft, retry the same notebook/section/page selection "
+        retry += ("with a new --export-id; the original export is preserved."
+                  if mode == "export" else "using the same --output; already stored IDs will be skipped.")
+        summary["note"] = " ".join(part for part in (summary["note"], retry) if part)
+        interrupted.saved_results = summary
+        raise interrupted
+    return summary

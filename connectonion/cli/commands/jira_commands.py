@@ -23,12 +23,39 @@ def _jira():
     return Jira()
 
 
-def _handle_error(exc: Exception, as_json: bool) -> None:
-    msg = str(exc).strip()
+def _failure_details(exc: Exception) -> tuple[str, str]:
+    """Classify typed failures without asking scripts to parse a message."""
+    from ...useful_tools.jira import JiraConfigError, JiraAuthError, JiraPermissionError
+
+    if isinstance(exc, OSError):
+        return "storage_error", "Check --output and directory permissions, then retry the Jira command."
+    if isinstance(exc, JiraAuthError):
+        return "reauth_required", (
+            "Create an API token at https://id.atlassian.com/manage-profile/security/api-tokens, "
+            "set JIRA_API_TOKEN temporarily in your shell, then retry this Jira command."
+        )
+    if isinstance(exc, JiraPermissionError):
+        return "permission_denied", "Check your account's read access to the selected Jira scope, then retry."
+    if isinstance(exc, JiraConfigError):
+        return "invalid_configuration", (
+            "Check JIRA_URL and JIRA_EMAIL and set JIRA_API_TOKEN temporarily; see co jira --help."
+        )
+    return "import_failed", ("Check the selected Jira scope and co jira --help, then retry; "
+                             "if the provider response remains invalid, contact your Jira administrator.")
+
+
+def _handle_error(exc: Exception, as_json: bool, *, scope: dict | None = None) -> None:
+    msg = "Could not read or write local Jira source files. Check --output and directory permissions." \
+        if isinstance(exc, OSError) else str(exc).strip()
+    code, recovery = _failure_details(exc)
+    result = {"error": msg, "exit_code": 1, "source": "jira", "scope": scope or {},
+              "error_code": code, "recovery_action": recovery}
     if as_json:
-        print(json.dumps({"error": msg, "exit_code": 1}))
+        print(json.dumps(result))
     else:
+        errors.print(f"Jira command failed (scope: {json.dumps(result['scope'])}).", markup=False)
         errors.print(msg, style="red", markup=False)
+        errors.print(f"Next: {recovery}", markup=False)
     sys.exit(1)
 
 
@@ -58,7 +85,7 @@ def handle_jira_projects(*, as_json: bool = False) -> None:
 
     JSON output: {"projects": [{"key": ..., "name": ...}, ...]}.
     Empty result: {"projects": []}.
-    Errors: exit 1; JSON mode returns {"error": ..., "exit_code": 1}; no token in output.
+    Errors: exit 1; JSON includes error, exit_code, source, scope, error_code and recovery_action.
     """
     from ...useful_tools.jira import JiraConfigError, JiraAuthError, JiraPermissionError
     try:
@@ -92,7 +119,7 @@ def handle_jira_issues(
     try:
         issues = _jira().issue_items(project_key, set(issue_keys))
     except (JiraConfigError, JiraAuthError, JiraPermissionError, ValueError) as exc:
-        _handle_error(exc, as_json)
+        _handle_error(exc, as_json, scope={"projects": [project_key], "issues": sorted(set(issue_keys))})
         return
     if as_json:
         print(json.dumps({"issues": issues}))
@@ -117,7 +144,7 @@ def handle_jira_sync(
 ) -> None:
     """Validate credentials, collect selected issues and their history, write source.yaml and the records.
 
-    Full workflow: verify → issue_items → issue_changelogs → write_source_yaml → jira_issues_to_records → placement.
+    Full workflow: verify → issue_items → issue_changelogs → jira_issues_to_records → write_source_yaml → placement.
     History (F13FCAKE-12): one extra read per issue, attached as extensions.changelog; history=False
     (--no-history) skips those reads and the records carry no changelog.
     Placement (F13FCAKE-11): ongoing sync → append_daily_jsonl(keep_versions=True) (daily/YYYY/MM/DD.jsonl);
@@ -142,16 +169,24 @@ def handle_jira_sync(
             export_target(output_dir, export_id)
         jira = _jira()
         info, issues, changelogs = _read_jira(jira, project_key, issue_keys, history)
-        jira.write_source_yaml(output_dir, [project_key], set(issue_keys))
         adapter_result = jira_issues_to_records(issues, info["site_url"], changelogs=changelogs)
+        if adapter_result.errors and not adapter_result.records:
+            _report_rejected(adapter_result.errors, as_json, project_key, issue_keys, None, None,
+                             len(issues), 0, 0, _history_counts([]) if history else None, export_id)
+            return
+        jira.write_source_yaml(output_dir, [project_key], set(issue_keys))
         jsonl_path, appended = _place_records(adapter_result.records, output_dir, export_id,
                                               {"projects": [project_key], "issues": sorted(set(issue_keys))})
-    except (JiraConfigError, JiraAuthError, JiraPermissionError, ValueError) as exc:
-        _handle_error(exc, as_json)
+    except (JiraConfigError, JiraAuthError, JiraPermissionError, ValueError, OSError) as exc:
+        _handle_error(exc, as_json, scope={"projects": [project_key], "issues": sorted(set(issue_keys))})
         return
     source_yaml = str(output_dir / "source.yaml")
     rejected = adapter_result.errors
     counts = _history_counts(adapter_result.records) if history else None
+    if rejected:
+        _report_rejected(rejected, as_json, project_key, issue_keys, source_yaml, jsonl_path,
+                         len(issues), len(adapter_result.records), appended, counts, export_id)
+        return
     if as_json:
         print(json.dumps({
             "written": source_yaml,
@@ -171,7 +206,6 @@ def handle_jira_sync(
               f"Records mapped: {len(adapter_result.records)}  Records appended: {appended}")
         _print_history(counts)
         print("Example: co rem sources")
-    _exit_if_rejected(rejected, as_json)
 
 
 # Every Jira read happens before any file is written, so an auth failure while reading history writes nothing.
@@ -210,11 +244,26 @@ def _place_records(records: list[dict], output_dir: Path, export_id: str | None,
 
 
 # Mapping errors (F13FCAKE-16) must reach the user: list each rejected item, then exit 1.
-def _exit_if_rejected(rejected: dict, as_json: bool) -> None:
-    if not rejected:
-        return
-    if not as_json:
-        errors.print(f"{len(rejected)} item(s) were rejected and not written:", style="red", markup=False)
+def _report_rejected(rejected, as_json, project, issue_keys, source_yaml, jsonl_path,
+                     collected, mapped, appended, counts, export_id) -> None:
+    recovery = "Review the rejected Jira items and retry; keep --output for daily imports or use a new --export ID."
+    message = ("Some selected Jira items could not be imported; valid results are retained." if mapped else
+               "No valid Jira records were processed; no new import files were written.")
+    report = {"error": message,
+              "exit_code": 1, "source": "jira", "scope": {"projects": [project], "issues": sorted(set(issue_keys))},
+              "error_code": "partial_import" if mapped else "processing_failed", "recovery_action": recovery, "written": source_yaml,
+              "placement": "export" if export_id else "daily", "jsonl": str(jsonl_path) if jsonl_path else None, "project": project,
+              "issues": collected, "mapped": mapped, "appended": appended, "history": counts, "rejected": rejected}
+    if as_json:
+        print(json.dumps(report))
+    else:
+        errors.print(f"Jira import failed (scope: {json.dumps(report['scope'])}).", markup=False)
+        errors.print(message, markup=False)
+        if jsonl_path:
+            errors.print(f"Valid records retained: {mapped}; newly appended: {appended}. Saved to: {jsonl_path}", markup=False)
+        errors.print(f"Records mapped: {mapped}  Records appended: {appended}", markup=False)
+        errors.print(f"{len(rejected)} item(s) were rejected and not written:", markup=False)
         for label, reason in rejected.items():
-            errors.print(f"  {label}: {reason}", markup=False)
+            errors.print(f"Rejected {label}: {reason}", markup=False)
+        errors.print(f"Next: {recovery}", markup=False)
     sys.exit(1)
