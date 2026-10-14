@@ -38,15 +38,21 @@ representative import/recovery flows. Check output, exit codes and saved records
 not only whether a command finishes. Never manufacture live throttling or expose
 credentials to demonstrate an error.
 
-| Area | What was checked | Evidence |
-| --- | --- | --- |
-| Functional / related features | Discovery, selected import, repeat import, exports, shared record consumers and cross-source isolation | Automated; representative live discovery/import/repetition |
-| Negative / permission | Invalid arguments/scope, authentication, permission, malformed metadata/content and storage failure | Automated; live Jira authentication and OneNote invalid-scope recovery |
-| Pagination / rate / network | Multiple pages, loop/foreign-link guards, bounded retry and actionable failure feedback | Automated |
-| Valid results / recovery | Valid empty success, partial results retained, all-failed outcomes, retry without losing saved data | Automated; saved-file comparisons and corrected live retries |
-| Privacy / machine output | Safe messages/configuration, source/scope, stable JSON fields, stdout/stderr separation and Unicode compatibility | Automated; live JSON parsing and redacted records |
-| Volume | 100/1000 items per source, accurate unique counts, repeat writes zero and oversized OneNote selection rejected | Synthetic volume checks, not a production performance SLA |
-| UX / demo | Clear failure cause and next action; successful import and recoverable failure per source | Automated and live CLI rehearsal; formal demo pending |
+AC numbers follow the order of the Story's acceptance criteria. Verified means
+the cited checks passed, not that team approval or the formal demo is complete.
+
+| AC | Story acceptance criterion | Corresponding checks / evidence | Status |
+| --- | --- | --- | --- |
+| AC1 | Authentication, permission, pagination, rate-limit, network, empty and malformed-content failures have defined outcomes. | Automated checks for all listed categories; defined error/empty/partial outcomes in the [CLI contract](../cli/import-failure-feedback.md) | Verified |
+| AC2 | Messages identify the affected source or scope and a recovery action without exposing secrets. | JSON/human source, scope and recovery assertions; synthetic-secret checks; representative manual failure feedback | Verified |
+| AC3 | A failed item or source does not erase or misrepresent valid processed results. | Mixed/all-failed batches, interrupted OneNote imports, shared-consumer/cross-source isolation and accurate counts; manual saved-file comparisons and corrected retries | Verified |
+| AC4 | Functional, non-functional, performance or volume, related-feature and UX or recovery checks are in the test matrix. | Functional imports; privacy/output non-functional checks; 100/1000-item synthetic volume; shared consumers/isolation; recovery flows, documented in [test results](sprint1-test-results.md#automated-coverage-and-outcomes) | Coverage documented; team matrix review pending |
+| AC5 | Each defect records severity, owner, status and retest result before the demo. | [Defect and retest register](sprint1-test-results.md#defect-and-retest-register) lists 14 fixed/retested groups with severity and proposed component owners | Actual owner assignment and team confirmation pending |
+| AC6 | The demo contains at least one successful flow and one recoverable failure. | [Manual Jira](sprint1-test-results.md#manual-live-jira-results) and [OneNote](sprint1-test-results.md#manual-live-onenote-results) success/failure/recovery sequences completed | Representative flows verified; formal demo pending |
+| AC7 | Invalid input, authentication/permission failure, rate limiting and unrecoverable processing failure return documented non-zero exit codes. | Parser, fatal-category and mixed/all-item processing tests; [documented exit codes](../cli/import-failure-feedback.md#output-and-exit-codes): parser 2, fatal 1, item failures Jira 1 / OneNote 2 | Verified |
+| AC8 | Valid empty results remain distinguishable and do not masquerade as failures. | Automated valid-empty listing/content checks; manual empty OneNote discovery returned valid JSON and exit 0 | Verified |
+| AC9 | Human-readable errors are separated from machine-readable output; JSON mode returns a stable error object containing source/scope, error code and recovery action without secrets. | stdout/stderr separation, repeated stable JSON fields, scope/code/recovery and synthetic-secret assertions; live JSON parsing, including multilingual output | Verified |
+| AC10 | Automated tests cover pagination, authentication/permission failure, empty result, rate limiting, malformed content and exit-code/output behaviour. | [Automated coverage and added tests](sprint1-test-results.md#automated-coverage-and-outcomes); final related regression: 424 passed | Verified |
 
 ## Decisions to confirm with the team
 
@@ -63,7 +69,7 @@ credentials to demonstrate an error.
 - [ ] Review the Story branch/MR and merge the accepted changes.
 - [ ] Present a successful import and a recoverable failure in the formal demo.
 
-Story key / branch: `F13FCAKE-17` (remote push pending).
+Story key / branch: `F13FCAKE-17` (pushed to origin).
 Team reviewer(s): pending. Review outcome: pending.
 Fix commit: `356eb88b`. MR / merge: pending. Formal demo outcome: pending.
 

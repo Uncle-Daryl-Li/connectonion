@@ -156,7 +156,7 @@ The color test was not changed or suppressed, and is not counted as passed.
   memory or internet throughput. No timing guarantee is claimed.
 - No frontend import, automatic rem registration or complete security audit was
   performed.
-- Team matrix approval, individual owner assignment, remote push/MR/merge and
+- Team matrix approval, individual owner assignment, MR/merge and
   formal demo remain pending; use the [review summary](sprint1-review-summary.md).
 
 To rerun the recorded related selection from the project directory:
