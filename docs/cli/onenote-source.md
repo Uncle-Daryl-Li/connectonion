@@ -118,14 +118,64 @@ Daily output can be read by the existing source-agnostic
 | --- | --- |
 | 0 | Successful verification/listing/import, including valid empty listings |
 | 1 | Fatal authentication, scope, local storage or malformed listing failure |
-| 2 | One or more selected pages failed; valid pages were retained |
+| 2 | Parser usage error, or one/more selected page failures (including all failed); distinguish by `error_code` |
 
-`--json` produces a single JSON object on stdout. Partial failures are keyed by
-page ID. Missing, removed, inaccessible or malformed pages do not abort other
-valid pages. Authentication expiration that cannot be refreshed aborts with
-`co auth microsoft` recovery guidance. No provider response bodies or tokens are
+`--json` produces a single JSON object on stdout.
+Non-ASCII names, titles and error scopes use standard JSON Unicode
+escapes on stdout. JSON parsers recover their original values; this prevents
+Windows legacy-codepage native pipes from corrupting UTF-8 characters or JSON
+syntax. UTF-8 import files are unchanged. Partial
+failures are keyed by page ID. Missing, removed, inaccessible or malformed pages do not abort other
+valid pages. Authentication expiration that cannot be refreshed stops further
+reads with `co auth microsoft` recovery guidance. If valid pages were already
+processed, those records are saved before the failure is reported. No provider response bodies or tokens are
 printed. If every selected page fails, no import files are created. Corrupted
 existing JSONL is preserved and no records are appended.
+
+Fatal and page-level failure reports return `source: "onenote"`, `scope`, `error_code` and
+`recovery_action`, alongside the existing string `error` and numeric `exit_code`.
+The requested notebook, section and explicit pages are retained in `scope` even
+if authentication fails before discovery; account-level verify/notebooks failures
+use `{}`. These fields contain no credential values or raw provider responses.
+For example, an unrefreshable HTTP 401 during a selected import returns:
+
+```json
+{
+  "error": "Microsoft authorization expired.\nNext: co auth microsoft",
+  "exit_code": 1,
+  "source": "onenote",
+  "scope": {"notebook": "nb-test", "section": "section-test", "pages": ["page-test"]},
+  "error_code": "reauth_required",
+  "recovery_action": "co auth microsoft"
+}
+```
+
+Provider credential errors preserve their typed code and recovery command
+(for example `permission_denied` or `missing_scope`). Local I/O/YAML failures use
+`storage_error`; remaining validation/processing errors use `import_failed`.
+Human-readable failure feedback names OneNote and the selected scope on stderr;
+failed imports do not print a success-looking summary to stdout. Successful JSON
+is unchanged; failure reports keep their existing counters and add the structured
+error fields. Page-level partial success uses `partial_import`; zero valid pages
+uses `processing_failed`, null saved paths and an explicit no-new-files message.
+Both retain exit 2. Parser errors use `invalid_input`, exit 2 and a safe
+command-level scope with a runnable help command, without echoing invalid values.
+This applies to the `co onenote source` command group/children, not the unrelated
+OneNote editing commands. See [cross-source error contract](import-failure-feedback.md).
+
+An authentication failure after valid pages were processed still exits **1**,
+but its fatal error object also includes the saved `records`, `written`,
+`skipped`, `jsonl`, `source_yaml`, per-page `errors`, and a recovery `note`.
+Human mode reports the saved count/path and IDs that were not imported on
+stderr. This is not complete success and does not use the ordinary page-level
+failure exit 2. A first-request authentication failure creates no import files.
+
+After reconnecting, retry the same notebook/section/page selection. For daily
+mode use the same `--output`; already saved IDs are skipped. For export mode use
+a **new `--export-id`**: the partial export is retained and is never overwritten.
+The JSON `note` and human feedback state this difference explicitly. An expired
+access token without a refresh token is a reauthentication failure, not malformed
+HTML, and does not trigger a broker request with missing credentials.
 
 Page HTML reads retry HTTP 429, 503 and 504 at most twice (three transient
 attempts, plus at most one authentication refresh request). The collector honors

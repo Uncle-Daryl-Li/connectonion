@@ -139,12 +139,15 @@ class Jira:
                 f"Jira returned an unexpected HTTP {response.status_code} response."
             ) from exc
         try:
-            return response.json()
+            data = response.json()
         except Exception as exc:
             raise ValueError(
                 "Jira returned a response that could not be parsed as JSON. "
                 "Try again or contact your Jira administrator."
             ) from exc
+        if not isinstance(data, dict):
+            raise ValueError("Jira returned malformed metadata instead of a JSON object. Retry or contact your Jira administrator.")
+        return data
 
     def verify_connection(self) -> dict:
         """GET /rest/api/3/myself — confirms credentials; returns accountId, displayName, site_url.
@@ -153,6 +156,9 @@ class Jira:
         emailAddress is included only when Jira returns it (privacy settings may omit it).
         """
         data = self._get("myself")
+        if (not isinstance(data.get("accountId"), str) or not data["accountId"]
+                or not isinstance(data.get("displayName"), str)):
+            raise ValueError("Jira returned malformed account metadata. Retry or contact your Jira administrator.")
         result: dict = {
             "accountId": data["accountId"],
             "displayName": data["displayName"],
@@ -261,8 +267,14 @@ class Jira:
                     f"Jira returned 403 for project {project_key!r}. "
                     "Check that your API token has read access to this project."
                 ) from None
-            results.extend(page.get("issues", []))
+            batch = page.get("issues", [])
+            if (not isinstance(batch, list) or any(not isinstance(issue, dict)
+                    or not isinstance(issue.get("key"), str) for issue in batch)):
+                raise ValueError("Jira returned malformed issue metadata. Retry or contact your Jira administrator.")
+            results.extend(batch)
             next_token = page.get("nextPageToken")
+            if next_token is not None and (not isinstance(next_token, str) or not next_token):
+                raise ValueError("Jira returned malformed pagination metadata. Retry or contact your Jira administrator.")
             if next_token is None:
                 returned_keys = {issue.get("key", "") for issue in results}
                 missing_keys = selected_issue_keys - returned_keys
@@ -275,9 +287,8 @@ class Jira:
                 return results
             if next_token in seen_tokens:
                 raise ValueError(
-                    f"Jira issue pagination cursor did not advance "
-                    f"(repeated nextPageToken={next_token!r}). "
-                    "Aborting to prevent an infinite loop."
+                    "Jira issue pagination cursor did not advance. "
+                    "Aborting to prevent an infinite loop; retry or contact your Jira administrator."
                 )
             seen_tokens.add(next_token)
 

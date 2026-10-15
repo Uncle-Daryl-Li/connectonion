@@ -74,7 +74,7 @@ def _typer_app(**kwargs) -> typer.Typer:
     The doubling above was present on all twelve groups, and a fix applied at
     the call sites is a fix that the thirteenth group will not get.
     """
-    return typer.Typer(cls=_OneSuggestion, **kwargs)
+    return typer.Typer(cls=kwargs.pop("cls", _OneSuggestion), **kwargs)
 
 
 # pretty_exceptions_show_locals defaults to True in Typer, which dumps every
@@ -2482,14 +2482,17 @@ app.add_typer(mcp_app, name="mcp")
 
 
 # Jira (F13FCAKE-9/10/18): verify, list projects, and read selected issues.
+from .commands.import_feedback import ImportFeedbackCommand, ImportFeedbackGroup
+
 jira_app = _typer_app(
+    cls=ImportFeedbackGroup,
     help="Verify Jira access, list projects, and read selected issues. JIRA_URL and JIRA_EMAIL can be set with 'co env set'. JIRA_API_TOKEN must be supplied only as a temporary, non-persistent shell environment variable; use the no-echo setup procedure documented in the Jira Skill, then unset it after the command.",
     epilog="Examples: co jira verify; co jira projects --json; co jira issues ALPHA ALPHA-1 --json",
 )
 app.add_typer(jira_app, name="jira")
 
 
-@jira_app.command("verify", epilog="Example:  co jira verify --json")
+@jira_app.command("verify", cls=ImportFeedbackCommand, epilog="Example:  co jira verify --json")
 def _jira_verify(
     as_json: bool = typer.Option(False, "--json", help="Output connection info as JSON"),
 ):
@@ -2498,7 +2501,7 @@ def _jira_verify(
     handle_jira_verify(as_json=as_json)
 
 
-@jira_app.command("projects", epilog="Example:  co jira projects --json")
+@jira_app.command("projects", cls=ImportFeedbackCommand, epilog="Example:  co jira projects --json")
 def _jira_projects(
     as_json: bool = typer.Option(False, "--json", help="Output project list as JSON"),
 ):
@@ -2507,7 +2510,7 @@ def _jira_projects(
     handle_jira_projects(as_json=as_json)
 
 
-@jira_app.command("issues", epilog="Example:  co jira issues ALPHA ALPHA-1 ALPHA-2 --json")
+@jira_app.command("issues", cls=ImportFeedbackCommand, epilog="Example:  co jira issues ALPHA ALPHA-1 ALPHA-2 --json")
 def _jira_issues(
     project_key: str = typer.Argument(..., help="Jira project key, e.g. ALPHA"),
     issue_keys: list[str] = typer.Argument(..., help="One or more issue keys, e.g. ALPHA-1 ALPHA-2"),
@@ -2520,6 +2523,7 @@ def _jira_issues(
 
 @jira_app.command(
     "sync",
+    cls=ImportFeedbackCommand,
     epilog="Example:  co jira sync ALPHA ALPHA-1 ALPHA-2  |  co jira sync ALPHA ALPHA-1 --output ~/my/dir --json"
            "  |  co jira sync ALPHA ALPHA-1 ALPHA-2 --export ALPHA-history-2026-10-12"
            "  |  co jira sync ALPHA ALPHA-1 --no-history",

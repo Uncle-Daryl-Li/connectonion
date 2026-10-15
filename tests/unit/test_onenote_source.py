@@ -206,12 +206,28 @@ def test_content_long_retry_after_reports_failure_without_sleeping_or_retrying_e
 def test_content_refresh_can_recover_without_discarding_page(graph, monkeypatch):
     from connectonion.useful_tools.outlook import Outlook
     refreshed = []
+    monkeypatch.setenv("MICROSOFT_REFRESH_TOKEN", "fixture-refresh")
     monkeypatch.setattr(Outlook, "_refresh_via_backend", lambda self, rt: refreshed.append(rt) or "fresh")
     routes, _ = graph
     responses = iter([(401, "private"), HTML])
     routes["/me/onenote/pages/page-good/content"] = lambda: next(responses)
     result = OneNoteSource().collect("nb-fixture", "section-fixture", ["page-good"])
-    assert len(result.records) == 1 and not result.errors and len(refreshed) == 1
+    assert len(result.records) == 1 and not result.errors and refreshed == ["fixture-refresh"]
+
+
+def test_content_auth_failure_without_refresh_requires_login(graph, monkeypatch):
+    """A missing refresh credential is authentication failure, not malformed content."""
+    from connectonion.useful_tools.outlook import Outlook
+    monkeypatch.delenv("MICROSOFT_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr(Outlook, "_refresh_via_backend",
+                        lambda *args: pytest.fail("Must not call the refresh broker without a refresh token"))
+    routes, _ = graph
+    routes["/me/onenote/pages/page-good/content"] = (401, "fixture-secret-token")
+    with pytest.raises(ProviderCredentialError) as error:
+        OneNoteSource().collect("nb-fixture", "section-fixture", ["page-good"])
+    assert error.value.code == "reauth_required"
+    assert error.value.next_command == "co auth microsoft"
+    assert "fixture-secret-token" not in str(error.value)
 
 
 def test_cli_help_and_json_partial_import(graph, tmp_path):
