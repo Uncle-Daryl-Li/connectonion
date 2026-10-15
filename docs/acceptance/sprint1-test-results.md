@@ -2,7 +2,8 @@
 
 ## Scope and overall result
 
-Baseline: `0a0c1269`; fixes and tests committed as `356eb88b` on `F13FCAKE-17`.
+Baseline: `0a0c1269`; initial fixes/tests are in `356eb88b` on `F13FCAKE-17`.
+The subsequent Typer compatibility correction is tracked in the same branch.
 These are recorded completed
 runs; consolidating the documents does not rerun tests. Automated checks use
 synthetic HTTP, isolated credentials/homes and temporary storage. Manual live
@@ -10,9 +11,13 @@ checks were performed by the tester through CLI commands and saved-result
 inspection. No test account,
 email, site address, resource ID, notebook name or raw private content is included.
 
-**Final related regression: 424 passed, exit 0, no warnings or skipped tests.**
-This consists of 405 import/provider cases and 19 CLI-help cases: 114 added test
+**Final related regression: 449 passed under Typer 0.20.0 and separately under
+Typer 0.27.3, exit 0, no warnings or skipped tests in either run.**
+This consists of 430 import/provider cases and 19 CLI-help cases: 139 added test
 instances and 310 existing cases. It is not a full-repository test pass.
+The newer Typer was loaded from an isolated temporary dependency directory;
+the project virtual environment and lockfile were not upgraded. Run the same
+selection under each intended Typer runtime when repeating compatibility checks.
 
 Representative manual checks are complete for both sources: connection,
 selected import, repeated import, recoverable failure, preservation of saved
@@ -41,6 +46,7 @@ Other live failure scenarios remain subject to the verification boundaries.
 | Volume | Both sources persist 100/1000 unique items correctly; repeated imports write zero new items; 1001 selected OneNote pages rejected before remote access | Pass |
 | Related features / UX | Shared consumers, namespaced IDs and cross-source isolation work; retained counts and recovery actions are visible | Pass |
 | CLI compatibility | Existing CLI-help cases remain valid after import-parser changes | Pass |
+| Typer compatibility | Three usage-error handlers resolve the correct exception class for legacy/vendored Click; invalid arguments remain safe and help exits 0 without relying on `typer.core.click` | Pass under both tested runtimes |
 
 ### Added tests
 
@@ -50,6 +56,7 @@ Other live failure scenarios remain subject to the verification boundaries.
 | `tests/unit/test_onenote_source.py` | 1: unrefreshable content authentication failure; an existing positive refresh test was also strengthened |
 | `tests/unit/test_onenote_source_commands.py` | 4: multilingual success/error JSON through legacy Windows decoding |
 | `tests/e2e/cli/test_import_failure_contract.py` | 87: 28 fatal-category checks, 20 parser checks, 8 mixed/all malformed checks, 14 Jira metadata-shape checks, 12 OneNote page-failure checks, 4 volume checks and 1 selection-bound check |
+| `tests/unit/test_import_feedback.py` | 25: 20 safe invalid-argument cases, 4 group/leaf help cases and 1 unexpected-exception passthrough case when the feature has no `core.click` alias |
 
 The existing Jira human-rejection test retains its count/item assertions and now
 checks stderr with empty stdout, matching the updated failure-output contract.
@@ -69,7 +76,10 @@ checks stderr with empty stdout, matching the updated failure-output contract.
 | Initial final-round contract checks | 16 failed, 25 passed; mixed/all malformed extension also reproduced 8 failures |
 | Metadata-shape / zero-valid review extension | 18 failed, 4 passed; subsequent 67-case stage passed |
 | Specific page-recovery review extension | 10 failed, 2 passed; safe diagnostic/action fixes applied |
-| Final combined related regression | 424 passed, exit 0, no warnings/skips |
+| Previous combined regression (Typer 0.20.0) | 424 passed; did not establish compatibility with newer Typer |
+| Teammate-reported Typer regression | 402 passed, 22 failed: 20 invalid-argument and 2 help tests; independently reproduced under Typer 0.27.3 |
+| Missing-alias regression before correction | All 25 new cases failed, exposing the unsupported `typer.core.click` dependency |
+| Corrected combined regression | 449 passed per runtime under Typer 0.20.0 and 0.27.3; exit 0, no warnings/skips |
 
 One intermediate stability test summed retry waits across two commands against
 one command's limit. It was corrected to assert each command's bound separately.
@@ -114,7 +124,7 @@ same-day changed pages are skipped rather than incrementally refreshed.
 
 ## Defect and retest register
 
-All 14 groups below are **fixed locally and retested**, with team review pending.
+All 15 groups below are **fixed locally and retested**, with team review pending.
 Owners are proposed component roles, not assigned people; the team must fill in
 actual names before the demo. Severity is provisional: High concerns discarded
 valid new results; Medium concerns failure/output/recovery requirements; Low is
@@ -137,6 +147,7 @@ real credentials were disclosed.
 | FEEDBACK-D05 | Parser errors lacked JSON and echoed invalid values → safe parser error object/help | Medium | Import CLI | Fixed locally; review pending | All 20 parser variants pass |
 | FEEDBACK-D06 | Partial/all failure output misrepresented results → structured reports, stderr, zero-valid/no-files distinction | Medium | Jira / OneNote CLI | Fixed locally; review pending | Eight malformed mixed/all variants pass |
 | FEEDBACK-D07 | OneNote human page failures lacked reasons/actions → per-page diagnostics and permission/wait/network guidance | Medium | OneNote source / CLI | Fixed locally; review pending | All 12 page-failure variants pass |
+| FEEDBACK-D08 | Three handlers used the absent `typer.core.click` alias on newer Typer → import the runtime's UsageError with a legacy Click fallback | Medium | Import CLI | Fixed locally; review pending | Original 22 failures resolved; expanded 449-case selection passes under Typer 0.20.0 and 0.27.3 |
 
 ## Known limitation from the extra CLI check
 
@@ -162,6 +173,6 @@ The color test was not changed or suppressed, and is not counted as passed.
 To rerun the recorded related selection from the project directory:
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m pytest tests/e2e/cli/test_import_failure_contract.py tests/e2e/cli/test_import_auth_failure_feedback.py tests/unit/test_onenote_source_commands.py tests/unit/test_jira.py tests/unit/test_jira_adf.py tests/unit/test_onenote_source_auth.py tests/unit/test_onenote_source_scope.py tests/unit/test_onenote_source.py tests/unit/test_onenote.py tests/unit/test_provider_credentials.py tests/e2e/cli/test_cli_help.py -q -p no:cacheprovider
+.\.venv\Scripts\python.exe -X utf8 -m pytest tests/unit/test_import_feedback.py tests/e2e/cli/test_import_failure_contract.py tests/e2e/cli/test_import_auth_failure_feedback.py tests/unit/test_onenote_source_commands.py tests/unit/test_jira.py tests/unit/test_jira_adf.py tests/unit/test_onenote_source_auth.py tests/unit/test_onenote_source_scope.py tests/unit/test_onenote_source.py tests/unit/test_onenote.py tests/unit/test_provider_credentials.py tests/e2e/cli/test_cli_help.py -q -p no:cacheprovider
 $LASTEXITCODE
 ```

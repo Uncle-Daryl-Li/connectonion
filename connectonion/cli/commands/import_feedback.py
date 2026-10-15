@@ -4,6 +4,11 @@ import json
 
 import typer
 
+try:
+    from typer._click.exceptions import UsageError
+except ImportError:
+    from click import UsageError
+
 from ..typer_groups import _OneSuggestion
 
 
@@ -35,7 +40,7 @@ class ImportFeedbackCommand(typer.core.TyperCommand):
         original = list(args)
         try:
             return super().parse_args(ctx, args)
-        except typer.core.click.UsageError:
+        except UsageError:
             _invalid_arguments(ctx, original)
 
 
@@ -46,12 +51,12 @@ class ImportFeedbackGroup(_OneSuggestion):
         original = list(args)
         try:
             return super().parse_args(ctx, args)
-        except typer.core.click.UsageError:
+        except UsageError:
             _invalid_arguments(ctx, original)
 
     def resolve_command(self, ctx, args):
         original = list(args)
         try:
             return super().resolve_command(ctx, args)
-        except typer.core.click.UsageError:
+        except UsageError:
             _invalid_arguments(ctx, original)
