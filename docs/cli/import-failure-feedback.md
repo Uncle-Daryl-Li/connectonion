@@ -59,8 +59,4 @@ batches no longer create an empty JSONL/source declaration. OneNote page-level
 failures keep exit 2; scripts should use `error_code` to distinguish them from
 parser errors, rather than guessing from the exit code alone.
 
-Verification and limitations are recorded in the
-[Sprint 1 review summary](../acceptance/sprint1-review-summary.md) and
-[consolidated test results](../acceptance/sprint1-test-results.md). Synthetic volume
-checks are not production latency or memory guarantees. Team review and final
-demo remain separate requirements.
+Synthetic volume checks are not production latency or memory guarantees.
