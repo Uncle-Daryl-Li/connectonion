@@ -1,0 +1,6 @@
+{
+  "co jira verify": "jira_verify.txt",
+  "co jira projects": "jira_projects.txt",
+  "co jira projects --json": "jira_projects_json.json",
+  "co jira issues ALPHA ALPHA-1 ALPHA-2": "jira_issues.txt"
+}

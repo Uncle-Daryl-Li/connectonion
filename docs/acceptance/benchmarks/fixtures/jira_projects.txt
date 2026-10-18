@@ -1,0 +1,5 @@
+KEY     NAME                         TYPE
+------  ---------------------------  -------
+ALPHA   Alpha Demo Project           software
+BETA    Beta Integration Suite       software
+GAMMA   Gamma Operations Board       business

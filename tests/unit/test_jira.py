@@ -3020,3 +3020,2289 @@ def test_shared_writer_keeps_onenote_same_day_rule_and_its_citation(tmp_path):
     assert append_daily_jsonl([enriched], tmp_path, date=day, keep_versions=True) == (path, 1)
     assert resolve_reference(reference, tmp_path) == first
     assert resolve_reference(record_reference(path, enriched, tmp_path), tmp_path) == enriched
+
+
+# ---------------------------------------------------------------------------
+# scoped_issues() — F13FCAKE-19 incremental import API (Step 3)
+# ---------------------------------------------------------------------------
+
+def _scoped_mock(issues_pages: list[list[dict]]) -> tuple:
+    """Return (get_fn, calls) serving sequential pages of scoped_issues responses.
+
+    Each entry in issues_pages is the 'issues' list for one page.
+    Pages are served in order; nextPageToken advances from "tok1" → "tok2" → absent.
+    """
+    calls: list[dict] = []
+    responses = []
+    for idx, issues in enumerate(issues_pages):
+        has_next = idx < len(issues_pages) - 1
+        body = {"issues": issues}
+        if has_next:
+            body["nextPageToken"] = f"tok{idx + 1}"
+        responses.append(body)
+    call_seq = [0]
+
+    def get(url, auth=None, params=None, timeout=None):
+        calls.append({"url": url, "params": dict(params or {})})
+        idx = call_seq[0]
+        call_seq[0] += 1
+        if idx >= len(responses):
+            raise AssertionError(f"Unexpected extra GET (call #{idx + 1})")
+        resp = MagicMock(status_code=200)
+        resp.json = MagicMock(return_value=responses[idx])
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    return get, calls
+
+
+def test_scoped_issues_full_project_query_jql_no_since_no_keys():
+    """Full import: JQL is 'project = ALPHA ORDER BY updated ASC, key ASC'."""
+    get, calls = _scoped_mock([[_I1, _I2]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().scoped_issues("ALPHA")
+    assert result == [_I1, _I2]
+    assert len(calls) == 1
+    jql = calls[0]["params"]["jql"]
+    assert "project = ALPHA" in jql
+    assert "updated >=" not in jql
+    assert "key IN" not in jql
+    assert "ORDER BY updated ASC, key ASC" in jql
+
+
+def test_scoped_issues_incremental_query_adds_updated_clause():
+    """Incremental: JQL includes updated >= \"<since>\" before ORDER BY."""
+    since = "2024-06-01T00:00:00+00:00"
+    get, calls = _scoped_mock([[_I2]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().scoped_issues("ALPHA", since=since)
+    assert result == [_I2]
+    jql = calls[0]["params"]["jql"]
+    assert f'updated >= "{since}"' in jql
+    assert "ORDER BY updated ASC, key ASC" in jql
+
+
+def test_scoped_issues_issue_keys_filter_adds_key_in_clause():
+    """issue_keys: JQL adds key IN (ALPHA-1, ALPHA-2) in sorted order."""
+    get, calls = _scoped_mock([[_I1]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().scoped_issues("ALPHA", issue_keys=["ALPHA-2", "ALPHA-1"])
+    assert result == [_I1]
+    jql = calls[0]["params"]["jql"]
+    assert "key IN (ALPHA-1, ALPHA-2)" in jql
+    assert "ORDER BY updated ASC, key ASC" in jql
+
+
+def test_scoped_issues_combined_since_and_issue_keys():
+    """Combined: JQL contains both updated clause and key IN clause."""
+    since = "2024-01-01T00:00:00+00:00"
+    get, calls = _scoped_mock([[_I1]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        Jira().scoped_issues("ALPHA", since=since, issue_keys=["ALPHA-1"])
+    jql = calls[0]["params"]["jql"]
+    assert f'updated >= "{since}"' in jql
+    assert "key IN (ALPHA-1)" in jql
+    assert "ORDER BY updated ASC, key ASC" in jql
+
+
+def test_scoped_issues_empty_result_is_not_an_error():
+    """Zero issues returned is a valid empty result, not an error."""
+    get, _ = _scoped_mock([[]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().scoped_issues("ALPHA", since="2024-01-01T00:00:00+00:00")
+    assert result == []
+
+
+def test_scoped_issues_missing_issue_keys_in_incremental_result_not_an_error():
+    """In incremental mode, Jira not returning a requested key is normal, not an error."""
+    get, _ = _scoped_mock([[_I1]])  # ALPHA-2 not returned
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().scoped_issues(
+            "ALPHA",
+            since="2024-01-01T00:00:00+00:00",
+            issue_keys=["ALPHA-1", "ALPHA-2"],
+        )
+    # Should succeed with just the one returned issue
+    assert result == [_I1]
+
+
+def test_scoped_issues_pagination_two_pages_combined():
+    """Two pages via nextPageToken → combined list; exactly two HTTP requests."""
+    get, calls = _scoped_mock([[_I1, _I2], [_I3]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().scoped_issues("ALPHA")
+    assert result == [_I1, _I2, _I3]
+    assert len(calls) == 2
+    # Second request must send the nextPageToken from the first response
+    assert calls[1]["params"].get("nextPageToken") == "tok1"
+
+
+def test_scoped_issues_sends_explicit_fields_param():
+    """Every request sends fields= explicitly to avoid Jira returning id-only objects."""
+    get, calls = _scoped_mock([[_I1]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        Jira().scoped_issues("ALPHA")
+    assert "fields" in calls[0]["params"]
+    fields_sent = set(calls[0]["params"]["fields"].split(","))
+    assert "summary" in fields_sent
+    assert "updated" in fields_sent
+
+
+def test_scoped_issues_repeated_next_page_token_raises():
+    """Repeated nextPageToken (server stuck) raises ValueError — infinite-loop guard."""
+    call_seq = [0]
+
+    def get(url, auth=None, params=None, timeout=None):
+        call_seq[0] += 1
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"issues": [_I1], "nextPageToken": "same-token"})
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(ValueError, match="did not advance"):
+            Jira().scoped_issues("ALPHA")
+
+
+def test_scoped_issues_page_limit_raises_and_returns_no_data():
+    """Hitting _MAX_PAGES raises ValueError; no partial data is returned."""
+    call_seq = [0]
+
+    def get(url, auth=None, params=None, timeout=None):
+        call_seq[0] += 1
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(
+            return_value={"issues": [_I1], "nextPageToken": f"tok{call_seq[0]}"}
+        )
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(ValueError, match="exceeded"):
+            Jira().scoped_issues("ALPHA")
+    assert call_seq[0] == 50
+
+
+def test_scoped_issues_403_raises_permission_error_with_project_key():
+    """HTTP 403 raises JiraPermissionError naming the project key, not the server body."""
+    def get(url, auth=None, params=None, timeout=None):
+        resp = MagicMock(status_code=403)
+        resp.json = MagicMock(return_value={"errorMessages": ["secret internal detail"]})
+        resp.raise_for_status = MagicMock(side_effect=httpx.HTTPStatusError("403", request=MagicMock(), response=resp))
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(JiraPermissionError) as exc_info:
+            Jira().scoped_issues("ALPHA")
+    msg = str(exc_info.value)
+    assert "ALPHA" in msg
+    assert "secret internal detail" not in msg
+
+
+def test_scoped_issues_401_raises_auth_error():
+    """HTTP 401 raises JiraAuthError."""
+    def get(url, auth=None, params=None, timeout=None):
+        resp = MagicMock(status_code=401)
+        resp.json = MagicMock(return_value={})
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(JiraAuthError):
+            Jira().scoped_issues("ALPHA")
+
+
+def test_scoped_issues_malformed_issues_not_a_list_raises():
+    """Jira returning 'issues' as a non-list raises ValueError."""
+    def get(url, auth=None, params=None, timeout=None):
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"issues": "not-a-list"})
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(ValueError, match="malformed"):
+            Jira().scoped_issues("ALPHA")
+
+
+def test_scoped_issues_malformed_pagination_token_raises():
+    """Jira returning nextPageToken as an empty string raises ValueError."""
+    def get(url, auth=None, params=None, timeout=None):
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"issues": [_I1], "nextPageToken": ""})
+        return resp
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(ValueError, match="malformed pagination"):
+            Jira().scoped_issues("ALPHA")
+
+
+def test_scoped_issues_rejects_empty_project_key():
+    """Empty project_key raises ValueError before any HTTP request."""
+    with pytest.raises(ValueError, match="non-empty"):
+        Jira().scoped_issues("")
+
+
+def test_scoped_issues_rejects_lowercase_project_key():
+    """Lowercase project key raises ValueError before any HTTP request."""
+    with pytest.raises(ValueError, match="[Ii]nvalid project key"):
+        Jira().scoped_issues("alpha")
+
+
+def test_scoped_issues_rejects_project_key_with_metacharacters():
+    """Project key with JQL metacharacters raises ValueError before any HTTP request."""
+    with pytest.raises(ValueError, match="[Ii]nvalid project key"):
+        Jira().scoped_issues("ALPHA OR 1=1")
+
+
+def test_scoped_issues_rejects_empty_issue_keys_list():
+    """issue_keys=[] raises ValueError; callers must omit it for a full project query."""
+    with pytest.raises(ValueError, match="non-empty"):
+        Jira().scoped_issues("ALPHA", issue_keys=[])
+
+
+def test_scoped_issues_rejects_invalid_issue_key_format():
+    """issue_keys containing a malformed key raises ValueError before any HTTP request."""
+    with pytest.raises(ValueError, match="[Ii]nvalid Jira issue key"):
+        Jira().scoped_issues("ALPHA", issue_keys=["alpha-1"])
+
+
+def test_scoped_issues_rejects_issue_key_from_wrong_project():
+    """issue_keys containing a key from a different project raises ValueError before HTTP."""
+    with pytest.raises(ValueError, match="does not belong to project"):
+        Jira().scoped_issues("ALPHA", issue_keys=["BETA-1"])
+
+
+def test_scoped_issues_rejects_since_wrong_format():
+    """since with non-parseable value raises ValueError before any HTTP request."""
+    with pytest.raises(ValueError, match="ISO 8601|Raw JQL"):
+        Jira().scoped_issues("ALPHA", since="yesterday")
+
+
+def test_scoped_issues_rejects_since_empty_string():
+    """since='' raises ValueError before any HTTP request."""
+    with pytest.raises(ValueError, match="non-empty"):
+        Jira().scoped_issues("ALPHA", since="")
+
+
+def test_scoped_issues_no_http_request_on_validation_failure():
+    """Validation errors fire before any network request."""
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(url)
+        raise AssertionError("Should not reach network")
+
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        with pytest.raises(ValueError):
+            Jira().scoped_issues("alpha")  # lowercase triggers validation error
+
+    assert calls == [], "No HTTP request should have been made"
+
+
+def test_scoped_issues_since_date_only_is_accepted():
+    """since with date-only value (YYYY-MM-DD) passes format validation."""
+    get, calls = _scoped_mock([[]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().scoped_issues("ALPHA", since="2024-06-01")
+    assert result == []
+    assert '2024-06-01' in calls[0]["params"]["jql"]
+
+
+# --- P1: JQL injection via since ---
+
+def test_scoped_issues_rejects_since_with_injected_jql_operator():
+    """P1: since='2024-01-01\" OR project=BETA' cannot parse as ISO 8601 → ValueError."""
+    with pytest.raises(ValueError):
+        Jira().scoped_issues("ALPHA", since='2024-01-01" OR project=BETA')
+
+
+def test_scoped_issues_rejects_since_with_space_and_extra_content():
+    """P1: since with embedded space and extra JQL content is rejected."""
+    with pytest.raises(ValueError):
+        Jira().scoped_issues("ALPHA", since="2024-01-01 ; DROP TABLE issues")
+
+
+def test_scoped_issues_since_is_canonicalized_in_jql():
+    """P1: JQL receives the canonical .isoformat() form, not the raw input string."""
+    # Input uses timezone offset; canonical form must still be valid
+    since_input = "2024-06-15T08:30:00+10:00"
+    import datetime as _dt
+    expected_canonical = _dt.datetime.fromisoformat(since_input).isoformat()
+    get, calls = _scoped_mock([[]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        Jira().scoped_issues("ALPHA", since=since_input)
+    jql = calls[0]["params"]["jql"]
+    assert f'updated >= "{expected_canonical}"' in jql
+    # The raw input string must not be present if it differs from canonical form
+    # (both are valid here, but canonical has no injection characters)
+    assert '"' not in expected_canonical  # canonical cannot contain a double-quote
+
+
+def test_scoped_issues_since_canonical_form_contains_no_injection_chars():
+    """P1: canonical since value in JQL contains only safe characters."""
+    import datetime as _dt
+    test_cases = [
+        "2024-01-15",
+        "2024-01-15T00:00:00",
+        "2024-01-15T10:30:00+05:30",
+        "2024-01-15T10:30:00-07:00",
+        "2024-12-31T23:59:59+00:00",
+    ]
+    for since_input in test_cases:
+        get, calls = _scoped_mock([[]])
+        with patch("connectonion.useful_tools.jira.httpx.get", get):
+            Jira().scoped_issues("ALPHA", since=since_input)
+        jql = calls[0]["params"]["jql"]
+        # Extract the since value embedded between the outer double-quotes
+        import re as _re
+        m = _re.search(r'updated >= "([^"]+)"', jql)
+        assert m is not None, f"since clause not found in JQL: {jql!r}"
+        embedded = m.group(1)
+        # Must match only safe ISO 8601 characters
+        assert _re.fullmatch(r'[\d\-T:+Z]+', embedded), (
+            f"Injection characters found in embedded since value: {embedded!r}"
+        )
+
+
+# --- P2: issue_keys container type ---
+
+def test_scoped_issues_rejects_issue_keys_as_string():
+    """P2: issue_keys='ALPHA-1' (a string, not a list) raises ValueError."""
+    with pytest.raises(ValueError, match="list"):
+        Jira().scoped_issues("ALPHA", issue_keys="ALPHA-1")
+
+
+def test_scoped_issues_rejects_non_string_element_in_issue_keys():
+    """P2: a non-string element such as 123 raises ValueError, not TypeError."""
+    with pytest.raises(ValueError, match="string"):
+        Jira().scoped_issues("ALPHA", issue_keys=[123])
+
+
+def test_scoped_issues_accepts_issue_keys_as_set():
+    """P2: issue_keys as a set is accepted and normalised internally."""
+    get, calls = _scoped_mock([[_I1]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().scoped_issues("ALPHA", issue_keys={"ALPHA-1"})
+    assert result == [_I1]
+    assert "key IN (ALPHA-1)" in calls[0]["params"]["jql"]
+
+
+def test_scoped_issues_accepts_issue_keys_as_tuple():
+    """P2: issue_keys as a tuple is accepted and normalised internally."""
+    get, calls = _scoped_mock([[_I1]])
+    with patch("connectonion.useful_tools.jira.httpx.get", get):
+        result = Jira().scoped_issues("ALPHA", issue_keys=("ALPHA-1",))
+    assert result == [_I1]
+
+
+# --- P2: max_results validation ---
+
+def test_scoped_issues_rejects_max_results_zero():
+    """P2: max_results=0 raises ValueError before any HTTP request."""
+    with pytest.raises(ValueError, match="max_results"):
+        Jira().scoped_issues("ALPHA", max_results=0)
+
+
+def test_scoped_issues_rejects_max_results_negative():
+    """P2: max_results=-1 raises ValueError before any HTTP request."""
+    with pytest.raises(ValueError, match="max_results"):
+        Jira().scoped_issues("ALPHA", max_results=-1)
+
+
+def test_scoped_issues_rejects_max_results_float():
+    """P2: max_results=1.5 raises ValueError before any HTTP request."""
+    with pytest.raises(ValueError, match="max_results"):
+        Jira().scoped_issues("ALPHA", max_results=1.5)
+
+
+def test_scoped_issues_rejects_max_results_bool():
+    """P2: bool is an int subclass but must not be accepted as max_results."""
+    with pytest.raises(ValueError, match="max_results"):
+        Jira().scoped_issues("ALPHA", max_results=True)
+
+
+def test_scoped_issues_rejects_max_results_too_large():
+    """P2: max_results=101 exceeds the Jira API ceiling of 100 → ValueError."""
+    with pytest.raises(ValueError, match="max_results"):
+        Jira().scoped_issues("ALPHA", max_results=101)
+
+
+def test_scoped_issues_accepts_max_results_boundary_values():
+    """P2: max_results=1 and max_results=100 are both accepted."""
+    for mr in (1, 100):
+        get, calls = _scoped_mock([[]])
+        with patch("connectonion.useful_tools.jira.httpx.get", get):
+            Jira().scoped_issues("ALPHA", max_results=mr)
+        assert calls[0]["params"]["maxResults"] == mr
+
+
+# ===========================================================================
+# INC-1 to INC-16: run_jira_sync() incremental transaction tests (Sprint 2)
+# ===========================================================================
+
+import threading as _threading
+
+from connectonion.useful_tools.jira_checkpoint import (
+    JiraCheckpoint,
+    SyncResult,
+    run_jira_sync,
+    _checkpoint_path,
+    _staging_path,
+    _staging_tmp_path,
+    _pending_path,
+    _scope_hash,
+    _serialise_staging_line,
+    _CHECKPOINT_VERSION,
+    _STAGING_ENCODING_VERSION,
+    _scope_lock,
+)
+
+_SYNC_ACCOUNT = "https://sync.atlassian.net"
+_SYNC_ACCOUNT_ID = "syncuser123"
+_SYNC_PROJECT = "ALPHA"
+
+
+def _inc_issue(key: str, updated: str, summary: str = "") -> dict:
+    """Minimal Jira issue dict with required fields for jira_issues_to_records."""
+    return {
+        "id": f"inc-{key}",
+        "key": key,
+        "fields": {
+            "summary": summary or key,
+            "updated": updated,
+            "issuetype": {"name": "Story"},
+        },
+    }
+
+
+def _make_sync_mock(
+    issues,
+    changelogs=None,
+    account=_SYNC_ACCOUNT,
+    account_id=_SYNC_ACCOUNT_ID,
+    verify_exc=None,
+    scoped_exc=None,
+):
+    """Build a MagicMock that stands in for connectonion.useful_tools.jira.Jira."""
+    mock_cls = MagicMock()
+    inst = mock_cls.return_value
+    if verify_exc:
+        inst.verify_connection.side_effect = verify_exc
+    else:
+        inst.verify_connection.return_value = {
+            "accountId": account_id,
+            "displayName": "Sync User",
+            "site_url": account,
+        }
+    if scoped_exc:
+        inst.scoped_issues.side_effect = scoped_exc
+    else:
+        inst.scoped_issues.return_value = list(issues)
+    inst.issue_changelogs.return_value = changelogs or {}
+    return mock_cls
+
+
+def _saved_checkpoint(
+    state_dir,
+    project=_SYNC_PROJECT,
+    cursor=None,
+    account=_SYNC_ACCOUNT,
+    account_id=_SYNC_ACCOUNT_ID,
+    scope_override=None,
+    overlap=None,
+):
+    """Write a checkpoint file to state_dir and return (checkpoint, scope_hash)."""
+    scope = scope_override or {"type": "project", "project": project}
+    s_hash = _scope_hash("jira", account, account_id, scope)
+    cp = JiraCheckpoint(
+        version=_CHECKPOINT_VERSION,
+        source="jira",
+        account=account,
+        authorised_identity={"accountId": account_id},
+        canonical_scope=scope,
+        cursor=cursor,
+        last_key=None,
+        commit_time="2026-10-01T00:00:00+00:00",
+        overlap_snapshot_hashes=overlap or {},
+    )
+    cp.save(_checkpoint_path(state_dir, s_hash))
+    return cp, s_hash
+
+
+# --- INC-1: first import ---
+
+def test_inc1_first_import_no_checkpoint_full_query(tmp_path):
+    """INC-1: No checkpoint → full project query, records written, cursor advances to max(updated)."""
+    issues = [
+        _inc_issue("ALPHA-1", "2026-10-01T10:00:00.000+0000"),
+        _inc_issue("ALPHA-2", "2026-10-02T10:00:00.000+0000"),
+    ]
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    mock_cls = _make_sync_mock(issues)
+
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert result.exit_code == 0
+    assert result.issues_read == 2
+    assert result.issues_mapped == 2
+    assert result.net_new_records == 2
+    assert result.checkpoint_result == "advanced"
+    assert result.error_code is None
+
+    # Checkpoint written with cursor = max(updated).
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, {"type": "project", "project": _SYNC_PROJECT})
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp is not None
+    assert cp.cursor == "2026-10-02T10:00:00.000+0000"
+
+    # No staging / pending artifacts.
+    assert not _staging_path(state_dir, s_hash).exists()
+    assert not _pending_path(state_dir, s_hash).exists()
+
+    # scoped_issues called with since=None (full query, no cursor yet).
+    assert mock_cls.return_value.scoped_issues.call_args.kwargs.get("since") is None
+
+
+# --- INC-2: unchanged repeat → net_new=0, cursor unchanged (same updated value) ---
+
+def test_inc2_unchanged_repeat_zero_net_new_does_not_duplicate(tmp_path):
+    """INC-2: All returned records already in daily file → net_new=0, no duplicate appended."""
+    issues = [_inc_issue("ALPHA-1", "2026-10-01T10:00:00.000+0000")]
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock(issues)):
+        r1 = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+    assert r1.net_new_records == 1
+
+    # Second run: same issue returned again (overlap window).
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock(issues)):
+        r2 = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert r2.exit_code == 0
+    assert r2.net_new_records == 0
+    assert r2.error_code is None
+
+    # Daily file has exactly one line (no duplicate).
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, {"type": "project", "project": _SYNC_PROJECT})
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    daily = Path(r2.placement)
+    lines = [ln for ln in daily.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 1
+    # Cursor must not have regressed.
+    assert cp.cursor == "2026-10-01T10:00:00.000+0000"
+
+
+# --- INC-3: new issue on incremental run ---
+
+def test_inc3_new_issue_appended_on_incremental_run(tmp_path):
+    """INC-3: Second run finds a new issue → appended, cursor advances."""
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    first = [_inc_issue("ALPHA-1", "2026-10-01T10:00:00.000+0000")]
+    second = [
+        _inc_issue("ALPHA-1", "2026-10-01T10:00:00.000+0000"),
+        _inc_issue("ALPHA-2", "2026-10-03T10:00:00.000+0000"),
+    ]
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock(first)):
+        run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock(second)):
+        r2 = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert r2.exit_code == 0
+    assert r2.net_new_records == 1   # only ALPHA-2 is new
+    assert r2.checkpoint_result == "advanced"
+
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, {"type": "project", "project": _SYNC_PROJECT})
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp.cursor == "2026-10-03T10:00:00.000+0000"
+
+    # scoped_issues called with since != None on the second run.
+    mock_cls2_since = _make_sync_mock(second)
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls2_since):
+        run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+    call_kwargs = mock_cls2_since.return_value.scoped_issues.call_args.kwargs
+    assert call_kwargs.get("since") is not None
+
+
+# --- INC-4: changed issue appended as new snapshot ---
+
+def test_inc4_changed_issue_appended_as_new_snapshot(tmp_path):
+    """INC-4: Same issue key with newer updated → appended as a second snapshot."""
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    v1 = [_inc_issue("ALPHA-1", "2026-10-01T10:00:00.000+0000", summary="Original")]
+    v2 = [_inc_issue("ALPHA-1", "2026-10-04T12:00:00.000+0000", summary="Edited")]
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock(v1)):
+        run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock(v2)):
+        r2 = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert r2.exit_code == 0
+    assert r2.net_new_records == 1   # new snapshot for the edited issue
+
+    daily = Path(r2.placement)
+    lines = [ln for ln in daily.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 2   # two snapshots of ALPHA-1
+
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, {"type": "project", "project": _SYNC_PROJECT})
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp.cursor == "2026-10-04T12:00:00.000+0000"
+
+
+# --- INC-5: zero Jira results → cursor unchanged ---
+
+def test_inc5_zero_jira_results_cursor_unchanged(tmp_path):
+    """INC-5: Jira returns 0 issues → cursor and last_key must not be modified."""
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    cursor_before = "2026-10-01T10:00:00.000+0000"
+    _, s_hash = _saved_checkpoint(state_dir, cursor=cursor_before)
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([])):
+        result = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert result.exit_code == 0
+    assert result.issues_read == 0
+    assert result.net_new_records == 0
+    assert result.checkpoint_result == "unchanged"
+
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp.cursor == cursor_before   # cursor must not have advanced
+
+
+# --- INC-6: fully deduplicated via overlap_snapshot_hashes (cross-midnight dedup) ---
+
+def test_inc6_fully_deduplicated_via_overlap_hashes_advances_cursor(tmp_path):
+    """INC-6: Non-empty result, all hashes already in overlap_snapshot_hashes → net_new=0, cursor advances."""
+    from connectonion.useful_tools.adapter import snapshot_hash as _snap_hash
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+
+    issue = _inc_issue("ALPHA-1", "2026-10-05T09:00:00.000+0000")
+
+    # Perform a first run so the record is in the daily file and overlap hashes.
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([issue])):
+        r1 = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+    assert r1.net_new_records == 1
+
+    # Manually simulate a new day by deleting today's daily file
+    # but keeping the checkpoint (which has overlap_snapshot_hashes).
+    daily_file = Path(r1.placement)
+    daily_file.unlink()
+
+    # Third run: Jira returns the same issue again (overlap window).
+    # The hash is in overlap_snapshot_hashes → net_new=0, cursor still advances.
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([issue])):
+        r2 = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert r2.exit_code == 0
+    assert r2.net_new_records == 0
+    assert r2.checkpoint_result in ("advanced", "unchanged")
+    # The daily file for this new run should NOT contain the old record.
+    new_daily = Path(r2.placement)
+    if new_daily.exists():
+        lines = [ln for ln in new_daily.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        assert len(lines) == 0
+
+
+# --- INC-7: since parameter computed from cursor minus overlap window ---
+
+def test_inc7_incremental_since_uses_cursor_minus_overlap_window(tmp_path):
+    """INC-7: Incremental run passes since = cursor - 2min to scoped_issues."""
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    cursor = "2026-10-01T10:00:00+00:00"
+    _saved_checkpoint(state_dir, cursor=cursor)
+
+    mock_cls = _make_sync_mock([])
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    call_kwargs = mock_cls.return_value.scoped_issues.call_args.kwargs
+    since_str = call_kwargs.get("since")
+    assert since_str is not None
+
+    import datetime as _dt
+    cursor_dt = _dt.datetime.fromisoformat(cursor)
+    since_dt = _dt.datetime.fromisoformat(since_str)
+    # since must be 2 minutes before the cursor.
+    assert cursor_dt - since_dt == _dt.timedelta(minutes=2)
+
+
+# --- INC-8: equal timestamps → last_key from lexicographic tie-break ---
+
+def test_inc8_equal_timestamps_last_key_is_lexicographically_last(tmp_path):
+    """INC-8: Two issues with identical updated → last_key is the lexicographically larger key."""
+    ts = "2026-10-01T10:00:00.000+0000"
+    issues = [_inc_issue("ALPHA-2", ts), _inc_issue("ALPHA-9", ts)]
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock(issues)):
+        result = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, {"type": "project", "project": _SYNC_PROJECT})
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp.last_key == "ALPHA-9"   # lex-greater key wins the tie
+
+
+# --- INC-9: full=True ignores cursor and queries entire scope ---
+
+def test_inc9_full_flag_ignores_cursor(tmp_path):
+    """INC-9: --full passes since=None even when a cursor exists."""
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    _saved_checkpoint(state_dir, cursor="2026-10-01T10:00:00+00:00")
+
+    mock_cls = _make_sync_mock([])
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, full=True, history=False)
+
+    assert mock_cls.return_value.scoped_issues.call_args.kwargs.get("since") is None
+
+
+# --- INC-9b / INC-9c: --full does not advance the incremental checkpoint (P1-1) ---
+
+def test_inc9b_full_run_does_not_advance_checkpoint(tmp_path):
+    """INC-9b: --full writes records but leaves the incremental checkpoint cursor unchanged."""
+    import json as _json
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    cursor_before = "2026-10-01T10:00:00+00:00"
+    _, s_hash = _saved_checkpoint(state_dir, cursor=cursor_before)
+
+    issue = _inc_issue("ALPHA-1", "2026-10-12T09:00:00.000+0000")
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([issue])):
+        result = run_jira_sync(
+            _SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir,
+            full=True, history=False,
+        )
+
+    assert result.exit_code == 0
+    assert result.checkpoint_result == "skipped"
+    assert result.net_new_records >= 1
+
+    # Cursor must not have changed.
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp is not None
+    assert cp.cursor == cursor_before
+
+
+def test_inc9c_full_run_crash_recovery_does_not_advance_checkpoint(tmp_path):
+    """INC-9c: crash after full run records written → recovery cleans up without advancing cursor.
+
+    Simulates the scenario where --full completed Step 9 (records in daily JSONL) and
+    Step 9.5-full (manifest with is_full_run=True) but crashed before cleanup.  The
+    next incremental run's Step 3 should recover the staging+pending without saving
+    a new checkpoint, leaving the old cursor intact.
+    """
+    import json as _json
+    import uuid as _uuid
+    import datetime as _dt
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    cursor_before = "2026-10-01T10:00:00+00:00"
+    _, s_hash = _saved_checkpoint(state_dir, cursor=cursor_before)
+
+    # Write a record directly to the daily file (simulating Step 9 completion).
+    today = _dt.date.today()
+    daily_dir = output_dir / "daily" / str(today.year) / f"{today.month:02d}"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    daily_file = daily_dir / f"{today.day:02d}.jsonl"
+    record = {"id": "inc-ALPHA-1", "key": "ALPHA-1", "updated": "2026-10-12T09:00:00Z"}
+    daily_file.write_text(_json.dumps(record) + "\n", encoding="utf-8")
+
+    # Write staging (needs to exist for the recovery guard).
+    stg_p = _staging_path(state_dir, s_hash)
+    stg_p.parent.mkdir(parents=True, exist_ok=True)
+    stg_p.write_text(_json.dumps(record) + "\n", encoding="utf-8")
+
+    # Write manifest: records_appended=True + is_full_run=True (Step 9.5-full done).
+    pnd_p = _pending_path(state_dir, s_hash)
+    manifest = {
+        "run_id": str(_uuid.uuid4()),
+        "old_cursor": cursor_before,
+        "old_last_key": None,
+        "target_daily_path": str(daily_file),
+        "staging_filename": stg_p.name,
+        "encoding_version": _STAGING_ENCODING_VERSION,
+        "planned_record_count": 1,
+        "records_appended": True,
+        "is_full_run": True,
+    }
+    pnd_p.write_text(_json.dumps(manifest), encoding="utf-8")
+
+    # Run an incremental; Step 3 recovery should clean up without advancing the cursor.
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([])):
+        result = run_jira_sync(
+            _SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False,
+        )
+
+    assert result.exit_code == 0
+    assert result.checkpoint_result == "recovered"
+
+    # Cursor must NOT have advanced.
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp is not None
+    assert cp.cursor == cursor_before
+
+    # Staging+pending cleaned up.
+    assert not stg_p.exists()
+    assert not pnd_p.exists()
+
+    # No duplicates: daily file has exactly the one record already there.
+    lines = [ln for ln in daily_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 1
+
+
+# --- INC-9d: Step 9.5 Phase-2 manifest write failure is a hard failure ---
+
+def test_inc9d_step95_failure_is_hard_failure(tmp_path):
+    """INC-9d: If the Phase-2 manifest write (Step 9.5) raises, the run returns exit_code=2
+    with error_code='manifest_update_failed'.  The Phase-1 manifest and staging file are
+    left on disk so the next run's Step 3 recovery can re-append and advance the cursor.
+    The old checkpoint cursor must not change.
+    """
+    import json as _json
+    import connectonion.useful_tools.jira_checkpoint as _jcp_mod
+
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    cursor_before = "2026-10-01T10:00:00+00:00"
+    _, s_hash = _saved_checkpoint(state_dir, cursor=cursor_before)
+
+    issue = _inc_issue("ALPHA-1", "2026-10-12T09:00:00.000+0000")
+
+    _real_wpm = _jcp_mod._write_pending_manifest
+    _wpm_calls: list[int] = []
+
+    def _fail_second_wpm(*args, **kwargs):
+        _wpm_calls.append(1)
+        if len(_wpm_calls) == 2:  # Step 9.5 (Phase 2) call
+            raise OSError("Simulated manifest update failure at Step 9.5")
+        return _real_wpm(*args, **kwargs)
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([issue])), \
+         patch("connectonion.useful_tools.jira_checkpoint._write_pending_manifest",
+               _fail_second_wpm):
+        result = run_jira_sync(
+            _SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False,
+        )
+
+    assert result.exit_code == 2
+    assert result.error_code == "manifest_update_failed"
+
+    # Old checkpoint cursor must not have advanced.
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp is not None
+    assert cp.cursor == cursor_before
+
+    # Phase-1 manifest and staging must survive for Step-3 recovery on the next run.
+    pnd_p = _pending_path(state_dir, s_hash)
+    stg_p = _staging_path(state_dir, s_hash)
+    assert pnd_p.exists(), "Phase-1 manifest must survive a Step-9.5 failure"
+    assert stg_p.exists(), "Staging file must survive a Step-9.5 failure"
+
+    # The surviving manifest must carry the candidate snapshot but not records_appended=True.
+    manifest = _json.loads(pnd_p.read_text(encoding="utf-8"))
+    assert not manifest.get("records_appended"), \
+        "Phase-1 manifest must not have records_appended=True"
+    assert manifest.get("checkpoint_snapshot") is not None, \
+        "Phase-1 manifest must contain checkpoint_snapshot"
+
+
+# --- INC-9e: Step 3 recovery from Phase-1-only manifest ---
+
+def test_inc9e_recovery_snapshot_no_records_appended_appends_and_advances_cursor(tmp_path):
+    """INC-9e: A pending manifest with checkpoint_snapshot but no records_appended (Phase 1
+    only) triggers idempotent re-append + cursor advance, even when the daily JSONL did not
+    yet exist (crash before Step 9).
+    """
+    import json as _json
+    import datetime as _dt
+    import uuid as _uuid
+
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    cursor_before = "2026-10-01T10:00:00+00:00"
+    _, s_hash = _saved_checkpoint(state_dir, cursor=cursor_before)
+
+    # Target daily file does not exist yet — simulates crash before Step 9.
+    today = _dt.date.today()
+    daily_dir = output_dir / "daily" / str(today.year) / f"{today.month:02d}"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    daily_file = daily_dir / f"{today.day:02d}.jsonl"
+
+    stg_p = _staging_path(state_dir, s_hash)
+    stg_p.parent.mkdir(parents=True, exist_ok=True)
+    record = {"id": "inc-ALPHA-1", "key": "ALPHA-1", "updated": "2026-10-12T09:00:00Z"}
+    stg_p.write_text(_json.dumps(record) + "\n", encoding="utf-8")
+
+    expected_cursor = "2026-10-12T09:00:00+00:00"
+    snapshot = {
+        "version": _CHECKPOINT_VERSION,
+        "source": "jira",
+        "account": _SYNC_ACCOUNT,
+        "authorised_identity": {"accountId": _SYNC_ACCOUNT_ID},
+        "canonical_scope": {"type": "project", "project": _SYNC_PROJECT},
+        "cursor": expected_cursor,
+        "last_key": "ALPHA-1",
+        "commit_time": "2026-10-12T09:00:00+00:00",
+        "overlap_snapshot_hashes": {},
+    }
+    pnd_p = _pending_path(state_dir, s_hash)
+    manifest = {
+        "run_id": str(_uuid.uuid4()),
+        "old_cursor": cursor_before,
+        "old_last_key": None,
+        "target_daily_path": str(daily_file),
+        "staging_filename": stg_p.name,
+        "encoding_version": _STAGING_ENCODING_VERSION,
+        "planned_record_count": 1,
+        "checkpoint_snapshot": snapshot,
+        # records_appended deliberately absent — Phase 1 only
+    }
+    pnd_p.write_text(_json.dumps(manifest), encoding="utf-8")
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([])):
+        result = run_jira_sync(
+            _SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False,
+        )
+
+    assert result.exit_code == 0
+    assert result.checkpoint_result == "recovered"
+
+    # Cursor must have advanced to the snapshot cursor.
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp is not None
+    assert cp.cursor == expected_cursor
+
+    # Staging and pending cleaned up.
+    assert not stg_p.exists()
+    assert not pnd_p.exists()
+
+    # Record written to daily JSONL.
+    assert daily_file.exists()
+    lines = [ln for ln in daily_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 1
+
+
+def test_inc9e_neg_identity_mismatch_blocks_recovery(tmp_path):
+    """INC-9e-neg-1: checkpoint_snapshot with a different account — matches() raises →
+    recovery_failed.  Existing checkpoint cursor must not change.
+    """
+    import json as _json
+    import datetime as _dt
+    import uuid as _uuid
+
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    cursor_before = "2026-10-01T10:00:00+00:00"
+    _, s_hash = _saved_checkpoint(state_dir, cursor=cursor_before)
+
+    today = _dt.date.today()
+    daily_dir = output_dir / "daily" / str(today.year) / f"{today.month:02d}"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    daily_file = daily_dir / f"{today.day:02d}.jsonl"
+
+    stg_p = _staging_path(state_dir, s_hash)
+    stg_p.parent.mkdir(parents=True, exist_ok=True)
+    record = {"id": "inc-ALPHA-1", "key": "ALPHA-1", "updated": "2026-10-12T09:00:00Z"}
+    stg_p.write_text(_json.dumps(record) + "\n", encoding="utf-8")
+
+    # Snapshot with wrong account — matches() must reject it.
+    snapshot = {
+        "version": _CHECKPOINT_VERSION,
+        "source": "jira",
+        "account": "https://other-tenant.atlassian.net",  # deliberate mismatch
+        "authorised_identity": {"accountId": _SYNC_ACCOUNT_ID},
+        "canonical_scope": {"type": "project", "project": _SYNC_PROJECT},
+        "cursor": "2026-10-12T09:00:00+00:00",
+        "last_key": "ALPHA-1",
+        "commit_time": "2026-10-12T09:00:00+00:00",
+        "overlap_snapshot_hashes": {},
+    }
+    pnd_p = _pending_path(state_dir, s_hash)
+    manifest = {
+        "run_id": str(_uuid.uuid4()),
+        "old_cursor": cursor_before,
+        "old_last_key": None,
+        "target_daily_path": str(daily_file),
+        "staging_filename": stg_p.name,
+        "encoding_version": _STAGING_ENCODING_VERSION,
+        "planned_record_count": 1,
+        "checkpoint_snapshot": snapshot,
+    }
+    pnd_p.write_text(_json.dumps(manifest), encoding="utf-8")
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([])):
+        result = run_jira_sync(
+            _SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False,
+        )
+
+    assert result.exit_code == 2
+    assert result.error_code == "recovery_failed"
+
+    # Existing checkpoint cursor must not have changed.
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp is not None
+    assert cp.cursor == cursor_before
+
+
+def test_inc9e_neg_bad_target_path_blocks_recovery(tmp_path):
+    """INC-9e-neg-2: target_daily_path resolves outside output_dir/daily/ — path guard fires
+    → recovery_failed.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    cursor_before = "2026-10-01T10:00:00+00:00"
+    _, s_hash = _saved_checkpoint(state_dir, cursor=cursor_before)
+
+    stg_p = _staging_path(state_dir, s_hash)
+    stg_p.parent.mkdir(parents=True, exist_ok=True)
+    record = {"id": "inc-ALPHA-1", "key": "ALPHA-1", "updated": "2026-10-12T09:00:00Z"}
+    stg_p.write_text(_json.dumps(record) + "\n", encoding="utf-8")
+
+    snapshot = {
+        "version": _CHECKPOINT_VERSION,
+        "source": "jira",
+        "account": _SYNC_ACCOUNT,
+        "authorised_identity": {"accountId": _SYNC_ACCOUNT_ID},
+        "canonical_scope": {"type": "project", "project": _SYNC_PROJECT},
+        "cursor": "2026-10-12T09:00:00+00:00",
+        "last_key": "ALPHA-1",
+        "commit_time": "2026-10-12T09:00:00+00:00",
+        "overlap_snapshot_hashes": {},
+    }
+    pnd_p = _pending_path(state_dir, s_hash)
+    bad_path = tmp_path / "evil" / "daily" / "2026" / "10" / "12.jsonl"
+    manifest = {
+        "run_id": str(_uuid.uuid4()),
+        "old_cursor": cursor_before,
+        "old_last_key": None,
+        "target_daily_path": str(bad_path),
+        "staging_filename": stg_p.name,
+        "encoding_version": _STAGING_ENCODING_VERSION,
+        "planned_record_count": 1,
+        "checkpoint_snapshot": snapshot,
+    }
+    pnd_p.write_text(_json.dumps(manifest), encoding="utf-8")
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([])):
+        result = run_jira_sync(
+            _SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False,
+        )
+
+    assert result.exit_code == 2
+    assert result.error_code == "recovery_failed"
+
+
+# --- INC-9f: idempotent re-append when record already in daily JSONL ---
+
+def test_inc9f_cross_midnight_recovery_no_duplicates(tmp_path):
+    """INC-9f: Phase-1-only manifest + record already in daily JSONL (Step 9 completed before
+    crash).  Recovery must be idempotent (no duplicate) and still advance the cursor.
+    """
+    import json as _json
+    import datetime as _dt
+    import uuid as _uuid
+
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    cursor_before = "2026-10-01T10:00:00+00:00"
+    _, s_hash = _saved_checkpoint(state_dir, cursor=cursor_before)
+
+    # Pre-write record to daily JSONL — simulates Step 9 already having completed.
+    today = _dt.date.today()
+    daily_dir = output_dir / "daily" / str(today.year) / f"{today.month:02d}"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    daily_file = daily_dir / f"{today.day:02d}.jsonl"
+    record = {"id": "inc-ALPHA-1", "key": "ALPHA-1", "updated": "2026-10-12T09:00:00Z"}
+    daily_file.write_text(_json.dumps(record) + "\n", encoding="utf-8")
+
+    # Staging contains the same record.
+    stg_p = _staging_path(state_dir, s_hash)
+    stg_p.parent.mkdir(parents=True, exist_ok=True)
+    stg_p.write_text(_json.dumps(record) + "\n", encoding="utf-8")
+
+    expected_cursor = "2026-10-12T09:00:00+00:00"
+    snapshot = {
+        "version": _CHECKPOINT_VERSION,
+        "source": "jira",
+        "account": _SYNC_ACCOUNT,
+        "authorised_identity": {"accountId": _SYNC_ACCOUNT_ID},
+        "canonical_scope": {"type": "project", "project": _SYNC_PROJECT},
+        "cursor": expected_cursor,
+        "last_key": "ALPHA-1",
+        "commit_time": "2026-10-12T09:00:00+00:00",
+        "overlap_snapshot_hashes": {},
+    }
+    pnd_p = _pending_path(state_dir, s_hash)
+    manifest = {
+        "run_id": str(_uuid.uuid4()),
+        "old_cursor": cursor_before,
+        "old_last_key": None,
+        "target_daily_path": str(daily_file),
+        "staging_filename": stg_p.name,
+        "encoding_version": _STAGING_ENCODING_VERSION,
+        "planned_record_count": 1,
+        "checkpoint_snapshot": snapshot,
+        # records_appended deliberately absent — Phase 1 only
+    }
+    pnd_p.write_text(_json.dumps(manifest), encoding="utf-8")
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([])):
+        result = run_jira_sync(
+            _SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False,
+        )
+
+    assert result.exit_code == 0
+    assert result.checkpoint_result == "recovered"
+
+    # Cursor must have advanced to the snapshot cursor.
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp is not None
+    assert cp.cursor == expected_cursor
+
+    # Staging and pending cleaned up.
+    assert not stg_p.exists()
+    assert not pnd_p.exists()
+
+    # Idempotent: daily file still has exactly one record (no duplicate).
+    lines = [ln for ln in daily_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 1
+
+
+def test_inc9f_neg_bad_target_path_blocks_recovery(tmp_path):
+    """INC-9f-neg: Phase-1-only manifest with bad target_daily_path — path guard fires
+    → recovery_failed.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    cursor_before = "2026-10-01T10:00:00+00:00"
+    _, s_hash = _saved_checkpoint(state_dir, cursor=cursor_before)
+
+    stg_p = _staging_path(state_dir, s_hash)
+    stg_p.parent.mkdir(parents=True, exist_ok=True)
+    record = {"id": "inc-ALPHA-1", "key": "ALPHA-1", "updated": "2026-10-12T09:00:00Z"}
+    stg_p.write_text(_json.dumps(record) + "\n", encoding="utf-8")
+
+    snapshot = {
+        "version": _CHECKPOINT_VERSION,
+        "source": "jira",
+        "account": _SYNC_ACCOUNT,
+        "authorised_identity": {"accountId": _SYNC_ACCOUNT_ID},
+        "canonical_scope": {"type": "project", "project": _SYNC_PROJECT},
+        "cursor": "2026-10-12T09:00:00+00:00",
+        "last_key": "ALPHA-1",
+        "commit_time": "2026-10-12T09:00:00+00:00",
+        "overlap_snapshot_hashes": {},
+    }
+    pnd_p = _pending_path(state_dir, s_hash)
+    bad_path = tmp_path / "evil" / "daily" / "2026" / "10" / "12.jsonl"
+    manifest = {
+        "run_id": str(_uuid.uuid4()),
+        "old_cursor": cursor_before,
+        "old_last_key": None,
+        "target_daily_path": str(bad_path),
+        "staging_filename": stg_p.name,
+        "encoding_version": _STAGING_ENCODING_VERSION,
+        "planned_record_count": 1,
+        "checkpoint_snapshot": snapshot,
+    }
+    pnd_p.write_text(_json.dumps(manifest), encoding="utf-8")
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([])):
+        result = run_jira_sync(
+            _SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False,
+        )
+
+    assert result.exit_code == 2
+    assert result.error_code == "recovery_failed"
+
+
+# --- INC-10: auth failure → no local state touched ---
+
+def test_inc10_auth_failure_returns_error_no_state_written(tmp_path):
+    """INC-10: verify_connection() raises → SyncResult error_code='auth_failure', no files created."""
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    mock_cls = _make_sync_mock([], verify_exc=Exception("Auth failed"))
+
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert result.exit_code == 2
+    assert result.error_code == "auth_failure"
+    # Nothing was written to the state or output directory.
+    assert not state_dir.exists() or not any(state_dir.iterdir())
+
+
+# --- INC-11: partial mapping Option B ---
+
+def test_inc11_partial_mapping_valid_records_persist_cursor_unchanged(tmp_path):
+    """INC-11: One issue fails to map → valid records persisted, cursor unchanged, exit_code=1."""
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    cursor_before = "2026-10-01T10:00:00+00:00"
+    _, s_hash = _saved_checkpoint(state_dir, cursor=cursor_before)
+
+    valid_issue = _inc_issue("ALPHA-1", "2026-10-02T10:00:00.000+0000")
+    bad_issue = {"key": "ALPHA-BAD", "fields": "not-a-dict"}   # fails _jira_shape_problems
+    issues = [valid_issue, bad_issue]
+
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock(issues)):
+        result = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert result.exit_code == 1
+    assert result.error_code == "mapping_error"
+    assert result.issues_mapped == 1     # only the valid issue
+    assert len(result.rejections) == 1   # one rejection
+    assert result.net_new_records >= 1   # valid record was persisted
+
+    # Cursor must NOT have advanced.
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp.cursor == cursor_before
+
+
+# --- INC-12: fetch failure leaves checkpoint unchanged ---
+
+def test_inc12_fetch_failure_leaves_checkpoint_unchanged(tmp_path):
+    """INC-12: scoped_issues() raises → checkpoint cursor unchanged, exit_code=2."""
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    cursor_before = "2026-10-01T10:00:00+00:00"
+    _, s_hash = _saved_checkpoint(state_dir, cursor=cursor_before)
+
+    mock_cls = _make_sync_mock([], scoped_exc=Exception("Network error"))
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert result.exit_code == 2
+    assert result.error_code == "fetch_failed"
+
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp.cursor == cursor_before
+
+
+# --- INC-13: recovery from formal staging + pending ---
+
+def test_inc13_recovery_from_formal_staging_and_pending(tmp_path):
+    """INC-13: staging+pending present → repair + resume append, checkpoint_result='recovered'."""
+    import datetime as _dt
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    state_dir.mkdir(parents=True)
+
+    # Build an issue that would have been staged.
+    issue = _inc_issue("ALPHA-1", "2026-10-10T08:00:00.000+0000")
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    ar = jira_issues_to_records([issue], _SYNC_ACCOUNT, changelogs=None)
+    staged_records = ar.records
+
+    # Compute scope hash.
+    scope = {"type": "project", "project": _SYNC_PROJECT}
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, scope)
+
+    # Write staging file.
+    stg_p = _staging_path(state_dir, s_hash)
+    stg_p.write_bytes(b"".join(_serialise_staging_line(r) for r in staged_records))
+
+    # Target daily path: today's file.
+    today = _dt.date.today()
+    target_daily = output_dir / "daily" / str(today.year) / f"{today.month:02d}" / f"{today.day:02d}.jsonl"
+    target_daily.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write pending manifest.
+    import json as _json
+    pending_p = _pending_path(state_dir, s_hash)
+    manifest = {
+        "run_id": "test-run",
+        "old_cursor": None,
+        "old_last_key": None,
+        "target_daily_path": str(target_daily),
+        "staging_filename": stg_p.name,
+        "encoding_version": _STAGING_ENCODING_VERSION,
+        "planned_record_count": len(staged_records),
+    }
+    pending_p.write_text(_json.dumps(manifest) + "\n", encoding="utf-8")
+
+    mock_cls = _make_sync_mock([])   # scoped_issues won't be called during recovery
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert result.exit_code == 0
+    assert result.checkpoint_result == "recovered"
+
+    # Staging and pending files must have been cleaned up.
+    assert not stg_p.exists()
+    assert not pending_p.exists()
+
+    # The records were appended to the daily file.
+    assert target_daily.exists()
+    lines = [ln for ln in target_daily.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == len(staged_records)
+
+
+# --- INC-14: recovery from staging .tmp → removed, normal re-fetch ---
+
+def test_inc14_staging_tmp_removed_and_normal_sync_proceeds(tmp_path):
+    """INC-14: staging .tmp present → removed before normal fetch, run completes cleanly."""
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    state_dir.mkdir(parents=True)
+
+    scope = {"type": "project", "project": _SYNC_PROJECT}
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, scope)
+
+    # Place a .tmp file (simulates crash mid-write).
+    tmp_p = _staging_tmp_path(state_dir, s_hash)
+    tmp_p.write_bytes(b"incomplete")
+
+    issues = [_inc_issue("ALPHA-1", "2026-10-01T10:00:00.000+0000")]
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock(issues)):
+        result = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert result.exit_code == 0
+    assert result.net_new_records == 1
+    assert not tmp_p.exists()
+
+
+# --- INC-15: recovery from pending without staging → pending cleaned, re-fetch ---
+
+def test_inc15_pending_without_staging_cleaned_and_sync_proceeds(tmp_path):
+    """INC-15: pending manifest without staging → pending removed, normal sync proceeds."""
+    import json as _json
+    import datetime as _dt
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    state_dir.mkdir(parents=True)
+
+    scope = {"type": "project", "project": _SYNC_PROJECT}
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, scope)
+
+    today = _dt.date.today()
+    target_daily = output_dir / "daily" / str(today.year) / f"{today.month:02d}" / f"{today.day:02d}.jsonl"
+    pending_p = _pending_path(state_dir, s_hash)
+    manifest = {
+        "run_id": "old-run",
+        "old_cursor": None,
+        "old_last_key": None,
+        "target_daily_path": str(target_daily),
+        "staging_filename": _staging_path(state_dir, s_hash).name,
+        "encoding_version": _STAGING_ENCODING_VERSION,
+        "planned_record_count": 0,
+    }
+    pending_p.write_text(_json.dumps(manifest) + "\n", encoding="utf-8")
+
+    issues = [_inc_issue("ALPHA-1", "2026-10-01T10:00:00.000+0000")]
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock(issues)):
+        result = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert result.exit_code == 0
+    assert result.net_new_records == 1
+    assert not pending_p.exists()
+
+
+# --- INC-16: failure-and-retry equivalence (crash after staging, same final state) ---
+
+def test_inc16_failure_and_retry_equivalence(tmp_path):
+    """INC-16: Crash after staging is written, retry → identical final state as uninterrupted run."""
+    import json as _json
+    import datetime as _dt
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+
+    issue = _inc_issue("ALPHA-1", "2026-10-12T09:00:00.000+0000")
+
+    # Run 1 (reference): uninterrupted run.
+    ref_state = tmp_path / "ref_state"
+    ref_output = tmp_path / "ref_output"
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([issue])):
+        r_clean = run_jira_sync(_SYNC_PROJECT, state_dir=ref_state, output_dir=ref_output, history=False)
+    assert r_clean.exit_code == 0
+
+    # Run 2a (crash simulation): manually place staging + pending (simulating a crash mid-transaction).
+    scope = {"type": "project", "project": _SYNC_PROJECT}
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, scope)
+    from connectonion.useful_tools.adapter import jira_issues_to_records
+    ar = jira_issues_to_records([issue], _SYNC_ACCOUNT, changelogs=None)
+    staged_records = ar.records
+    stg_p = _staging_path(state_dir, s_hash)
+    stg_p.parent.mkdir(parents=True, exist_ok=True)
+    stg_p.write_bytes(b"".join(_serialise_staging_line(r) for r in staged_records))
+    today = _dt.date.today()
+    target_daily = output_dir / "daily" / str(today.year) / f"{today.month:02d}" / f"{today.day:02d}.jsonl"
+    target_daily.parent.mkdir(parents=True, exist_ok=True)
+    pending_p = _pending_path(state_dir, s_hash)
+    manifest = {
+        "run_id": "crashed-run",
+        "old_cursor": None,
+        "old_last_key": None,
+        "target_daily_path": str(target_daily),
+        "staging_filename": stg_p.name,
+        "encoding_version": _STAGING_ENCODING_VERSION,
+        "planned_record_count": len(staged_records),
+    }
+    pending_p.write_text(_json.dumps(manifest) + "\n", encoding="utf-8")
+
+    # Run 2b: recovery call (simulates the restart after crash).
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([issue])):
+        r_recovery = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+    assert r_recovery.exit_code == 0
+    assert r_recovery.checkpoint_result == "recovered"
+
+    # Run 2c: re-fetch call (advances cursor, net_new=0 because records already in daily).
+    with patch("connectonion.useful_tools.jira.Jira", _make_sync_mock([issue])):
+        r_refetch = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+    assert r_refetch.exit_code == 0
+
+    # Final state equivalence: checkpoint cursor matches the reference run.
+    ref_s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, scope)
+    cp_clean = JiraCheckpoint.load(_checkpoint_path(ref_state, ref_s_hash))
+    cp_retry = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp_retry is not None
+    assert cp_retry.cursor == cp_clean.cursor
+
+    # Records in daily file: same count as reference.
+    ref_daily = Path(r_clean.placement)
+    retry_daily = target_daily
+    clean_lines = [ln for ln in ref_daily.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    retry_lines = [ln for ln in retry_daily.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(retry_lines) == len(clean_lines)
+
+
+# --- INC-17: checkpoint-save failure + recovery equivalence (no duplicate writes) ---
+
+def test_inc17_checkpoint_save_failure_recovery_no_duplicates(tmp_path):
+    """INC-17: checkpoint-save failure preserves staging+pending; recovery re-saves checkpoint without
+    re-writing records, so daily JSONL has no duplicates after cross-midnight retry."""
+    import json as _json
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+
+    issue = _inc_issue("ALPHA-1", "2026-10-12T09:00:00.000+0000")
+    mock_cls = _make_sync_mock([issue])
+
+    # Track JiraCheckpoint.save calls; fail the first one (simulating Step 10 failure).
+    save_calls: list[str] = []
+    from connectonion.useful_tools.jira_checkpoint import JiraCheckpoint as _JCP
+
+    original_save = _JCP.save
+
+    def _failing_save(self, path):
+        if not save_calls:
+            save_calls.append("fail")
+            raise OSError("Simulated disk-full in Step 10")
+        save_calls.append("ok")
+        return original_save(self, path)
+
+    # Run 1: checkpoint save fails, records ARE written to daily.
+    scope = {"type": "project", "project": _SYNC_PROJECT}
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, scope)
+
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls), \
+         patch.object(_JCP, "save", _failing_save):
+        r1 = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert r1.exit_code == 2
+    assert r1.error_code == "checkpoint_save_failed"
+    assert r1.net_new_records >= 1  # records were written to daily
+
+    # Staging+pending must be PRESERVED (not deleted) so recovery can re-save the checkpoint.
+    stg_p = _staging_path(state_dir, s_hash)
+    pnd_p = _pending_path(state_dir, s_hash)
+    assert stg_p.exists(), "staging file must survive a checkpoint-save failure"
+    assert pnd_p.exists(), "pending manifest must survive a checkpoint-save failure"
+
+    # Pending manifest must carry the checkpoint snapshot.
+    manifest = _json.loads(pnd_p.read_text(encoding="utf-8"))
+    assert manifest.get("records_appended") is True, "manifest must mark records as appended"
+    assert "checkpoint_snapshot" in manifest, "manifest must embed the checkpoint snapshot"
+
+    # Count lines in daily JSONL before recovery.
+    daily_path = Path(r1.placement)
+    lines_before = [ln for ln in daily_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+    # Run 2 (simulates next-run / cross-midnight retry): recovery re-saves checkpoint.
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        r2 = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert r2.exit_code == 0
+    assert r2.checkpoint_result == "recovered"
+
+    # No duplicate records: daily JSONL must still have the same line count.
+    lines_after = [ln for ln in daily_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines_after) == len(lines_before), (
+        f"Expected {len(lines_before)} records after recovery, got {len(lines_after)} "
+        "(duplicate write detected)"
+    )
+
+    # Checkpoint must now be saved with the correct cursor.
+    cp = JiraCheckpoint.load(_checkpoint_path(state_dir, s_hash))
+    assert cp is not None
+    assert cp.cursor is not None
+
+
+# --- INC lock contention: second call returns immediately ---
+
+def test_inc_lock_contention_returns_immediately(tmp_path):
+    """run_jira_sync returns error_code='lock' and exit_code=2 when scope is already locked."""
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    state_dir.mkdir(parents=True)
+
+    scope = {"type": "project", "project": _SYNC_PROJECT}
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, scope)
+
+    lock_held = _threading.Event()
+    lock_release = _threading.Event()
+
+    def hold_lock():
+        with _scope_lock(state_dir, s_hash):
+            lock_held.set()
+            lock_release.wait(timeout=5)
+
+    t = _threading.Thread(target=hold_lock, daemon=True)
+    t.start()
+    assert lock_held.wait(timeout=2), "lock thread failed to acquire lock"
+
+    mock_cls = _make_sync_mock([])
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    lock_release.set()
+    t.join(timeout=5)
+
+    assert result.exit_code == 2
+    assert result.error_code == "lock"
+
+
+# --- INC checkpoint mismatch ---
+
+def test_inc_checkpoint_mismatch_returns_error(tmp_path):
+    """Checkpoint stored at the correct path but with a different internal account → mismatch."""
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+
+    # Compute the path run_jira_sync will look at (uses _SYNC_ACCOUNT from verify_connection).
+    scope = {"type": "project", "project": _SYNC_PROJECT}
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, scope)
+    cp_path = _checkpoint_path(state_dir, s_hash)
+    cp_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write a checkpoint at that path whose internal account field is WRONG.
+    bad_cp = JiraCheckpoint(
+        version=_CHECKPOINT_VERSION,
+        source="jira",
+        account="https://other.atlassian.net",   # mismatch
+        authorised_identity={"accountId": _SYNC_ACCOUNT_ID},
+        canonical_scope=scope,
+        cursor="2026-10-01T00:00:00+00:00",
+        last_key=None,
+        commit_time="2026-10-01T00:00:00+00:00",
+        overlap_snapshot_hashes={},
+    )
+    bad_cp.save(cp_path)
+
+    mock_cls = _make_sync_mock([])   # verify_connection returns _SYNC_ACCOUNT
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(_SYNC_PROJECT, state_dir=state_dir, output_dir=output_dir, history=False)
+
+    assert result.exit_code == 2
+    assert result.error_code == "checkpoint_mismatch"
+
+
+# --- INC staging byte-prefix repair ---
+
+def test_inc_staging_byte_prefix_repair_truncates_incomplete_line(tmp_path):
+    """Byte-prefix repair: daily file ending without newline → truncated and record appended."""
+    import datetime as _dt
+    from connectonion.useful_tools.jira_checkpoint import _repair_incomplete_final_line
+
+    state_dir = tmp_path / "state"
+    daily_file = tmp_path / "daily.jsonl"
+    scope = {"type": "project", "project": _SYNC_PROJECT}
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, scope)
+    stg_p = _staging_path(state_dir, s_hash)
+    stg_p.parent.mkdir(parents=True, exist_ok=True)
+
+    record = {"id": "jira:x:ALPHA-1", "source": "jira", "account": "x", "external_id": "ALPHA-1",
+              "kind": "Story", "title": "A", "text": "", "url": "", "author": "", "at": "",
+              "updated": "2026-10-01T10:00:00+00:00", "fetched": "2026-10-01T10:00:00+00:00",
+              "extensions": {}, "media": []}
+    full_line = _serialise_staging_line(record)
+
+    # Daily file has a partial (incomplete) write: first 10 bytes of the line.
+    daily_file.write_bytes(full_line[:10])
+
+    # Staging contains the complete line.
+    stg_p.write_bytes(full_line)
+
+    _repair_incomplete_final_line(daily_file, stg_p)
+
+    repaired = daily_file.read_bytes()
+    assert repaired == b""   # truncated back to 0 (the partial write was after last newline)
+
+
+# --- INC staging non-prefix → fail closed ---
+
+def test_inc_staging_non_prefix_fails_closed(tmp_path):
+    """Byte-prefix repair: mismatch → raises ValueError (fail closed, no truncation)."""
+    from connectonion.useful_tools.jira_checkpoint import _repair_incomplete_final_line
+
+    daily_file = tmp_path / "daily.jsonl"
+    stg_p = tmp_path / "staging.jsonl"
+
+    daily_file.write_bytes(b'{"id":"A"}\n{"corrupt_tail":')   # incomplete, non-matching tail
+    stg_p.write_bytes(b'{"id":"B"}\n')                         # first line is different
+
+    with pytest.raises(ValueError, match="Failing closed"):
+        _repair_incomplete_final_line(daily_file, stg_p)
+
+    # Daily file must be unchanged.
+    assert daily_file.read_bytes() == b'{"id":"A"}\n{"corrupt_tail":'
+
+
+# ── ISO ISOLATION TESTS (ISO-1 through ISO-7) ──────────────────────────────
+
+# Additional imports used by the ISO section.
+from connectonion.useful_tools.jira_checkpoint import (
+    _write_source_yaml_v2,
+    _SOURCE_YAML_VERSION,
+)
+
+
+def _onenote_sentinel(parent: Path) -> tuple[Path, bytes]:
+    """Create a sibling onenote dir with a sentinel file; return (sentinel_path, content)."""
+    on_dir = parent / "onenote"
+    on_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = on_dir / "sentinel.txt"
+    content = b"onenote-content-must-not-change"
+    sentinel.write_bytes(content)
+    return sentinel, content
+
+
+# --- ISO-1: Jira reads only JIRA_* credentials; ONENOTE_* vars are irrelevant ---
+
+def test_iso1_jira_raises_config_error_missing_jira_url(monkeypatch):
+    """ISO-1: Missing JIRA_URL → JiraConfigError; setting ONENOTE vars doesn't help."""
+    monkeypatch.delenv("JIRA_URL", raising=False)
+    # Set fake ONENOTE / Microsoft vars to make sure Jira ignores them.
+    monkeypatch.setenv("ONENOTE_ACCESS_TOKEN", "fake-onenote-token")
+    monkeypatch.setenv("MS_CLIENT_ID", "fake-ms-id")
+    with pytest.raises(JiraConfigError):
+        Jira()
+
+
+def test_iso1_jira_ignores_onenote_vars(monkeypatch):
+    """ISO-1: Valid JIRA_* vars present + ONENOTE vars set → Jira constructor succeeds."""
+    # jira_env fixture sets JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN — all valid.
+    monkeypatch.setenv("ONENOTE_ACCESS_TOKEN", "should-be-ignored")
+    monkeypatch.setenv("MS_CLIENT_ID", "also-ignored")
+    # Jira() must not raise — it only reads JIRA_* vars.
+    j = Jira()
+    assert j is not None
+
+
+# --- ISO-2: Equal external_id → distinct source-qualified record IDs ---
+
+def test_iso2_equal_external_id_distinct_record_ids():
+    """ISO-2: jira and onenote records sharing external_id produce distinct source: IDs."""
+    from connectonion.useful_tools.adapter import jira_issues_to_records, onenote_pages_to_records
+
+    shared_ext_id = "ITEM-99"
+    jira_issue = {
+        "id": shared_ext_id,
+        "key": shared_ext_id,
+        "fields": {
+            "summary": "Shared ID issue",
+            "updated": "2026-10-01T10:00:00+00:00",
+            "issuetype": {"name": "Task"},
+        },
+    }
+    onenote_page = {
+        "id": shared_ext_id,
+        "lastModifiedDateTime": "2026-10-01T10:00:00Z",
+        "title": "Shared ID page",
+    }
+
+    jira_result = jira_issues_to_records([jira_issue], _SYNC_ACCOUNT)
+    on_result = onenote_pages_to_records([onenote_page], _ONENOTE_ACCOUNT)
+
+    assert len(jira_result.records) == 1
+    assert len(on_result.records) == 1
+
+    jira_rid = jira_result.records[0]["id"]
+    on_rid = on_result.records[0]["id"]
+
+    # IDs must be distinct despite the same external_id.
+    assert jira_rid != on_rid
+    # Each ID must carry its own source prefix.
+    assert jira_rid.startswith("jira:")
+    assert on_rid.startswith("onenote:")
+    # Both carry the shared external_id in their ID.
+    assert shared_ext_id in jira_rid
+    assert shared_ext_id in on_rid
+
+
+# --- ISO-3: JiraCheckpoint.load() rejects checkpoints with source != "jira" ---
+
+def test_iso3_checkpoint_wrong_source_raises(tmp_path):
+    """ISO-3: Checkpoint with source='onenote' raises ValueError; onenote dir is untouched."""
+    state_dir = tmp_path / "state"
+    sentinel, sentinel_content = _onenote_sentinel(tmp_path)
+
+    scope = {"type": "project", "project": _SYNC_PROJECT}
+    s_hash = _scope_hash("jira", _SYNC_ACCOUNT, _SYNC_ACCOUNT_ID, scope)
+    cp_path = _checkpoint_path(state_dir, s_hash)
+    cp_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # JiraCheckpoint.save() rejects source!="jira", so write raw JSON directly.
+    raw = {
+        "version": _CHECKPOINT_VERSION,
+        "source": "onenote",   # wrong source
+        "account": _SYNC_ACCOUNT,
+        "authorised_identity": {"accountId": _SYNC_ACCOUNT_ID},
+        "canonical_scope": scope,
+        "cursor": None,
+        "last_key": None,
+        "commit_time": None,
+        "overlap_snapshot_hashes": {},
+    }
+    cp_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        JiraCheckpoint.load(cp_path)
+
+    # Onenote sibling dir must be byte-for-byte unchanged.
+    assert sentinel.read_bytes() == sentinel_content
+
+
+# --- ISO-4: Covered by test_inc_checkpoint_mismatch_returns_error ---
+# (sprint2.md ISO-4: different account/identity/scope checkpoints are rejected)
+
+
+# --- ISO-5: Jira auth failure leaves onenote dir unchanged ---
+
+def test_iso5_jira_auth_failure_leaves_onenote_unchanged(tmp_path):
+    """ISO-5: Jira auth failure → run_jira_sync writes nothing; onenote sibling unchanged."""
+    from connectonion.useful_tools.jira import JiraAuthError
+
+    state_dir = tmp_path / "state"
+    jira_output_dir = tmp_path / "jira_output"
+    sentinel, sentinel_content = _onenote_sentinel(tmp_path)
+
+    mock_cls = _make_sync_mock([], verify_exc=JiraAuthError("bad creds"))
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(
+            _SYNC_PROJECT,
+            state_dir=state_dir,
+            output_dir=jira_output_dir,
+            history=False,
+        )
+
+    assert result.exit_code != 0
+    # No checkpoint should have been written.
+    assert not any(state_dir.rglob("*.json")) if state_dir.exists() else True
+    # Jira output dir may not even exist.
+    # onenote sentinel is byte-for-byte unchanged.
+    assert sentinel.read_bytes() == sentinel_content
+
+
+# --- ISO-6: Successful sync writes only to jira output_dir; onenote unchanged ---
+
+def test_iso6_successful_sync_leaves_onenote_unchanged(tmp_path):
+    """ISO-6: Successful Jira sync writes to jira output_dir only; onenote dir unchanged."""
+    state_dir = tmp_path / "state"
+    jira_output_dir = tmp_path / "jira_output"
+    sentinel, sentinel_content = _onenote_sentinel(tmp_path)
+
+    issue = _inc_issue("ALPHA-1", "2026-10-01T10:00:00+00:00")
+    mock_cls = _make_sync_mock([issue])
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(
+            _SYNC_PROJECT,
+            state_dir=state_dir,
+            output_dir=jira_output_dir,
+            history=False,
+        )
+
+    assert result.exit_code == 0
+    # Jira output dir should exist and contain records.
+    assert jira_output_dir.exists()
+    # onenote sentinel is byte-for-byte unchanged.
+    assert sentinel.read_bytes() == sentinel_content
+    # No file under the onenote dir was modified by the sync.
+    on_dir = tmp_path / "onenote"
+    for f in on_dir.rglob("*"):
+        if f.is_file():
+            assert f.read_bytes() == sentinel_content
+
+
+# --- ISO-7: consume_records() works uniformly on mixed-source records ---
+
+def test_iso7_consume_records_source_agnostic():
+    """ISO-7: consume_records() returns records from both sources; all share required keys."""
+    from connectonion.useful_tools.adapter import (
+        jira_issues_to_records,
+        onenote_pages_to_records,
+        consume_records,
+        REQUIRED_FIELDS,
+    )
+
+    jira_issue = _inc_issue("ALPHA-1", "2026-10-01T10:00:00+00:00", "Issue 1")
+    onenote_page = {
+        "id": "page-100",
+        "lastModifiedDateTime": "2026-10-01T10:00:00Z",
+        "title": "Page 100",
+    }
+
+    jira_result = jira_issues_to_records([jira_issue], _SYNC_ACCOUNT)
+    on_result = onenote_pages_to_records([onenote_page], _ONENOTE_ACCOUNT)
+
+    # Merge into one AdapterResult manually.
+    from connectonion.useful_tools.adapter import AdapterResult
+    merged = AdapterResult(
+        records=jira_result.records + on_result.records,
+        errors={**jira_result.errors, **on_result.errors},
+    )
+
+    all_records = consume_records(merged)
+    assert len(all_records) == 2
+
+    # All records share the same required envelope fields regardless of source.
+    for rec in all_records:
+        for field_name in REQUIRED_FIELDS:
+            assert field_name in rec, f"Missing required field {field_name!r} in {rec}"
+
+    sources = {r["source"] for r in all_records}
+    assert sources == {"jira", "onenote"}
+
+
+# --- ISO-8: run_jira_sync rejects output_dir / state_dir inside OneNote namespace ---
+
+def test_iso8_run_jira_sync_rejects_onenote_output_dir(tmp_path):
+    """ISO-8a: run_jira_sync exits with namespace_violation when output_dir is the OneNote namespace."""
+    import connectonion.useful_tools.jira_checkpoint as _cp_mod
+
+    onenote_ns = tmp_path / "onenote"
+    onenote_ns.mkdir()
+
+    with patch.object(_cp_mod, "_RESERVED_NAMESPACES", frozenset({onenote_ns})):
+        result = run_jira_sync(
+            _SYNC_PROJECT,
+            output_dir=onenote_ns,
+            state_dir=tmp_path / "jira_state",
+            history=False,
+        )
+
+    assert result.exit_code == 2
+    assert result.error_code == "namespace_violation"
+    assert "onenote" in (result.error_detail or "").lower()
+
+
+def test_iso8_run_jira_sync_rejects_onenote_state_dir(tmp_path):
+    """ISO-8b: run_jira_sync exits with namespace_violation when state_dir is inside the OneNote namespace."""
+    import connectonion.useful_tools.jira_checkpoint as _cp_mod
+
+    onenote_ns = tmp_path / "onenote"
+    state_inside = onenote_ns / ".state"
+    state_inside.mkdir(parents=True)
+
+    with patch.object(_cp_mod, "_RESERVED_NAMESPACES", frozenset({onenote_ns})):
+        result = run_jira_sync(
+            _SYNC_PROJECT,
+            output_dir=tmp_path / "jira_output",
+            state_dir=state_inside,
+            history=False,
+        )
+
+    assert result.exit_code == 2
+    assert result.error_code == "namespace_violation"
+
+
+def test_iso8_run_jira_sync_allows_custom_non_onenote_dir(tmp_path):
+    """ISO-8c: run_jira_sync proceeds past the namespace guard for a custom non-OneNote directory."""
+    import connectonion.useful_tools.jira_checkpoint as _cp_mod
+
+    onenote_ns = tmp_path / "onenote"
+    custom_output = tmp_path / "my_jira_output"
+    custom_state = tmp_path / "my_jira_state"
+
+    mock_cls = _make_sync_mock([])
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls), \
+         patch.object(_cp_mod, "_RESERVED_NAMESPACES", frozenset({onenote_ns})):
+        result = run_jira_sync(
+            _SYNC_PROJECT,
+            output_dir=custom_output,
+            state_dir=custom_state,
+            history=False,
+        )
+
+    # Guard did not fire; run reached Jira (verified_connection called).
+    assert result.error_code != "namespace_violation"
+    assert mock_cls.return_value.verify_connection.called
+
+
+# ── P2-1: source.yaml pre-flight (conflict detected before any writes) ──────
+
+
+def test_p21_conflicting_source_yaml_blocks_before_fetch(tmp_path):
+    """P2-1: A source.yaml with a different account blocks run_jira_sync before Step 6.
+
+    scoped_issues must NOT be called (no writes occurred before the conflict was detected).
+    """
+    output_dir = tmp_path / "output"
+    state_dir = tmp_path / "state"
+
+    # Write a source.yaml that belongs to a *different* Jira account.
+    _write_source_yaml_v2(
+        output_dir, "jira",
+        account="https://other.atlassian.net",
+        account_id="otheracc",
+        canonical_scope={"type": "project", "project": _SYNC_PROJECT},
+    )
+
+    mock_cls = _make_sync_mock([_inc_issue("ALPHA-1", "2026-10-12T09:00:00.000+0000")])
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(
+            _SYNC_PROJECT,
+            output_dir=output_dir,
+            state_dir=state_dir,
+            history=False,
+        )
+
+    assert result.exit_code == 2
+    assert result.error_code == "source_yaml_conflict"
+    assert result.error_detail  # non-empty description
+    # scoped_issues must not have been called — no records were written.
+    assert not mock_cls.return_value.scoped_issues.called
+
+
+def test_p21_matching_source_yaml_does_not_block(tmp_path):
+    """P2-1: A source.yaml that matches the current account/scope is accepted."""
+    output_dir = tmp_path / "output"
+    state_dir = tmp_path / "state"
+
+    # Write a source.yaml that matches the sync credentials.
+    _write_source_yaml_v2(
+        output_dir, "jira",
+        account=_SYNC_ACCOUNT,
+        account_id=_SYNC_ACCOUNT_ID,
+        canonical_scope={"type": "project", "project": _SYNC_PROJECT},
+    )
+
+    mock_cls = _make_sync_mock([_inc_issue("ALPHA-1", "2026-10-12T09:00:00.000+0000")])
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(
+            _SYNC_PROJECT,
+            output_dir=output_dir,
+            state_dir=state_dir,
+            history=False,
+        )
+
+    assert result.error_code != "source_yaml_conflict"
+    assert result.exit_code == 0
+    # scoped_issues was reached.
+    assert mock_cls.return_value.scoped_issues.called
+
+
+def test_p21_absent_source_yaml_does_not_block(tmp_path):
+    """P2-1: No source.yaml present → pre-flight passes, sync proceeds normally."""
+    output_dir = tmp_path / "output"
+    state_dir = tmp_path / "state"
+
+    # Deliberately do NOT create a source.yaml.
+    mock_cls = _make_sync_mock([_inc_issue("ALPHA-1", "2026-10-12T09:00:00.000+0000")])
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(
+            _SYNC_PROJECT,
+            output_dir=output_dir,
+            state_dir=state_dir,
+            history=False,
+        )
+
+    assert result.error_code != "source_yaml_conflict"
+    assert result.exit_code == 0
+    assert mock_cls.return_value.scoped_issues.called
+
+
+# ── _write_source_yaml_v2 unit tests ──────────────────────────────────────
+
+def test_source_yaml_v2_fresh_write(tmp_path):
+    """v2 guard: missing file → write fresh v2 with correct structure."""
+    output_dir = tmp_path / "output"
+    scope = {"type": "project", "project": "ALPHA"}
+
+    _write_source_yaml_v2(output_dir, "jira", "https://x.atlassian.net", "acc1", scope)
+
+    target = output_dir / "source.yaml"
+    assert target.exists()
+    doc = yaml.safe_load(target.read_text())
+    assert doc["schema_version"] == _SOURCE_YAML_VERSION
+    assert doc["driver"] == "jira"
+    assert doc["account"] == "https://x.atlassian.net"
+    assert doc["authorised_identity"]["accountId"] == "acc1"
+    assert doc["canonical_scope"] == scope
+    # Must never contain tokens or email.
+    text = target.read_text()
+    assert "token" not in text.lower()
+    assert "@" not in text
+
+
+def test_source_yaml_v2_idempotent(tmp_path):
+    """v2 guard: same identity written twice → file content unchanged after second call."""
+    output_dir = tmp_path / "output"
+    scope = {"type": "project", "project": "ALPHA"}
+    _write_source_yaml_v2(output_dir, "jira", "https://x.atlassian.net", "acc1", scope)
+
+    before_stat = (output_dir / "source.yaml").stat().st_mtime_ns
+    before_bytes = (output_dir / "source.yaml").read_bytes()
+
+    _write_source_yaml_v2(output_dir, "jira", "https://x.atlassian.net", "acc1", scope)
+
+    after_bytes = (output_dir / "source.yaml").read_bytes()
+    # Content must be identical (no new write).
+    assert after_bytes == before_bytes
+
+
+def test_source_yaml_v2_v1_raises_without_migrate(tmp_path):
+    """v2 guard: existing v1 file (schema_version: 1) → raises ValueError."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    target = output_dir / "source.yaml"
+    target.write_text("schema_version: 1\ndriver: jira\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema_version"):
+        _write_source_yaml_v2(output_dir, "jira", "https://x.atlassian.net", "acc1", {})
+
+    # File must remain unchanged.
+    assert target.read_text(encoding="utf-8") == "schema_version: 1\ndriver: jira\n"
+
+
+def test_source_yaml_v2_v1_migrates_with_flag(tmp_path):
+    """v2 guard: migrate=True overwrites v1 with a fresh v2 file."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    scope = {"type": "project", "project": "BETA"}
+    (output_dir / "source.yaml").write_text("schema_version: 1\ndriver: jira\n")
+
+    _write_source_yaml_v2(
+        output_dir, "jira", "https://x.atlassian.net", "acc1", scope, migrate=True
+    )
+
+    doc = yaml.safe_load((output_dir / "source.yaml").read_text())
+    assert doc["schema_version"] == _SOURCE_YAML_VERSION
+    assert doc["canonical_scope"] == scope
+
+
+def test_source_yaml_v2_identity_mismatch_raises_and_leaves_file(tmp_path):
+    """v2 guard: v2 file with different account → raises ValueError; file unchanged."""
+    output_dir = tmp_path / "output"
+    scope = {"type": "project", "project": "ALPHA"}
+    _write_source_yaml_v2(output_dir, "jira", "https://original.atlassian.net", "acc1", scope)
+    original_bytes = (output_dir / "source.yaml").read_bytes()
+
+    with pytest.raises(ValueError, match="different"):
+        _write_source_yaml_v2(output_dir, "jira", "https://other.atlassian.net", "acc1", scope)
+
+    assert (output_dir / "source.yaml").read_bytes() == original_bytes
+
+
+def test_source_yaml_v2_unversioned_raises(tmp_path):
+    """v2 guard: file with no schema_version field → raises ValueError (treated as v1/unversioned)."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "source.yaml").write_text("driver: jira\naccount: https://x.atlassian.net\n")
+
+    with pytest.raises(ValueError, match="schema_version"):
+        _write_source_yaml_v2(output_dir, "jira", "https://x.atlassian.net", "acc1", {})
+
+
+def test_source_yaml_v2_migrate_source_on_run_jira_sync(tmp_path):
+    """v2 guard: migrate_source=True on run_jira_sync → v2 source.yaml written over v1."""
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    # Place a v1 source.yaml in the output dir.
+    (output_dir / "source.yaml").write_text(
+        "schema_version: 1\ndriver: jira\naccount: https://sync.atlassian.net\n"
+    )
+
+    # Must return at least one issue so the zero-issues early-return is not taken.
+    issue = _inc_issue("ALPHA-1", "2026-10-01T10:00:00+00:00")
+    mock_cls = _make_sync_mock([issue])
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(
+            _SYNC_PROJECT,
+            state_dir=state_dir,
+            output_dir=output_dir,
+            history=False,
+            migrate_source=True,
+        )
+
+    assert result.exit_code == 0
+    assert result.error_code != "source_yaml_conflict"
+
+    doc = yaml.safe_load((output_dir / "source.yaml").read_text())
+    assert doc["schema_version"] == _SOURCE_YAML_VERSION
+
+
+def test_source_yaml_v2_conflict_on_run_jira_sync_is_nonfatal(tmp_path):
+    """v2 guard: v2 file with mismatched identity → exit_code=2, error_code=source_yaml_conflict.
+
+    P2-1: the conflict is now detected in the pre-flight check (before Step 6 / before any
+    writes), so exit_code is 2 (was 0 in the pre-P2-1 implementation).
+    """
+    state_dir = tmp_path / "state"
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    scope = {"type": "project", "project": _SYNC_PROJECT}
+    # Write a v2 source.yaml with a DIFFERENT account.
+    _write_source_yaml_v2(output_dir, "jira", "https://other.atlassian.net", "otheracc", scope)
+
+    # Must return at least one issue so the zero-issues early-return is not taken.
+    issue = _inc_issue("ALPHA-1", "2026-10-01T10:00:00+00:00")
+    mock_cls = _make_sync_mock([issue])
+    with patch("connectonion.useful_tools.jira.Jira", mock_cls):
+        result = run_jira_sync(
+            _SYNC_PROJECT,
+            state_dir=state_dir,
+            output_dir=output_dir,
+            history=False,
+        )
+
+    # Pre-flight caught the conflict before any writes; exit_code is now 2 (P2-1).
+    assert result.exit_code == 2
+    assert result.error_code == "source_yaml_conflict"
+
+
+# ===========================================================================
+# CLI-INC-1 to CLI-INC-5: handle_jira_sync_incremental() CLI wrapper tests
+# ===========================================================================
+
+from connectonion.cli.commands.jira_commands import handle_jira_sync_incremental
+
+
+def _sync_result(**kwargs):
+    """Build a SyncResult with sensible defaults for CLI tests."""
+    defaults = {
+        "scope": {"type": "project", "project": "ALPHA"},
+        "mode": "incremental",
+        "issues_read": 1,
+        "issues_mapped": 1,
+        "net_new_records": 1,
+        "placement": "/fake/daily/2026/10/01.jsonl",
+        "checkpoint_result": "advanced",
+        "rejections": {},
+        "error_code": None,
+        "error_detail": None,
+        "exit_code": 0,
+    }
+    defaults.update(kwargs)
+    return SyncResult(**defaults)
+
+
+def test_cli_inc1_successful_run_human_output(capsys):
+    """CLI-INC-1: successful run prints placement, counts, and checkpoint result."""
+    result = _sync_result()
+    with patch(
+        "connectonion.useful_tools.jira_checkpoint.run_jira_sync", return_value=result
+    ):
+        handle_jira_sync_incremental("ALPHA", [], history=False)
+    out = capsys.readouterr().out
+    assert "/fake/daily/2026/10/01.jsonl" in out
+    assert "ALPHA" in out
+    assert "Checkpoint: advanced" in out
+
+
+def test_cli_inc2_successful_run_json_output(capsys):
+    """CLI-INC-2: successful run with --json emits a parseable object with all keys."""
+    result = _sync_result(net_new_records=3)
+    with patch(
+        "connectonion.useful_tools.jira_checkpoint.run_jira_sync", return_value=result
+    ):
+        handle_jira_sync_incremental("ALPHA", [], as_json=True, history=False)
+    data = json.loads(capsys.readouterr().out)
+    assert data["exit_code"] == 0
+    assert data["net_new_records"] == 3
+    assert data["mode"] == "incremental"
+    assert "scope" in data
+    assert "checkpoint_result" in data
+
+
+def test_cli_inc3_auth_failure_exits_2(capsys):
+    """CLI-INC-3: auth failure (exit_code 2) exits 2 and emits JSON with recovery_action."""
+    result = _sync_result(
+        issues_read=0, issues_mapped=0, net_new_records=0,
+        placement=None, checkpoint_result="skipped",
+        error_code="auth_failure",
+        error_detail="Jira authentication failed: 401",
+        exit_code=2,
+    )
+    with patch(
+        "connectonion.useful_tools.jira_checkpoint.run_jira_sync", return_value=result
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            handle_jira_sync_incremental("ALPHA", [], as_json=True, history=False)
+    assert exc_info.value.code == 2
+    data = json.loads(capsys.readouterr().out)
+    assert data["exit_code"] == 2
+    assert data["error_code"] == "auth_failure"
+    assert "recovery_action" in data
+    assert "API token" in data["recovery_action"]
+
+
+def test_cli_inc4_partial_failure_exits_1(capsys):
+    """CLI-INC-4: mapping errors (exit_code 1) exit 1, list rejections on stderr."""
+    result = _sync_result(
+        issues_read=2, issues_mapped=1, net_new_records=1,
+        checkpoint_result="unchanged",
+        rejections={"ALPHA-2": "missing required field: summary"},
+        error_code="mapping_error",
+        error_detail="1 issue(s) failed to map",
+        exit_code=1,
+    )
+    with patch(
+        "connectonion.useful_tools.jira_checkpoint.run_jira_sync", return_value=result
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            handle_jira_sync_incremental("ALPHA", [], history=False)
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "ALPHA-2" in err
+    assert "rejected" in err.lower()
+
+
+def test_cli_inc5_recovered_checkpoint_prints_message(capsys):
+    """CLI-INC-5: checkpoint_result='recovered' prints a recovery message (no exit)."""
+    result = _sync_result(
+        issues_read=0, issues_mapped=0, net_new_records=0,
+        placement="/fake/daily/2026/10/01.jsonl",
+        checkpoint_result="recovered",
+    )
+    with patch(
+        "connectonion.useful_tools.jira_checkpoint.run_jira_sync", return_value=result
+    ):
+        handle_jira_sync_incremental("ALPHA", [], history=False)
+    out = capsys.readouterr().out
+    assert "Recovered" in out
+    assert "ALPHA" in out

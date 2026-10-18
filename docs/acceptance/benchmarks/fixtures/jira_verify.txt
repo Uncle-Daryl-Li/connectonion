@@ -1,0 +1,4 @@
+Connected to Jira
+  Account : demo@example.com
+  Site    : https://demo-team.atlassian.net
+  Status  : OK

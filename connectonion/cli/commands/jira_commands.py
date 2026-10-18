@@ -1,11 +1,13 @@
 """
-Purpose: `co jira` — verify connection, list projects, read scoped issues and their history (F13FCAKE-9/10/12/18)
+Purpose: `co jira` — verify connection, list projects, read scoped issues and their history (F13FCAKE-9/10/12/18); incremental checkpoint-backed sync (F13FCAKE-19)
 LLM-Note:
-  Dependencies: imports from [sys, json, rich, useful_tools/jira.Jira] | imported by [cli/main.py] | tested by [tests/unit/test_jira.py]
+  Dependencies: imports from [sys, json, rich, useful_tools/jira.Jira, useful_tools/jira_checkpoint.run_jira_sync] | imported by [cli/main.py] | tested by [tests/unit/test_jira.py, tests/unit/test_jira_checkpoint.py]
   Data flow: CLI flags -> _jira() factory -> Jira.verify_connection()/project_items()/issue_items() -> formatted output or JSON
     sync: issue_items -> issue_changelogs (unless --no-history, F13FCAKE-12) -> jira_issues_to_records(changelogs=...) -> daily/ or exports/
+    sync-inc: run_jira_sync() (10-step AG-1–AG-5 transaction) -> SyncResult -> formatted output or JSON
   State/Effects: sync writes source.yaml and daily JSONL under the output dir; Jira itself is always read-only; all auth/scope validation in tool layer
-  Errors: JiraConfigError/JiraAuthError/JiraPermissionError/ValueError -> stderr + exit 1; never exposes token | sync with items rejected by the shared record contract (F13FCAKE-16) still writes the valid records, lists every rejected item, and exits 1 | restricted or unavailable history is per item: the issue is still written, the reason is kept under extensions.changelog, exit stays 0
+    sync-inc additionally writes checkpoint, staging, and pending files under state_dir (.state/)
+  Errors: JiraConfigError/JiraAuthError/JiraPermissionError/ValueError -> stderr + exit 1; never exposes token | sync with items rejected by the shared record contract (F13FCAKE-16) still writes the valid records, lists every rejected item, and exits 1 | sync-inc exit_code 1 = partial mapping failure, exit_code 2 = hard failure (auth/lock/persistence/recovery)
 """
 
 import json
@@ -267,3 +269,151 @@ def _report_rejected(rejected, as_json, project, issue_keys, source_yaml, jsonl_
             errors.print(f"Rejected {label}: {reason}", markup=False)
         errors.print(f"Next: {recovery}", markup=False)
     sys.exit(1)
+
+
+# Recovery guidance keyed by the error_code SyncResult field (F13FCAKE-19).
+_SYNC_INC_RECOVERY = {
+    "auth_failure": (
+        "Create an API token at https://id.atlassian.com/manage-profile/security/api-tokens, "
+        "set JIRA_API_TOKEN temporarily in your shell, then retry."
+    ),
+    "checkpoint_corrupt": (
+        "Delete the corrupted checkpoint file and run "
+        "'co jira sync-inc --project <KEY> --full' to perform a clean full import."
+    ),
+    "checkpoint_mismatch": (
+        "The checkpoint belongs to a different account or scope. "
+        "Run 'co jira sync-inc --project <KEY> --full' or delete the checkpoint manually."
+    ),
+    "lock": "Another sync is already running for this scope. Wait for it to finish or check for stuck processes.",
+    "recovery_failed": (
+        "Manual intervention required. "
+        "Inspect the staging and daily JSONL files under --output and --state, then retry."
+    ),
+    "mapping_error": "Review the rejected Jira items and retry; valid records were still written.",
+    "persistence": "Check --output and --state directory permissions, then retry.",
+    "source_yaml_conflict": (
+        "Delete source.yaml under --output and rerun, "
+        "or pass --migrate-source to upgrade from v1."
+    ),
+    "fetch_failed": "Check your Jira credentials and network, then retry 'co jira sync-inc'.",
+    "internal_error": "Unexpected error. Run 'co jira verify' to check credentials, then retry.",
+    "namespace_violation": (
+        "Pass a --output / --state path outside ~/.co/rem/docs/onenote "
+        "or omit the flags to use the default Jira directories."
+    ),
+}
+
+
+def _sync_inc_recovery(error_code: str | None) -> str:
+    return _SYNC_INC_RECOVERY.get(
+        error_code or "",
+        "Run 'co jira verify' to check credentials and retry 'co jira sync-inc'.",
+    )
+
+
+def handle_jira_sync_incremental(
+    project_key: str,
+    issue_keys: list[str],
+    *,
+    output_dir: Path | None = None,
+    state_dir: Path | None = None,
+    as_json: bool = False,
+    full: bool = False,
+    history: bool = True,
+    migrate_source: bool = False,
+) -> None:
+    """Run incremental (or full) Jira sync using the checkpoint-backed transaction engine.
+
+    Calls run_jira_sync() (F13FCAKE-19) which implements the 10-step AG-1–AG-5 transaction.
+    The first run is always a full import; subsequent runs read only issues updated since
+    the last checkpoint. Pass full=True (--full) to force a complete re-import.
+
+    JSON output on success: {mode, scope, issues_read, issues_mapped, net_new_records,
+    placement, checkpoint_result, rejections, error_code, exit_code}.
+    JSON output on failure: adds error, exit_code, source, error_code, recovery_action.
+
+    exit_code 1 = partial mapping failure (valid records written, cursor unchanged).
+    exit_code 2 = hard failure (auth, lock, persistence, recovery error).
+    """
+    from ...useful_tools.jira_checkpoint import run_jira_sync
+
+    result = run_jira_sync(
+        project_key,
+        issue_keys=issue_keys if issue_keys else None,
+        full=full,
+        state_dir=state_dir,
+        output_dir=output_dir,
+        history=history,
+        migrate_source=migrate_source,
+    )
+
+    if result.exit_code == 0:
+        if as_json:
+            print(json.dumps({
+                "mode": result.mode,
+                "scope": result.scope,
+                "issues_read": result.issues_read,
+                "issues_mapped": result.issues_mapped,
+                "net_new_records": result.net_new_records,
+                "placement": result.placement,
+                "checkpoint_result": result.checkpoint_result,
+                "rejections": result.rejections,
+                "error_code": result.error_code,
+                "exit_code": 0,
+            }))
+            return
+        if result.checkpoint_result == "recovered":
+            print(f"Recovered from interrupted run; staged records written to {result.placement}")
+            print(f"Example: co jira sync-inc --project {project_key}")
+            return
+        if result.issues_read == 0:
+            print(f"No new issues in {project_key} since last sync (checkpoint up to date).")
+        elif result.net_new_records == 0:
+            print(
+                f"Project: {project_key}  Issues read: {result.issues_read}  "
+                f"Records mapped: {result.issues_mapped}  New records: 0 (all already present)"
+            )
+        else:
+            print(f"Wrote {result.placement}")
+            print(
+                f"Project: {project_key}  Issues read: {result.issues_read}  "
+                f"Records mapped: {result.issues_mapped}  New records: {result.net_new_records}"
+            )
+        print(f"Checkpoint: {result.checkpoint_result}")
+        if result.error_code:
+            errors.print(
+                f"Warning: {result.error_code}: {result.error_detail}", style="yellow", markup=False
+            )
+        return
+
+    # exit_code 1 (partial) or 2 (hard failure)
+    scope = result.scope
+    msg = result.error_detail or "Sync failed."
+    recovery = _sync_inc_recovery(result.error_code)
+    report = {
+        "error": msg,
+        "exit_code": result.exit_code,
+        "source": "jira",
+        "scope": scope,
+        "error_code": result.error_code,
+        "recovery_action": recovery,
+        "mode": result.mode,
+        "issues_read": result.issues_read,
+        "issues_mapped": result.issues_mapped,
+        "net_new_records": result.net_new_records,
+        "placement": result.placement,
+        "checkpoint_result": result.checkpoint_result,
+        "rejections": result.rejections,
+    }
+    if as_json:
+        print(json.dumps(report))
+    else:
+        errors.print(f"Jira sync failed (scope: {json.dumps(scope)}).", markup=False)
+        errors.print(msg, style="red", markup=False)
+        if result.rejections:
+            errors.print(f"{len(result.rejections)} item(s) rejected:", markup=False)
+            for label, reason in result.rejections.items():
+                errors.print(f"  Rejected {label}: {reason}", markup=False)
+        errors.print(f"Next: {recovery}", markup=False)
+    sys.exit(result.exit_code)

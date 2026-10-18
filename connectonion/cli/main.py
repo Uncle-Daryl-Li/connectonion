@@ -2560,6 +2560,75 @@ def _jira_sync(
                      history=history)
 
 
+@jira_app.command(
+    "sync-inc",
+    cls=ImportFeedbackCommand,
+    epilog=(
+        "Example:  co jira sync-inc --project ALPHA"
+        "  |  co jira sync-inc --project ALPHA --issues ALPHA-1 --issues ALPHA-2"
+        "  |  co jira sync-inc --project ALPHA --full"
+        "  |  co jira sync-inc --project ALPHA --json"
+    ),
+)
+def _jira_sync_inc(
+    project_key: str = typer.Option(..., "--project", help="Jira project key, e.g. ALPHA"),
+    issue_keys: Optional[List[str]] = typer.Option(
+        None, "--issues",
+        help="Restrict the sync to these issue keys (repeat per key: --issues ALPHA-1 --issues ALPHA-2)",
+        show_default=False,
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        help="Directory to write source.yaml and daily JSONL (default: ~/.co/rem/docs/jira)",
+        show_default=False,
+    ),
+    state: Optional[Path] = typer.Option(
+        None,
+        "--state",
+        help="Directory for checkpoint and staging files (default: ~/.co/rem/docs/jira/.state)",
+        show_default=False,
+    ),
+    full: bool = typer.Option(
+        False,
+        "--full/--no-full",
+        help="Ignore the existing checkpoint and re-import all matching issues (use after scope change)",
+    ),
+    history: bool = typer.Option(
+        True,
+        "--history/--no-history",
+        help="Also read each issue's change history (one extra read per issue); --no-history skips it",
+    ),
+    migrate_source: bool = typer.Option(
+        False,
+        "--migrate-source/--no-migrate-source",
+        help="Upgrade a v1 source.yaml to v2 in place (otherwise a v1 file causes an error)",
+        show_default=False,
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Output result as JSON"),
+):
+    """Incremental Jira sync: reads only issues updated since the last checkpoint (F13FCAKE-19).
+
+    The first run is always a full import. Subsequent runs read only issues updated
+    since the last successful checkpoint (cursor-based, 2-minute overlap window).
+    Use --full to force a complete re-import after a scope change.
+
+    Placement: appends to today's daily JSONL under --output (ongoing imports).
+    State: checkpoint and crash-recovery files live under --state.
+    """
+    from .commands.jira_commands import handle_jira_sync_incremental
+    handle_jira_sync_incremental(
+        project_key,
+        issue_keys or [],
+        output_dir=output,
+        state_dir=state,
+        as_json=as_json,
+        full=full,
+        history=history,
+        migrate_source=migrate_source,
+    )
+
+
 # OneNote (#1887): the notebooks `co auth microsoft` grants since 1.8.9.
 onenote_app = _typer_app(
     help="Your OneNote pages. Bare co onenote shows recent pages; ls shows notebooks. Reading is Read-only.",

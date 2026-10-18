@@ -1,0 +1,5 @@
+Project : ALPHA
+Issues  : ALPHA-1, ALPHA-2
+
+ALPHA-1  [Open]     Fix login redirect on expired session
+ALPHA-2  [In Progress]  Add rate-limit headers to REST endpoints

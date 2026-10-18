@@ -15,6 +15,7 @@ Components under test:
 - Module: connectonion/benchmark/runner.py (with connectonion.core.agent.Agent and useful_plugins.skills)
 """
 
+import json
 import os
 import textwrap
 
@@ -374,3 +375,334 @@ def test_an_attempt_that_saw_the_answers_anyway_is_invalid_not_judged_and_not_a_
 
     from connectonion.benchmark import report as reports
     assert "INVALID" in reports.render(report)
+
+
+
+# ---- offline command-fixture support (_stub_commands_for_eval) --------------------------------
+
+
+@pytest.fixture
+def bg_project(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    bm_dir = tmp_path / ".co" / "benchmarks"
+    bm_dir.mkdir(parents=True)
+    fx_dir = bm_dir / "fixtures"
+    fx_dir.mkdir()
+    (fx_dir / "projects.txt").write_text("KEY   NAME\nALPHA Alpha Project\n")
+    (fx_dir / "verify.txt").write_text("Connected: test@example.com\n")
+    (fx_dir / "map.json").write_text(json.dumps({
+        "co jira projects": "projects.txt",
+        "co jira verify": "verify.txt",
+    }))
+    return tmp_path
+
+
+def _bg_agent():
+    """An Agent whose bash / run_background / task_output tools echo back calls."""
+    def bash(command: str, description: str = "", cwd: str = ".", timeout: int = 120, agent=None) -> str:
+        """Run a bash command."""
+        return f"bash_real: {command}"
+
+    def run_background(command: str, description: str = "", agent=None) -> str:
+        """Run a shell command in the background."""
+        return f"Task real_1 started: {command}"
+
+    def task_output(task_id: str, tail: int = 50) -> str:
+        """Get output from a background task."""
+        return f"original output for {task_id}"
+
+    return Agent("bg-test", tools=[bash, run_background, task_output],
+                 llm=MockLLM(on_complete=lambda m, t: LLMResponse(
+                     content="done", tool_calls=[], raw_response=None, usage=TokenUsage())),
+                 log=False)
+
+
+def _fx_dir(bg_project):
+    return bg_project / ".co" / "benchmarks" / "fixtures"
+
+
+def test_stub_returns_fixture_output_for_matched_command(bg_project):
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    with runner._stub_commands_for_eval(bot, fx, live=False):
+        rb = bot.tools.get("run_background")
+        resp = rb(command="co jira projects", description="")
+        assert "fixture_1" in resp
+        to = bot.tools.get("task_output")
+        content = to(task_id="fixture_1")
+    assert "ALPHA Alpha Project" in content
+
+
+def test_stub_exact_match_only__no_partial_match(bg_project):
+    # "co jira projects" is in the map but "co jira projects --json" is not
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    with runner._stub_commands_for_eval(bot, fx, live=False):
+        rb = bot.tools.get("run_background")
+        resp = rb(command="co jira projects --json", description="")
+    assert "real_1" in resp, "unregistered variant must delegate to original"
+
+
+def test_stub_exact_match_only__json_does_not_match_bare(bg_project):
+    # if only the --json variant is in the map, the bare command must not match
+    fx = _fx_dir(bg_project)
+    (fx / "map.json").write_text(json.dumps({"co jira projects --json": "projects.txt"}))
+    bot = _bg_agent()
+    with runner._stub_commands_for_eval(bot, fx, live=False):
+        rb = bot.tools.get("run_background")
+        resp = rb(command="co jira projects", description="")
+    assert "real_1" in resp, "bare command must not match the --json fixture"
+
+
+def test_stub_unmatched_command_delegates_to_original(bg_project):
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    with runner._stub_commands_for_eval(bot, fx, live=False):
+        rb = bot.tools.get("run_background")
+        resp = rb(command="co some other command", description="")
+    assert "real_1" in resp and "co some other command" in resp
+
+
+def test_stub_repeated_task_output_returns_same_content(bg_project):
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    with runner._stub_commands_for_eval(bot, fx, live=False):
+        rb = bot.tools.get("run_background")
+        resp = rb(command="co jira verify", description="")
+        task_id = resp.split()[1]  # "Task fixture_1 started: ..."
+        to = bot.tools.get("task_output")
+        first = to(task_id=task_id)
+        second = to(task_id=task_id)
+    assert first == second
+    assert "Connected: test@example.com" in first
+
+
+def test_stub_transparent_when_live(bg_project):
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    original_rb = bot.tools.get("run_background")
+    with runner._stub_commands_for_eval(bot, fx, live=True):
+        rb_inside = bot.tools.get("run_background")
+    assert rb_inside is original_rb, "live=True must not swap tools"
+
+
+def test_stub_transparent_when_no_map(bg_project):
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    (fx / "map.json").unlink()
+    original_rb = bot.tools.get("run_background")
+    with runner._stub_commands_for_eval(bot, fx, live=False):
+        rb_inside = bot.tools.get("run_background")
+    assert rb_inside is original_rb, "absent map.json must not swap tools"
+
+
+def test_stub_malformed_map_raises_runner_error(bg_project):
+    fx = _fx_dir(bg_project)
+    (fx / "map.json").write_text("{ not valid json")
+    bot = _bg_agent()
+    with pytest.raises(runner.RunnerError) as exc:
+        with runner._stub_commands_for_eval(bot, fx, live=False):
+            pass
+    assert exc.value.code == 2 and "not valid JSON" in str(exc.value)
+
+
+def test_stub_map_wrong_type_raises_runner_error(bg_project):
+    fx = _fx_dir(bg_project)
+    (fx / "map.json").write_text(json.dumps(["list", "not", "object"]))
+    bot = _bg_agent()
+    with pytest.raises(runner.RunnerError) as exc:
+        with runner._stub_commands_for_eval(bot, fx, live=False):
+            pass
+    assert exc.value.code == 2 and "JSON object" in str(exc.value)
+
+
+def test_stub_missing_fixture_file_raises_runner_error(bg_project):
+    fx = _fx_dir(bg_project)
+    (fx / "map.json").write_text(json.dumps({"co jira verify": "does_not_exist.txt"}))
+    bot = _bg_agent()
+    with pytest.raises(runner.RunnerError) as exc:
+        with runner._stub_commands_for_eval(bot, fx, live=False):
+            pass
+    assert exc.value.code == 2 and "does_not_exist.txt" in str(exc.value)
+
+
+def test_stub_absolute_path_in_map_raises_runner_error(bg_project):
+    fx = _fx_dir(bg_project)
+    abs_path = str(bg_project / "outside.txt")
+    (bg_project / "outside.txt").write_text("should not be accessible")
+    (fx / "map.json").write_text(json.dumps({"co jira verify": abs_path}))
+    bot = _bg_agent()
+    with pytest.raises(runner.RunnerError) as exc:
+        with runner._stub_commands_for_eval(bot, fx, live=False):
+            pass
+    assert exc.value.code == 2 and "absolute" in str(exc.value)
+
+
+def test_stub_traversal_attempt_raises_runner_error(bg_project):
+    fx = _fx_dir(bg_project)
+    (bg_project / "outside.txt").write_text("should not be accessible")
+    (fx / "map.json").write_text(json.dumps({"co jira verify": "../../../outside.txt"}))
+    bot = _bg_agent()
+    with pytest.raises(runner.RunnerError) as exc:
+        with runner._stub_commands_for_eval(bot, fx, live=False):
+            pass
+    assert exc.value.code == 2 and "escapes" in str(exc.value)
+
+
+def test_stub_tools_restored_after_normal_completion(bg_project):
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    original_rb = bot.tools.get("run_background")
+    original_to = bot.tools.get("task_output")
+    with runner._stub_commands_for_eval(bot, fx, live=False):
+        pass
+    assert bot.tools.get("run_background") is original_rb
+    assert bot.tools.get("task_output") is original_to
+
+
+def test_stub_tools_restored_after_exception(bg_project):
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    original_rb = bot.tools.get("run_background")
+    with pytest.raises(RuntimeError):
+        with runner._stub_commands_for_eval(bot, fx, live=False):
+            raise RuntimeError("simulated crash")
+    assert bot.tools.get("run_background") is original_rb
+
+
+def test_stub_first_tool_restored_if_second_stub_install_fails(bg_project):
+    """If add() raises while installing the second stub (task_output), the
+    first stub (run_background) must still be removed and the original restored."""
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    original_rb = bot.tools.get("run_background")
+    original_to = bot.tools.get("task_output")
+
+    real_add = bot.tools.add
+    call_count = [0]
+
+    def failing_add(tool):
+        call_count[0] += 1
+        if call_count[0] == 2:  # second add is the task_output stub
+            raise RuntimeError("simulated registry failure on second stub")
+        return real_add(tool)
+
+    bot.tools.add = failing_add
+    with pytest.raises(RuntimeError, match="simulated registry failure"):
+        with runner._stub_commands_for_eval(bot, fx, live=False):
+            pass  # pragma: no cover
+
+    # Both originals must be restored even though installation failed partway.
+    assert bot.tools.get("run_background") is original_rb
+    assert bot.tools.get("task_output") is original_to
+
+
+def test_stub_third_stub_install_fails_all_originals_restored(bg_project):
+    """If add() raises while installing the third stub (bash), after run_background
+    and task_output stubs were already installed, all three originals must be
+    restored in finally."""
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    original_rb   = bot.tools.get("run_background")
+    original_to   = bot.tools.get("task_output")
+    original_bash = bot.tools.get("bash")
+
+    real_add = bot.tools.add
+    call_count = [0]
+
+    def failing_add(tool):
+        call_count[0] += 1
+        if call_count[0] == 3:  # third add is the bash stub
+            raise RuntimeError("simulated registry failure on third stub")
+        return real_add(tool)
+
+    bot.tools.add = failing_add
+    with pytest.raises(RuntimeError, match="simulated registry failure"):
+        with runner._stub_commands_for_eval(bot, fx, live=False):
+            pass  # pragma: no cover
+
+    # All three originals must be back.
+    assert bot.tools.get("run_background") is original_rb
+    assert bot.tools.get("task_output") is original_to
+    assert bot.tools.get("bash") is original_bash
+
+
+def test_stub_duplicate_normalized_commands_raises_runner_error(bg_project):
+    """Two map keys that collapse to the same normalised command must raise
+    RunnerError(code=2) instead of silently overwriting the first fixture."""
+    fx = _fx_dir(bg_project)
+    # "co jira projects" and "co  jira  projects" normalise identically.
+    (fx / "map.json").write_text(json.dumps({
+        "co jira projects": "projects.txt",
+        "co  jira  projects": "verify.txt",
+    }))
+    bot = _bg_agent()
+    with pytest.raises(runner.RunnerError) as exc:
+        with runner._stub_commands_for_eval(bot, fx, live=False):
+            pass
+    assert exc.value.code == 2 and "duplicates" in str(exc.value)
+
+
+def test_stub_fixture_read_error_raises_runner_error(bg_project):
+    """A fixture file that cannot be decoded raises RunnerError(code=2)."""
+    fx = _fx_dir(bg_project)
+    # Write bytes that are not valid UTF-8.
+    (fx / "bad.bin").write_bytes(b"\xff\xfe invalid utf-8 \x80\x81")
+    (fx / "map.json").write_text(json.dumps({"co jira verify": "bad.bin"}))
+    bot = _bg_agent()
+    with pytest.raises(runner.RunnerError) as exc:
+        with runner._stub_commands_for_eval(bot, fx, live=False):
+            pass
+    assert exc.value.code == 2 and "bad.bin" in str(exc.value)
+
+
+def test_stub_bash_returns_fixture_directly_for_matched_command(bg_project):
+    """bash("co jira projects") must return fixture content directly, no task ID."""
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    with runner._stub_commands_for_eval(bot, fx, live=False):
+        bash = bot.tools.get("bash")
+        result = bash(command="co jira projects", description="")
+    assert "ALPHA Alpha Project" in result
+    # A task-ID prefix would mean it went through run_background path by mistake.
+    assert "fixture_" not in result
+
+
+def test_stub_bash_unmatched_command_delegates_to_original(bg_project):
+    """An unregistered bash command must fall through to the real bash tool."""
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    with runner._stub_commands_for_eval(bot, fx, live=False):
+        bash = bot.tools.get("bash")
+        result = bash(command="echo hello", description="")
+    assert "bash_real: echo hello" in result
+
+
+def test_stub_bash_transparent_when_live(bg_project):
+    """live=True must leave the bash tool completely unchanged."""
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    original_bash = bot.tools.get("bash")
+    with runner._stub_commands_for_eval(bot, fx, live=True):
+        assert bot.tools.get("bash") is original_bash
+
+
+def test_stub_bash_restored_after_normal_completion(bg_project):
+    """The original bash tool must be back on the agent after a clean exit."""
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    original_bash = bot.tools.get("bash")
+    with runner._stub_commands_for_eval(bot, fx, live=False):
+        pass
+    assert bot.tools.get("bash") is original_bash
+
+
+def test_stub_bash_restored_after_body_exception(bg_project):
+    """The original bash tool must be restored even when the body raises."""
+    bot = _bg_agent()
+    fx = _fx_dir(bg_project)
+    original_bash = bot.tools.get("bash")
+    with pytest.raises(RuntimeError):
+        with runner._stub_commands_for_eval(bot, fx, live=False):
+            raise RuntimeError("crash in body")
+    assert bot.tools.get("bash") is original_bash

@@ -43,6 +43,7 @@ Usage:
 import datetime
 import hashlib
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -258,6 +259,9 @@ def append_daily_jsonl(records: list[dict], source_dir: Path, *,
         for record in new_records:
             json.dump(record, fh, ensure_ascii=False)
             fh.write("\n")
+        if new_records:
+            fh.flush()
+            os.fsync(fh.fileno())
     return target, len(new_records)
 
 
@@ -645,3 +649,7 @@ def _onenote_record(page: dict, account: str, fetched: str) -> dict:
 
 def _parent_name(parent) -> str:
     return str(parent.get("displayName") or "") if isinstance(parent, dict) else ""
+
+
+# Public alias so jira_checkpoint.py can import snapshot_hash without touching _snapshot_hash.
+snapshot_hash = _snapshot_hash

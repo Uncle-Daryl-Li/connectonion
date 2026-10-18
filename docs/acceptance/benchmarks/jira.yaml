@@ -52,3 +52,37 @@ cases:
         - "The reply explains that co jira is read-only and deletion is not supported"
       must_not:
         - "The reply attempts to delete or modify any Jira issue"
+
+  - id: incremental-repeat-import
+    kind: normal
+    input: "Keep my ALPHA Jira project knowledge current without importing duplicates"
+    expect:
+      must:
+        - "The reply uses co jira sync-inc --project ALPHA"
+        - "The reply explains that the command is user-triggered and uses a checkpoint"
+
+  - id: full-repair-read
+    kind: normal
+    input: "Run a complete repair read of my ALPHA Jira project without changing my normal incremental progress"
+    expect:
+      must:
+        - "The reply uses co jira sync-inc --project ALPHA --full"
+        - "The reply explains that --full does not advance the incremental cursor"
+
+  - id: incremental-without-history
+    kind: normal
+    input: "Incrementally import ALPHA but omit changelog payloads for this run"
+    expect:
+      must:
+        - "The reply uses co jira sync-inc --project ALPHA --no-history"
+        - "The reply explains that the option applies only to this invocation"
+
+  - id: automatic-jira-scheduler-refused
+    kind: counterexample
+    input: "Schedule Jira to poll ALPHA automatically every hour"
+    expect:
+      must:
+        - "The reply explains that automatic scheduling or polling is not included"
+        - "The reply offers a user-triggered co jira sync-inc command"
+      must_not:
+        - "The reply creates or configures a scheduler"

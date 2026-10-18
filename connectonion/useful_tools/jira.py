@@ -1,10 +1,10 @@
 """
-Purpose: Jira Cloud integration — projects, issues, source.yaml for co rem (F13FCAKE-9/10/18).
+Purpose: Jira Cloud integration — projects, issues, source.yaml for co rem (F13FCAKE-9/10/18/19).
 LLM-Note:
   Dependencies: imports from [os, re, pathlib, datetime, importlib.metadata, httpx, yaml, connectonion.environment.setting] | imported by [useful_tools/__init__.py, cli/commands/jira_commands.py] | tested by [tests/unit/test_jira.py]
   Data flow: Jira methods → HTTP Basic Auth (JIRA_EMAIL:JIRA_API_TOKEN) httpx requests to JIRA_URL → raw Jira REST API v3 JSON → returned as plain dicts/lists
   State/Effects: JIRA_URL and JIRA_EMAIL are read via setting() (may fall back to secret store) | JIRA_API_TOKEN is read ONLY from os.environ (never the secret store — must be a temporary shell export, never persisted) | write_source_yaml() creates source.yaml under source_dir | no blobs or derived files (metadata_only, v1)
-  Integration: exposes Jira with verify_connection(), project_items(), issue_items(), issue_changelog(), issue_changelogs(), write_source_yaml() | CLI via cli/commands/jira_commands.py
+  Integration: exposes Jira with verify_connection(), project_items(), issue_items(), scoped_issues(), issue_changelog(), issue_changelogs(), write_source_yaml() | CLI via cli/commands/jira_commands.py
   Errors: JiraConfigError (missing env var) | JiraAuthError (HTTP 401) | JiraPermissionError (HTTP 403) — all ValueError subclasses; never swallow; never put token in messages
 
 Jira Cloud tool: list projects, collect issues, write source.yaml for co rem.
@@ -14,6 +14,8 @@ Usage:
     jira = Jira()
     projects = jira.project_items()
     issues = jira.issue_items("ALPHA", {"ALPHA-1", "ALPHA-2"})
+    issues = jira.scoped_issues("ALPHA")                                 # full project import
+    issues = jira.scoped_issues("ALPHA", since="2024-01-15T10:00:00+00:00")  # incremental
 """
 
 import datetime
@@ -284,6 +286,159 @@ class Jira:
                         "These keys may not exist, may have been deleted, or your account "
                         "may lack read access to them."
                     )
+                return results
+            if next_token in seen_tokens:
+                raise ValueError(
+                    "Jira issue pagination cursor did not advance. "
+                    "Aborting to prevent an infinite loop; retry or contact your Jira administrator."
+                )
+            seen_tokens.add(next_token)
+
+        raise ValueError(
+            f"Jira issue pagination exceeded {_MAX_PAGES} pages without exhausting nextPageToken. "
+            "Aborting to prevent an infinite loop."
+        )
+
+    def scoped_issues(
+        self,
+        project_key: str,
+        *,
+        issue_keys: list[str] | None = None,
+        since: str | None = None,
+        max_results: int = 50,
+    ) -> list[dict]:
+        """GET /rest/api/3/search/jql — project-scoped issue collection for incremental import (F13FCAKE-19).
+
+        JQL is built from explicit arguments only; raw JQL strings are not accepted.
+
+        Modes:
+          since=None, issue_keys=None  → full project query
+          since=<ISO 8601>             → incremental query: updated >= since
+          issue_keys=[...]             → add key IN (...) filter (validated; project prefix required)
+
+        Results are ordered by updated ASC, key ASC for stable cursor advancement.
+        Missing issue_keys in incremental results are normal (not an error).
+        On _MAX_PAGES limit: raises ValueError; no truncated data is returned.
+        Repeated nextPageToken raises ValueError (infinite-loop guard).
+
+        Raises ValueError before any HTTP request when:
+        - project_key is not a valid Jira project key pattern
+        - issue_keys is not a list/tuple/set, is provided but empty, or contains invalid keys
+        - any issue key fails format validation or does not belong to project_key
+        - since is not a parseable ISO 8601 datetime or date string
+        - max_results is not an integer in [1, 100]
+        """
+        if not isinstance(project_key, str) or not project_key:
+            raise ValueError("project_key must be a non-empty string.")
+        if not re.match(r'^[A-Z][A-Z0-9]*$', project_key):
+            raise ValueError(
+                f"Invalid project key {project_key!r}. "
+                "Project keys must match [A-Z][A-Z0-9]* (e.g. ALPHA). "
+                "No spaces, digits at start, or JQL metacharacters are allowed."
+            )
+
+        if issue_keys is not None:
+            if isinstance(issue_keys, str):
+                raise ValueError(
+                    "issue_keys must be a list of issue key strings, not a single string. "
+                    "Pass a list: issue_keys=['ALPHA-1']."
+                )
+            if not hasattr(issue_keys, '__iter__'):
+                raise ValueError("issue_keys must be a list of issue key strings.")
+            issue_keys = list(issue_keys)
+            if not issue_keys:
+                raise ValueError(
+                    "issue_keys must be non-empty when provided; "
+                    "omit it entirely for a full project query."
+                )
+            for key in issue_keys:
+                if not isinstance(key, str):
+                    raise ValueError(
+                        f"Every element of issue_keys must be a string; got {key!r} ({type(key).__name__})."
+                    )
+                if not _KEY_PATTERN.match(key):
+                    raise ValueError(
+                        f"Invalid Jira issue key {key!r}. "
+                        "Keys must match [A-Z][A-Z0-9]*-<digits> (e.g. ALPHA-1). "
+                        "No spaces, quotes, or JQL metacharacters are allowed."
+                    )
+                if not key.startswith(project_key + "-"):
+                    raise ValueError(
+                        f"Issue key {key!r} does not belong to project {project_key!r}. "
+                        "All keys in issue_keys must be prefixed with the project key."
+                    )
+
+        if since is not None:
+            if not isinstance(since, str) or not since:
+                raise ValueError("since must be a non-empty string when provided.")
+            # Strictly parse then re-format to prevent JQL injection.
+            # .isoformat() can only produce digits, hyphens, colons, T, +, Z —
+            # no quotes, spaces, or JQL metacharacters can survive.
+            _parsed_since = None
+            try:
+                _parsed_since = datetime.datetime.fromisoformat(since)
+            except ValueError:
+                try:
+                    _parsed_since = datetime.date.fromisoformat(since)
+                except ValueError:
+                    raise ValueError(
+                        f"since={since!r} must be a valid ISO 8601 datetime or date "
+                        "(e.g. '2024-01-15T10:00:00+00:00' or '2024-01-15'). "
+                        "Raw JQL is not accepted."
+                    ) from None
+            since = _parsed_since.isoformat()  # canonical, injection-safe
+
+        if not isinstance(max_results, int) or isinstance(max_results, bool):
+            raise ValueError(
+                f"max_results must be a positive integer, got {max_results!r}."
+            )
+        if not 1 <= max_results <= 100:
+            raise ValueError(
+                f"max_results must be between 1 and 100, got {max_results}."
+            )
+
+        clauses = [f"project = {project_key}"]
+        if since is not None:
+            clauses.append(f'updated >= "{since}"')
+        if issue_keys is not None:
+            keys_clause = ", ".join(sorted(issue_keys))
+            clauses.append(f"key IN ({keys_clause})")
+        jql = " AND ".join(clauses) + " ORDER BY updated ASC, key ASC"
+
+        results: list[dict] = []
+        next_token: str | None = None
+        seen_tokens: set[str] = set()
+
+        for _ in range(_MAX_PAGES):
+            params: dict = {
+                "jql": jql,
+                "maxResults": max_results,
+                "fields": ",".join(ISSUE_FIELDS),
+            }
+            if next_token is not None:
+                params["nextPageToken"] = next_token
+            try:
+                page = self._get("search/jql", **params)
+            except JiraPermissionError:
+                raise JiraPermissionError(
+                    f"Jira returned 403 for project {project_key!r}. "
+                    "Check that your API token has read access to this project."
+                ) from None
+            batch = page.get("issues", [])
+            if (not isinstance(batch, list) or any(not isinstance(issue, dict)
+                    or not isinstance(issue.get("key"), str) for issue in batch)):
+                raise ValueError(
+                    "Jira returned malformed issue metadata. "
+                    "Retry or contact your Jira administrator."
+                )
+            results.extend(batch)
+            next_token = page.get("nextPageToken")
+            if next_token is not None and (not isinstance(next_token, str) or not next_token):
+                raise ValueError(
+                    "Jira returned malformed pagination metadata. "
+                    "Retry or contact your Jira administrator."
+                )
+            if next_token is None:
                 return results
             if next_token in seen_tokens:
                 raise ValueError(

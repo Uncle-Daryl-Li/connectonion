@@ -2,7 +2,7 @@
 #
 # Build:  docker build -f Dockerfile.jira-test -t connectonion-jira-test .
 # Run:    docker run --rm connectonion-jira-test
-# Pass:   exit code 0; "57 passed" in output
+# Pass:   exit code 0; all selected Jira and checkpoint tests pass.
 #
 # Security guarantees
 # -------------------
@@ -30,7 +30,7 @@ RUN pip install --no-cache-dir -e ".[dev]"
 COPY tests/ ./tests/
 COPY pytest.ini ./
 
-# Run only the Jira unit tests.
+# Run the Jira and Jira-checkpoint unit tests.
 # -p no:cacheprovider  — avoids writing .pytest_cache inside the container
 # --tb=short           — concise tracebacks if anything fails
-CMD ["pytest", "tests/unit/test_jira.py", "-v", "--tb=short", "-p", "no:cacheprovider"]
+CMD ["pytest", "tests/unit/test_jira.py", "tests/unit/test_jira_checkpoint.py", "-v", "--tb=short", "-p", "no:cacheprovider"]

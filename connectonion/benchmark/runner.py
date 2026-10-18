@@ -149,7 +149,7 @@ def _shown(path: str) -> str:
     """A project skill by its project path, `.co/skills/x/SKILL.md`. The absolute
     path wrapped every evidence line in two on the first real report."""
     try:
-        return str(Path(path).resolve().relative_to(Path.cwd().resolve()))
+        return Path(path).resolve().relative_to(Path.cwd().resolve()).as_posix()
     except ValueError:
         return path  # ~/.co/skills or built-in: outside the project, so it stays absolute
 
@@ -269,7 +269,9 @@ def run(suite: Suite, agent, *, agent_path: str, skill: Optional[dict] = None, i
         raise RunnerError("--max-iterations must be a positive integer", code=2)
     started = time.time()
     cases = []
-    with _live_flag(live), _step_ceiling(agent, max_iterations), _answers_out_of_reach(agent, suite):
+    with _live_flag(live), _step_ceiling(agent, max_iterations), \
+         _stub_commands_for_eval(agent, suite.path.parent / "fixtures", live), \
+         _answers_out_of_reach(agent, suite):
         for case in suite.cases:
             cases.append(_run_case(case, agent, skill=skill, invoke=invoke, runs=runs,
                                    judge_model=judge_model, judge_call=judge_call,
@@ -369,6 +371,193 @@ def _answers_out_of_reach(agent, suite: Suite):
         yield
     finally:
         events["before_each_tool"].remove(guard)
+
+
+
+# ---- offline command-fixture support ---------------------------------------------------
+#
+# When live=False and a map.json exists under .co/benchmarks/fixtures/, the two
+# background tools (run_background / task_output) are swapped for stubs that
+# return pre-recorded outputs instead of invoking real subprocesses.  The swap
+# follows the same context-manager pattern as _step_ceiling and
+# _answers_out_of_reach: originals are restored unconditionally in finally.
+#
+# Security:
+#   - Fixture paths are confined to the fixture directory (no absolute paths,
+#     no ../  traversal).
+#   - Every fixture file is validated at entry, before any agent case runs.
+#   - RunnerError (code=2) is raised for any map/fixture problem.
+
+
+def _normalize_command(cmd: str) -> str:
+    """Strip and collapse all interior whitespace to a single space."""
+    return " ".join(cmd.strip().split())
+
+
+@contextlib.contextmanager
+def _stub_commands_for_eval(agent, fixture_dir: Path, live: bool):
+    """Replace bash, run_background, and task_output with fixture stubs for the eval run.
+
+    Active only when live=False and a map.json exists under fixture_dir.
+    Commands are matched exactly after normalisation (strip + collapse whitespace).
+    bash returns fixture content directly; run_background creates a task ID that
+    task_output resolves.  Falls through to the original tool for unmatched commands.
+    Restores originals unconditionally in finally.
+    """
+    map_file = fixture_dir / "map.json"
+    if live or not map_file.exists():
+        yield
+        return
+
+    try:
+        map_text = map_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RunnerError(f"fixture map {map_file} could not be read: {exc}", code=2) from exc
+    try:
+        raw = json.loads(map_text)
+    except json.JSONDecodeError as exc:
+        raise RunnerError(f"fixture map {map_file} is not valid JSON: {exc}", code=2) from exc
+    if not isinstance(raw, dict):
+        raise RunnerError(
+            f"fixture map {map_file}: top-level value must be a JSON object, "
+            f"got {type(raw).__name__}",
+            code=2,
+        )
+
+    fixture_dir_resolved = fixture_dir.resolve()
+    fixture_content: dict = {}
+    for cmd, rel_path in raw.items():
+        if not isinstance(cmd, str) or not isinstance(rel_path, str):
+            raise RunnerError(
+                f"fixture map {map_file}: every key and value must be a string", code=2
+            )
+        if Path(rel_path).is_absolute():
+            raise RunnerError(
+                f"fixture map {map_file}: {rel_path!r} is an absolute path; "
+                f"use a path relative to {fixture_dir}",
+                code=2,
+            )
+        candidate = (fixture_dir / rel_path).resolve()
+        try:
+            candidate.relative_to(fixture_dir_resolved)
+        except ValueError:
+            raise RunnerError(
+                f"fixture map {map_file}: {rel_path!r} escapes the fixture directory",
+                code=2,
+            )
+        if not candidate.is_file():
+            raise RunnerError(
+                f"fixture map {map_file}: fixture file {rel_path!r} not found "
+                f"(looked at {candidate})",
+                code=2,
+            )
+        norm_cmd = _normalize_command(cmd)
+        if norm_cmd in fixture_content:
+            raise RunnerError(
+                f"fixture map {map_file}: {cmd!r} normalises to {norm_cmd!r}, "
+                f"which duplicates an earlier entry; use exactly one key per command",
+                code=2,
+            )
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RunnerError(
+                f"fixture map {map_file}: could not read fixture {rel_path!r}: {exc}",
+                code=2,
+            ) from exc
+        fixture_content[norm_cmd] = text
+
+    tools_reg = getattr(agent, "tools", None)
+    original_rb   = tools_reg.get("run_background") if tools_reg is not None else None
+    original_to   = tools_reg.get("task_output")    if tools_reg is not None else None
+    original_bash = tools_reg.get("bash")           if tools_reg is not None else None
+
+    if not fixture_content or (original_rb is None and original_to is None and original_bash is None):
+        yield
+        return
+
+    _pending: dict = {}
+    _counter = [0]
+
+    def run_background_stub(command: str, description: str = "", agent=None) -> str:
+        """Run a shell command in the background."""
+        norm = _normalize_command(command)
+        if norm in fixture_content:
+            _counter[0] += 1
+            task_id = f"fixture_{_counter[0]}"
+            _pending[task_id] = fixture_content[norm]
+            desc = f" ({description})" if description else ""
+            return f"Task {task_id} started{desc}: {command}"
+        if original_rb is not None:
+            return original_rb(command=command, description=description, agent=agent)
+        return f"run_background: no fixture for {command!r}"
+
+    def task_output_stub(task_id: str, tail: int = 50) -> str:
+        """Get output from a background task."""
+        if task_id in _pending:
+            return _pending[task_id]
+        if original_to is not None:
+            return original_to(task_id=task_id, tail=tail)
+        return f"task_output: unknown task {task_id!r}"
+
+    def bash_stub(command: str, description: str = "", cwd: str = ".", timeout: int = 120, agent=None) -> str:
+        """Run a bash command."""
+        norm = _normalize_command(command)
+        if norm in fixture_content:
+            return fixture_content[norm]
+        if original_bash is not None:
+            return original_bash(command=command, description=description, cwd=cwd,
+                                 timeout=timeout, agent=agent)
+        return f"bash: no fixture for {command!r}"
+
+    run_background_stub.__name__ = "run_background"
+    task_output_stub.__name__ = "task_output"
+    bash_stub.__name__ = "bash"
+
+    from ..core.tool_factory import create_tool_from_function
+
+    stub_rb   = create_tool_from_function(run_background_stub)
+    stub_to   = create_tool_from_function(task_output_stub)
+    stub_bash = create_tool_from_function(bash_stub)
+
+    # Six flags track the state of each tool independently so the finally block
+    # can undo exactly what succeeded, even if setup fails partway through.
+    _rb_removed     = False
+    _rb_installed   = False
+    _to_removed     = False
+    _to_installed   = False
+    _bash_removed   = False
+    _bash_installed = False
+    try:
+        if original_rb is not None:
+            agent.tools.remove("run_background")
+            _rb_removed = True
+            agent.tools.add(stub_rb)
+            _rb_installed = True
+        if original_to is not None:
+            agent.tools.remove("task_output")
+            _to_removed = True
+            agent.tools.add(stub_to)
+            _to_installed = True
+        if original_bash is not None:
+            agent.tools.remove("bash")
+            _bash_removed = True
+            agent.tools.add(stub_bash)
+            _bash_installed = True
+        yield
+    finally:
+        if _rb_installed:
+            agent.tools.remove("run_background")
+        if _rb_removed:
+            agent.tools.add(original_rb)
+        if _to_installed:
+            agent.tools.remove("task_output")
+        if _to_removed:
+            agent.tools.add(original_to)
+        if _bash_installed:
+            agent.tools.remove("bash")
+        if _bash_removed:
+            agent.tools.add(original_bash)
 
 
 def _saw_answers(trace: List[dict], answers: List[str]) -> Optional[str]:
