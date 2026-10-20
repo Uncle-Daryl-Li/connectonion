@@ -400,18 +400,209 @@ Stable remains 1.8.3; this does not authorize final 1.8.4 or cloud provisioning.
 See [1.8.4a2 notes](docs/releases/1.8.4a2.md) and the
 [local acceptance record](docs/acceptance/1.8.4-live-followup/README.md).
 
-## Current Version: 1.9.2b10
+## Current Version: 1.9.3rc11
 
-1.9.2b10 is a 1.9.2 beta; stable remains 1.9.1. The `co handoff` mail reads
-like a mail on any screen: who handed you what, the task, where it stands and
-the open questions first, then the block for Codex or Claude Code in a box that
-wraps. Its install step asks for a version that exists (1.9.2b10 or newer, never
-the sender's own build) and installs co in its own environment, never the
-global Python. `co email send` keeps a plain-text body's paragraphs. One
-line installs co (`curl … install.sh | sh`), and an accepted handoff makes
-each side the other's agent contact. See
-[1.9.2b10 notes](docs/releases/1.9.2b10.md).
+1.9.3rc11 is a REM fix candidate; stable remains 1.9.2. Daily upkeep no longer drops a page's quotes
+(it now checks a rewrite against the page it replaces), pronoun repair only touches the owner,
+project pages get a quote round, deepen weighs activity above emptiness, and `co rem translate --all --to zh` gives the reader
+Chinese page content. See
+[1.9.3rc11 notes](docs/releases/1.9.3rc11.md).
 
+- 1.9.3rc11 (upkeep keeps its quotes).
+
+## Previous preview: 1.9.3rc10
+
+1.9.3rc10 is 1.9.3rc9 with one correction; stable remains 1.9.2. The packaged handoff blog post
+told its story with a real person and their business; it now uses a fictional sender. The code is
+unchanged. See [1.9.3rc10 notes](docs/releases/1.9.3rc10.md).
+
+- 1.9.3rc10 (the docs ship too).
+
+## Earlier preview: 1.9.3rc9
+
+1.9.3rc9 is a REM candidate; stable remains 1.9.2. Person pages quote people: the quote floor,
+first contact, History order and owner pronouns are enforced in code, and mean quotes per person
+page rose from 6.8 to 22.4 on notebook copies. Enrich reads long histories period by period, enrich
+and muse are judged on the lines they wrote, gathering at 16 workers is about twice as fast, and
+the reader shows quotes, quiet citations and the owner's language. A handoff pasted into a
+conversation about other work stops and asks for a new one. See [1.9.3rc9 notes](docs/releases/1.9.3rc9.md).
+
+- 1.9.3rc9 (pages that quote people).
+
+## Earlier preview: 1.9.3rc8
+
+1.9.3rc8 is a REM correction-maintenance candidate; stable remains 1.9.2.
+Subject changes without retained routing continuity no longer regain the prior
+subject's contact dates during promotion. Successful page passes keep the
+latest status of each known kind. Neither fix rewrites old saved claims or
+establishes visual/product maturity. See [1.9.3rc8 notes](docs/releases/1.9.3rc8.md).
+
+- 1.9.3rc8 (subject corrections survive restoration; status footers stay bounded).
+
+## Earlier preview: 1.9.3rc7
+
+1.9.3rc7 is a maintenance candidate; stable remains 1.9.2. REM excludes its own
+Windows drive/UNC task sessions from newly imported context, skill invocation
+counts and cached evidence samples (#2318, #2548). It does not repair memories
+already derived from internal prompts. See [1.9.3rc7 notes](docs/releases/1.9.3rc7.md).
+
+- 1.9.3rc7 (REM internal Windows tasks stay out of user context).
+
+## Previous preview: 1.9.3rc6
+
+1.9.3rc6 is the sixth 1.9.3 release candidate; stable remains 1.9.2. A handoff addressed to one
+agent's mailbox and accepted by another agent (a forwarded link) no longer re-points that name to the
+acceptor's key, and names rc5 already re-pointed read as mail contacts again (#2542). See
+[1.9.3rc6 notes](docs/releases/1.9.3rc6.md).
+
+- 1.9.3rc6 (a forwarded link no longer takes the name).
+
+## Previous preview: 1.9.3rc5
+
+1.9.3rc5 is the fifth 1.9.3 release candidate; stable remains 1.9.2. `co handoff` is end-to-end
+encrypted: `send` seals the handoff on the sender's machine and the key travels after `#` in the
+link (`coh4` codes), and after acceptance every message between the two agents is boxed to the other
+agent's key. The pasted prompt's install floor is 1.9.3rc5. See [1.9.3rc5 notes](docs/releases/1.9.3rc5.md).
+
+- 1.9.3rc5 (handoffs sealed).
+
+## Earlier preview: 1.9.3rc4
+
+1.9.3rc4 is the fourth 1.9.3 release candidate; stable remains 1.9.2. It fixes `co rem enrich` and
+`co rem muse` as rc3 shipped them: a Codex sub-agent finishing no longer ends the main turn, enrich's
+reading ledger for a project page includes its coding sessions, GitHub issues and pull requests and
+the git log, muse reads the same ledger, and the review gate accepts what the ledger lists. See
+[1.9.3rc4 notes](docs/releases/1.9.3rc4.md).
+
+- 1.9.3rc4 (enrich and muse, fixed).
+
+## Earlier preview: 1.9.3rc3
+
+1.9.3rc3 is the third 1.9.3 release candidate; stable remains 1.9.2. `co rem` gains two commands
+that deepen one written page: `co rem enrich PAGE` follows the leads the page has not followed
+(links, attachments, older threads) and adds what they establish, and `co rem muse PAGE` thinks the
+page through in one seven-turn thread, writing only when a question yields an insight. Both go
+through investigate's review gate. See [1.9.3rc3 notes](docs/releases/1.9.3rc3.md).
+
+- 1.9.3rc3 (enrich and muse).
+
+## Earlier preview: 1.9.3rc2
+
+1.9.3rc2 is the second 1.9.3 release candidate; stable remains 1.9.2. `co rem` keeps your coding
+sessions as Agent sessions: `co rem import sessions` writes one page per Codex or Claude Code
+conversation you typed in, with what it produced and its project, and `--summarise` adds a title,
+summary, topic tags, outcome and your verified decisions. The reader lists them by topic with one
+search and filters. Also reader fixes: one obligation counted once, calm empty states, last night's
+runs drawn as stretches, code and paths keep their case. See [1.9.3rc2 notes](docs/releases/1.9.3rc2.md).
+
+- 1.9.3rc2 (Agent sessions).
+
+## Earlier preview: 1.9.3rc1
+
+1.9.3rc1 is the 1.9.3 release candidate; stable remains 1.9.2. This candidate's `co rem` was given a
+real first run: a fresh notebook over 180 days of mail and coding sessions. It found pages lost
+after their paid turns to the notebook lock, which is fixed; on the fixed code 66 pages were
+accepted, none refused, none lost. Person pages lead in three sentences and list what each side
+owes; project pages are read from the repository's current line; the reader opens on what is
+waiting on you and shows each citation's original beside its line. Includes #2373 (the
+maintenance lock on Windows). See [1.9.3rc1 notes](docs/releases/1.9.3rc1.md).
+
+- 1.9.3rc1 (REM you can show).
+
+## Previous preview: 1.9.3b5
+
+1.9.3b5 is a 1.9.3 beta; stable remains 1.9.2. `co rem`'s first run on a real notebook: quotes are
+checked against their sources, every person, organisation and project page is audited, contact
+facts are the person's own or Unknown, and review repairs a page and removes only refuted
+sentences instead of refusing it. Refusals go to one ledger and are retried with a cap. The reader
+has one Activity view, `co rem open` serves a live reader that translates a page with co ai, and
+pages can be written in the owner's language. Includes #2347 (Claude Code projects after session
+preambles). See [1.9.3b5 notes](docs/releases/1.9.3b5.md).
+
+- 1.9.3b5 (REM pages you can trust on the first run).
+
+## Previous preview: 1.9.3b4
+
+1.9.3b4 is a 1.9.3 beta; stable remains 1.9.2. The pasted line, the prompt, the mail and the help texts
+said a handoff handed someone a task; they now say it hands them the context of a session (#2523). See
+[1.9.3b4 notes](docs/releases/1.9.3b4.md).
+
+- 1.9.3b4 (A handoff is the context of a session, not a task).
+
+## Previous preview: 1.9.3b3
+
+1.9.3b3 is a 1.9.3 beta; stable remains 1.9.2. In a Codex home that had run Codex before, the thread
+1.9.3b2 wrote was missing from `/resume` and the app's sidebar: Codex 0.162.1 lists threads from its
+state database, which takes in new rollouts only once. Accept now has Codex read the thread by id, which
+lists it, and `co handoff done` repeats the line that names it, because a Codex receiver left accept's
+copy out of its report. See [1.9.3b3 notes](docs/releases/1.9.3b3.md).
+
+- 1.9.3b3 (The handoff's thread, listed in Codex).
+
+## Previous preview: 1.9.3b2
+
+1.9.3b2 is a 1.9.3 beta; stable remains 1.9.2. A pasted handoff left the sender's conversation out of
+every thread: the recipient's Codex held the paste, tool calls and its own summary (#2513). Accept,
+run inside Codex or Claude Code, now writes the sender's conversation as a thread of its own, ending
+in the report, and says how to open it; `co handoff thread` adds it when a sandbox kept accept out.
+See [1.9.3b2 notes](docs/releases/1.9.3b2.md).
+
+- 1.9.3b2 (The sender's conversation, as a thread of its own).
+
+## Previous preview: 1.9.3b1
+
+1.9.3b1 is a 1.9.3 beta; stable remains 1.9.2. The line a handoff's recipient pastes installed
+1.9.2b27, because the install floor was not raised for b29 to 1.9.2, so recipients ran without the
+1.9.2 permission defaults: on Parrot `co handoff open` worked with full access. The recipient now
+installs the release that sent the handoff, and a test holds the floor at each release's own
+version (#2512). See [1.9.3b1 notes](docs/releases/1.9.3b1.md).
+
+- 1.9.3b1 (The recipient runs the release that sent it).
+
+## Stable release: 1.9.2
+
+Stable 1.9.2 hands a coding session to someone else's agent. `co handoff send` drafts it from the
+session (Codex, Claude Code, Gemini CLI, opencode, droid, Cursor or Grok), has the sender's own
+Codex or Claude Code take out private sentences, masks other people's details, and shows exactly
+what leaves before anything is sent; the recipient pastes one line, their agent accepts, works, asks
+the sender's agent what the session does not say, and sends the result back as a patch. Neither side
+gets more than messages about that handoff (DD-078, trust starts from cost). 1.9.2b31 passed real
+runs in the Codex and Claude Code apps in both directions, and Codex to Codex on 1.9.2b30, each
+ending with the patch applied on the sender's side with no other step from a person. See
+[1.9.2 notes](docs/releases/1.9.2.md).
+
+- 1.9.2 (Hand a session to someone else's agent).
+
+## Previous preview: 1.9.2rc1
+
+1.9.2rc1 is the 1.9.2 release candidate; stable remains 1.9.1. After 1.9.2b31 passed a real
+handoff in both directions between Claude Code and Codex, and Codex to Codex, each ending with the
+returned patch applied on the sender's side, `co trust list` stops saying a handoff makes a
+contact, and the recipient's agent is told its patch holds only its own changes. See
+[1.9.2rc1 notes](docs/releases/1.9.2rc1.md).
+
+- 1.9.2rc1 (Both directions, end to end).
+- 1.9.2b31 (Nobody gets more than the handoff).
+- 1.9.2b30 (From whichever agent you used).
+- 1.9.2b29 (Read by your own agent).
+- 1.9.2b28 (As you edited it).
+- 1.9.2b27 (Only what you approved).
+- 1.9.2b26 (Nobody else's details).
+- 1.9.2b25 (A note in your own voice).
+- 1.9.2b24 (Read it first, then one line).
+- 1.9.2b23 (A note from someone you know).
+- 1.9.2b22 (Everything arrives with accept).
+- 1.9.2b21 (A handoff that opens on what you discussed).
+- 1.9.2b20 (A handoff nobody has to babysit).
+- 1.9.2b19 (One host, whichever way you start it).
+- 1.9.2b18 (A handoff a stranger can start from nothing).
+- 1.9.2b17 (A session copy with nothing secret in it).
+- 1.9.2b16 (A first handoff mail a stranger can read).
+- 1.9.2b15 (Every question answered once, on day thirty-one too).
+- 1.9.2b14 (See what your agent did, and for whom).
+- 1.9.2b13 (Questions answer themselves).
+- 1.9.2b12 (Agents talk through an inbox, not email).
+- 1.9.2b11 (A handoff that keeps what you said).
 - 1.9.2b10 (A handoff mail you can read on a phone).
 - 1.9.2b9 (Use the connectors Codex already has).
 - 1.9.2b8 (Paste one prompt to take over a handoff).
@@ -423,7 +614,7 @@ each side the other's agent contact. See
 - 1.9.2b2 (A first run that loses fewer pages; built, not published).
 - 1.9.2b1 (Each pass improves the page, not only grows it).
 
-## Stable release: 1.9.1
+## Previous stable: 1.9.1
 
 Stable 1.9.1 makes co rem's first run investigate rather than skim. It reads
 180 days of mail sixteen pages at a time, fetches two years in the background

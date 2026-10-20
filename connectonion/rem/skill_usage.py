@@ -30,11 +30,12 @@ from pathlib import Path
 
 from .files import RemError, read_json, state_path, write_json
 from .skill_runs import eval_events
-from .source import KINDS, source_files
+from .source import KINDS, rem_task, source_files
 
 CACHE = "skill-usage.json"
 # 3: Recount messages whose optional Codex id was omitted; older caches missed them.
-VERSION = 4
+# 5: Recount without exec prompts; their tool loads remain evidence.
+VERSION = 5
 EVER = datetime(1970, 1, 1, tzinfo=timezone.utc)
 COMMAND = re.compile(r"<command-name>/([^<\s]+)</command-name>")
 MENTION = re.compile(r"(?<![\w$])\$([A-Za-z][\w.:-]*)")
@@ -154,7 +155,7 @@ def usage(subscriptions: dict, names, *, root: Path | None = None, days: int = 1
                 skill = wanted.get(invoked.casefold()) or wanted.get(invoked.rsplit(":", 1)[-1].casefold())
                 if not skill or (when and when[:19] < since.isoformat()[:19]):
                     continue
-                if cwd and ("/.state/tasks/" in cwd + "/" or (root and _inside(cwd, root))):
+                if cwd and (rem_task(cwd) or (root and _inside(cwd, root))):
                     continue  # co rem's own task folders
                 row = counts[skill]
                 row["count"] += 1
@@ -207,7 +208,7 @@ def session_samples(root: Path, name: str, limit: int = 3) -> dict:
                 continue
             if when and when[:19] < since:
                 continue
-            if cwd and ("/.state/tasks/" in cwd + "/" or _inside(cwd, root)):
+            if cwd and (rem_task(cwd) or _inside(cwd, root)):
                 continue
             matches.append((when, file, kind, cwd))
     selected = sorted(set(matches), reverse=True)[:limit]

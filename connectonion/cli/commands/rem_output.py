@@ -7,6 +7,7 @@ from datetime import datetime
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from .. import style
@@ -255,7 +256,7 @@ def _init_text(value: dict, failed: bool) -> str:
                    if isinstance(skills, dict) else skill_count)
     skills_created = len(skills.get('created') or []) if isinstance(skills, dict) else 0
     counts = [('People', len(value.get('people') or []), ''),
-              ('Organizations', len(value.get('orgs') or []), ''),
+              ('Organisations', len(value.get('orgs') or []), ''),
               ('Projects', len(value.get('projects') or []), ''),
               ('Skills', skill_names, f" names · {skill_count:,} installed copies"),
               ('New pages', len(value.get('created') or []) + skills_created, '')]
@@ -268,6 +269,9 @@ def _init_text(value: dict, failed: bool) -> str:
                              f" · {value.get('phase', 'unknown')} · {scope}")
     lines = [title, '', *(labelled(label, f"{number:,}".rjust(wide) + tail) for label, number, tail in counts),
              labelled('Detailed map', '.state/map.json in this notebook, or rerun with --json')]
+    if value.get('sessions'):
+        from ...rem.sessions import summary
+        lines.append(summary(value['sessions']))
     for error in value.get('errors') or []:
         source = str(error.get('source', 'source'))
         lines.append(f"  {BROKEN} {source}" + ' ' * max(1, COLUMN - 4 - len(source)) + str(error.get('error', 'unavailable')))
@@ -340,7 +344,7 @@ def guide(next_command) -> str:
     paragraphs = [
         "co rem — map first, investigate next",
         "First run: " + next_command(["init"]) +
-        ". A script (no model) creates People, Organizations, Projects and Skills from templates and "
+        ". A script (no model) creates People, Organisations, Projects and Skills from templates and "
         "source metadata and prints your own page; then, in a terminal, it writes your own page with one "
         "model turn, after saying what it will spend (--no-investigate skips that). It starts no background "
         "work. Then read it with " + next_command(["open"]) + " and keep it current with " +
@@ -366,7 +370,10 @@ def guide(next_command) -> str:
 
 # Why a daily round started no page, in words (the record keeps the code).
 NO_PAGE = {'nothing_unfinished': 'every page is written', 'nothing_new': 'nothing new since the last run',
-           'no_page_fits_budget': 'no page fit what was left of the day\'s calls'}
+           'no_page_fits_budget': 'no page fit what was left of the day\'s calls',
+           'nothing_found': 'no page tried had anything to write from',
+           'refused': 'every page tried was refused; each is tried again within a day',
+           'failed': 'every page tried failed'}
 
 
 def _tokens(*usages) -> str:
@@ -409,6 +416,28 @@ def _pages_line(pages: list, left) -> str:
     return " · ".join(words) + (f" · {left} left" if left is not None else "")
 
 
+def depth_summary(value):
+    """Keep a deepening round's gains and losses visible beside its cost."""
+    columns = ("record", "round", "chars", "quotes", "sources", "insights", "lost quotes", "outcomes", "points")
+    rows = []
+    for row in value["picked"]:
+        rows.append(f"picked {row['record']}: value {row['value']}, recent ×{row['recent']}, "
+                    f"{row['quotes']} quotes, {row['sources']} sources, round {row['rounds'] + 1}")
+    rows.append(" | ".join(columns))
+    for row in value["rounds"]:
+        cells = [row["record"], str(row["round"])]
+        cells += [f"{row[key][0]} -> {row[key][1]}" for key in ("chars", "quotes", "sources")]
+        cells += [str(row["insights"]), str(row["lost_quotes"]),
+                  f"{row['enrich']} / {row['muse']}", f"{row['points']:g}"]
+        rows.append(" | ".join(cells))
+    if not value["rounds"]:
+        rows.append("No pages deepened.")
+    if value["stopped"]:
+        rows.append(f"Stopped: {value['stopped']}")
+    rows.append(f"Left: {value['left']}")
+    return escape("\n".join(rows))
+
+
 def sync_summary(value, spell=lambda arguments: 'co rem ' + ' '.join(arguments)):
     """What `co rem sync` ends on (#2044): a few lines, not the run record.
 
@@ -436,6 +465,12 @@ def sync_summary(value, spell=lambda arguments: 'co rem ' + ' '.join(arguments))
     if batch.get('outcome') not in ('completed', None):
         material += f" · {str(batch.get('outcome')).replace('_', ' ')}"
     lines = [rem_look.section('New material', said(material))]
+    if batch.get('sessions'):
+        from ...rem.sessions import summary
+        lines.append(rem_look.section('Agent sessions', said(summary(batch['sessions']).removeprefix('Agent sessions: '))))
+    if batch.get('failed_source'):
+        lines.append(rem_look.section('Source failed', said(
+            f"{batch['failed_source']}: {batch.get('error') or 'source could not be read'}")))
     lines += [rem_look.row('Refused', said(f"{row.get('record')}: {(row.get('errors') or ['rejected'])[0]}"[:160]),
                            style.warn(rem_look.BROKEN))
               for row in batch.get('refusals') or [] if isinstance(row, dict)]
@@ -449,6 +484,12 @@ def sync_summary(value, spell=lambda arguments: 'co rem ' + ' '.join(arguments))
             why = value.get('reason') or run.get('reason') or ''
             pages = f"none started; {NO_PAGE.get(why, why or 'see the log')}"
         lines.append(rem_look.section('Pages', said(pages)))
+    if 'depth' in value:
+        depth = value['depth']
+        detail = f"Deepened {len(depth['rounds'])} pages"
+        if depth.get('stopped'):
+            detail += f"; stopped: {depth['stopped']}"
+        lines.append(rem_look.section('Deepening', said(detail)))
     archive = _archive_line(batch.get('mail_archive'))
     if archive:
         lines.append(rem_look.section('Mail archive', said(archive) + ' ' + style.muted(rem_look.RESUMES)))

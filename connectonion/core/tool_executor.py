@@ -19,6 +19,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
+from ..approvals import needs_owner, special, stops_here
 from ..debug.xray import clear_xray_context, inject_xray_context, is_xray_enabled
 from .interrupt import InterruptibleIO, UserInterrupt, run_interruptible
 from .tool_result import ToolFailure
@@ -393,6 +394,15 @@ def execute_single_tool(
             'description': getattr(tool_func, 'description', '')
         }
 
+        # #2408: the special classes are decided by code, before any plugin
+        # can approve the call, in every mode.
+        klass = special(tool_name, tool_args, tool_func)
+        if klass:
+            trace_entry["class"] = klass
+            if stops_here(agent):
+                agent.current_session.pop('pending_tool', None)
+                raise ValueError(needs_owner(klass, tool_name))
+
         # Invoke before_each_tool events. A rejection or interrupt is control
         # flow, but pending_tool is transient in every outcome.
         try:
@@ -547,6 +557,8 @@ def execute_single_tool(
         error_msg = f"Error: {str(e)}"
         error_msg += f"\n\nTool '{tool_name}' schema: required={required}, all_params={properties}, you_provided={list(tool_args.keys())}"
         trace_entry["result"] = error_msg
+        if not cleared:
+            trace_entry["declined"] = True
 
         agent._record_trace(trace_entry)
 

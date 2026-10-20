@@ -37,7 +37,7 @@ from typing import Callable, Optional, Union
 import uvicorn
 from rich.console import Console
 
-from ... import address
+from ... import address, approvals
 from ...backend import DEFAULT_BACKEND_WS_URL
 from .. import announce, relay
 from ..asgi import create_app as asgi_create_app
@@ -81,7 +81,7 @@ from .ws_router import run_ws_session
 EXEC_REQUIRES = ("admin", "whitelist", "contact")
 
 
-def _make_ws_exec(create_agent, exec_permissions, trust_agent):
+def _make_ws_exec(create_agent, exec_permissions, trust_agent, record_dir=None):
     """Direct tool execution, gated on who is asking as well as what they ask.
 
     EXEC used to take neither the caller's address nor their level:
@@ -103,6 +103,24 @@ def _make_ws_exec(create_agent, exec_permissions, trust_agent):
     from that whitelist.
     """
     def handle_ws_exec(tool_name, args, requester_address=None):
+        result = gated_exec(tool_name, args, requester_address)
+        # The record (#2408). EXEC runs no hooks, so this is its only trace.
+        if record_dir:
+            approvals.append(record_dir, {
+                "path": "exec",
+                "who": approvals.identity(requester_address),
+                "tool": tool_name,
+                "args": approvals.short(args),
+                "class": result.get("class"),
+                # Only a tool that ran reports a duration; a refusal never ran.
+                "decision": "done" if "duration_ms" in result else "declined",
+                "outcome": result.get("status"),
+                "reason": approvals.short(result.get("error")),
+                "ms": result.get("duration_ms", 0),
+            })
+        return result
+
+    def gated_exec(tool_name, args, requester_address):
         if not requester_address:
             return {"status": "error",
                     "error": "forbidden: exec requires an authenticated caller"}
@@ -114,14 +132,29 @@ def _make_ws_exec(create_agent, exec_permissions, trust_agent):
                     "error": f"forbidden: exec requires a contact or admin, "
                              f"you are {level}"}
 
-        return exec_handler(create_agent, exec_permissions, tool_name, args)
+        return exec_handler(create_agent, exec_permissions, tool_name, args,
+                            owner=(level == "admin"))
 
     return handle_ws_exec
 
 
-def _make_remote_browser(remote_browser_service, trust_agent):
+def _make_remote_browser(remote_browser_service, trust_agent, record_dir=None):
     """Bind Remote Browser to authenticated contact-or-admin authority."""
     def handle_remote_browser(request, requester_address=None, transport="unknown"):
+        reply = gated_browser(request, requester_address, transport)
+        if record_dir:
+            approvals.append(record_dir, {
+                "path": "browser",
+                "who": approvals.identity(requester_address),
+                "tool": f"remote-browser {request.get('command', '')}".strip(),
+                "args": approvals.short({k: v for k, v in request.items() if k != "command"}),
+                "decision": "done" if reply.get("ok") else "declined",
+                "outcome": "success" if reply.get("ok") else reply.get("code"),
+                "reason": None if reply.get("ok") else approvals.short(reply.get("message")),
+            })
+        return reply
+
+    def gated_browser(request, requester_address, transport):
         if not requester_address:
             return {
                 "schema_version": "1",
@@ -393,8 +426,9 @@ def _create_route_handlers(
                              mode_policy=mode_policy,
                              is_admin=bool(requester and requester["level"] == "admin")), prompt)
 
-    handle_ws_exec = _make_ws_exec(create_agent, exec_permissions, trust_agent)
-    handle_remote_browser = _make_remote_browser(remote_browser_service, trust_agent)
+    record_dir = Path(project_dir) / ".co" if project_dir else project_co_dir()
+    handle_ws_exec = _make_ws_exec(create_agent, exec_permissions, trust_agent, record_dir)
+    handle_remote_browser = _make_remote_browser(remote_browser_service, trust_agent, record_dir)
 
     def handle_prepare_provider_workroom_turn(
         storage,
@@ -663,9 +697,9 @@ def _port_taken_message(port: int, co_dir: Path) -> str:
     where = (f"Change `port:` in {config_file}" if config_file.exists()
              else f"Put `port: {port + 1}` in {config_file} (it does not exist yet: create it)")
     return (f"[host] Port {port} is already in use — another agent, or an earlier "
-            f"`python agent.py` still running?\n"
+            f"`co host` still running?\n"
             f"       {where}, "
-            f"or for one run: AGENT_PORT={port + 1} python agent.py")
+            f"or for one run: co host --port {port + 1}")
 
 
 def _print_host_banner(
@@ -821,6 +855,23 @@ def _create_cleanup_lifespan(registry):
             job.stop()
 
     return on_startup, on_shutdown
+
+def _create_handoff_lifespan():
+    """Watch the handoffs this agent sent: acceptances, questions (answered automatically) and done.
+
+    It reads the mailbox only while a handoff sent in the last 14 days is waiting (handoff/watch.py)."""
+    from ...handoff import watch
+    stop = []
+
+    async def on_startup():
+        stop.append(watch.start())
+
+    async def on_shutdown():
+        for event in stop:
+            event.set()
+
+    return on_startup, on_shutdown
+
 
 def _both(first, second):
     """Run two lifespan callbacks as one, in order.
@@ -1040,6 +1091,15 @@ def _create_relay_lifespan(relay_url: str, addr_data: dict, summary: str, port: 
 DEFAULT_RELAY_URL = DEFAULT_BACKEND_WS_URL
 
 
+def _rem_root(rem_root, config: dict) -> Path | None:
+    """Where REM requests are read from: the code parameter, else the owner's ~/.co/rem
+    unless host.yaml says `rem: false`. Every host serves it, not only `co ai` (#2439);
+    only an admin can read it."""
+    if rem_root:
+        return Path(rem_root).expanduser().resolve()
+    return None if config.get("rem", True) is False else (Path.home() / ".co" / "rem").resolve()
+
+
 def host(
     create_agent: Callable,
     port: int = None,
@@ -1057,6 +1117,7 @@ def host(
     http=None,
     provider_station=None,
     rem_root: Path = None,
+    listen: list | None = None,
     on_agent_startup=None,
     on_agent_shutdown=None,
 ):
@@ -1105,6 +1166,8 @@ def host(
         summary: Agent description (default: from config or agent.system_prompt)
         examples: Example prompts (default: from config or auto-generated)
         http: Optional HTTPRouter with publisher-defined resource routes
+        rem_root: Where REM requests read from (default: ~/.co/rem, unless host.yaml has `rem: false`)
+        listen: Channels to answer, replacing host.yaml's `listen:` ([] answers none)
 
     Direct execution (WS EXEC):
         Clients can run a tool directly, bypassing the LLM, via
@@ -1286,7 +1349,9 @@ def host(
         project_dir=co_dir.parent,
         provider_station=provider_station,
     )
-    route_handlers["rem_root"] = Path(rem_root).expanduser().resolve() if rem_root else None
+    route_handlers["rem_root"] = _rem_root(rem_root, config)
+    # Where the local reader's token lives (rem_http.py): beside this Host's key.
+    route_handlers["identity_dir"] = co_dir
     # The host signs its half of a sealed direct channel with this.
     route_handlers["identity"] = addr_data
 
@@ -1343,12 +1408,16 @@ def host(
     # session_results.jsonl beside the interactive turns. The listener that
     # fills the directory is still its own process (DD-063 and #1478).
     inbox_startup, inbox_shutdown = create_inbox_lifespan(
-        co_dir, create_agent, storage, result_ttl, console=Console())
+        co_dir, create_agent, storage, result_ttl, console=Console(), channels=listen)
     on_startup = _both(on_startup, inbox_startup)
     on_shutdown = _both(inbox_shutdown, on_shutdown)
 
     on_startup = _both(on_startup, cleanup_startup)
     on_shutdown = _both(cleanup_shutdown, on_shutdown)
+    # Handoffs this agent sent get their questions answered whichever command started the host (#2453).
+    handoff_startup, handoff_shutdown = _create_handoff_lifespan()
+    on_startup = _both(on_startup, handoff_startup)
+    on_shutdown = _both(handoff_shutdown, on_shutdown)
     on_startup = _both(on_startup, on_agent_startup)
     on_shutdown = _both(on_agent_shutdown, on_shutdown)
 

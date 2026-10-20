@@ -20,7 +20,8 @@ def test_missing_cited_original_never_reaches_the_model(tmp_path):
         raise AssertionError('The audit cannot judge an unavailable original')
 
     report, usage = project_claim_review.review(Notebook(tmp_path), candidate, {}, tmp_path, should_not_run)
-    assert report == {'verdict': 'insufficient', 'findings': [], 'missing_citations': ['1']}
+    assert report == {'verdict': 'insufficient', 'findings': [], 'missing_citations': ['1'],
+                      'reason': 'No cited originals supplied'}
     assert usage == {}
 
 
@@ -76,12 +77,20 @@ def test_audit_keeps_all_cited_originals_when_several_source_files_are_long(tmp_
     assert len(material['sources']) == 4
     assert all('explains the project' in row['context']['excerpt'] for row in material['sources'])
 
-    def should_not_run(*args):
-        raise AssertionError('An over-budget audit cannot ask the model to guess')
+    # Over the bound, every excerpt is shortened evenly and marked truncated --
+    # an "insufficient" verdict left the pages with most to check unaudited.
+    sent = []
 
-    report, _usage = project_claim_review.review(Notebook(tmp_path), candidate, {}, tmp_path, should_not_run)
-    assert report['verdict'] == 'insufficient'
-    assert report['reason'] == 'Cited originals exceed the audit bound'
+    def audited(_workspace, prompt, *_args):
+        sent.append(prompt)
+        return {'result': json.dumps({'verdict': 'PASS', 'findings': []}), 'usage': {}}
+
+    report, _usage = project_claim_review.review(Notebook(tmp_path), candidate, {}, tmp_path, audited)
+    assert report['verdict'] == 'pass'
+    assert len(sent[0].encode('utf-8')) <= project_claim_review.BOUND
+    packet = json.loads(sent[0][sent[0].index('{"candidate"'):])
+    assert all(row['context']['truncated'] and 'explains the project' in row['context']['excerpt']
+               for row in packet['sources'])
 
 
 def test_runner_status_is_excluded_from_prose_audit(tmp_path, monkeypatch):
@@ -99,6 +108,146 @@ def test_runner_status_is_excluded_from_prose_audit(tmp_path, monkeypatch):
     report, _usage = project_claim_review.review(Notebook(tmp_path), candidate, {}, tmp_path, audited)
     assert report['verdict'] == 'pass'
     assert 'do not audit it as a prose claim' in seen['prompt']
+
+
+def test_people_audit_leaves_identity_fields_and_quote_style_to_code(tmp_path):
+    seen = []
+    candidate = '# Vern Chan\n\nVern wrote “Thank you.” [1]\n\n## Sources\n- [1] gmail:a\n'
+
+    def audited(_workspace, prompt, *_args):
+        seen.append(prompt)
+        return {'result': '{"verdict":"PASS","findings":[]}'}
+
+    project_claim_review.review(Notebook(tmp_path), candidate, {}, tmp_path, audited,
+                                record='people/vern-chan.md',
+                                items=[{'source': 'gmail:a', 'text': 'Thank you'}])
+    assert 'Email, Handles and Also known as are filled and checked by code; do not judge them' in seen[0]
+    assert "A quote's punctuation, spacing and quote-mark style are checked by code" in seen[0]
+    assert "judge only whether the words are the original's" in seen[0]
+
+
+def test_project_audit_counts_the_users_session_inputs_as_the_users_work(tmp_path):
+    """A first-run trial page lost People, Status and its open threads to "only a request" findings."""
+    seen = []
+    candidate = '# Atlas\n\n## Facts\n- People: the user (owner, sessions in these folders) [1]\n\n## Sources\n- [1] codex:s:1\n'
+
+    def audited(_workspace, prompt, *_args):
+        seen.append(prompt)
+        return {'result': '{"verdict":"PASS","findings":[]}'}
+
+    project_claim_review.review(Notebook(tmp_path), candidate, {}, tmp_path, audited,
+                                record='projects/atlas.md', items=[{'source': 'codex:s:1', 'text': 'Ship the export'}])
+    assert "every session input is the user's own message in this project's folders" in seen[0]
+    assert "its past date alone does not close it" in seen[0]
+    assert "Who did something is the sender" not in seen[0]
+
+
+@pytest.mark.parametrize('field', ['Email', 'Handles', 'Also known as'])
+def test_only_uncited_field_audit_findings_accept_the_page_unchanged(tmp_path, monkeypatch, field):
+    """Vern Chan's own address must not buy repair turns or become Unknown (2026-10-16)."""
+    prepare(tmp_path)
+    notebook, record = Notebook(tmp_path), 'people/vern-chan.md'
+    notebook.stub_person(record, 'Vern Chan', ['vern.chan@unsw.edu.au'], email='vern.chan@unsw.edu.au')
+    before = notebook.read(record)
+    candidate = (before.replace('- Unknown — not investigated yet', '- Unknown')
+                 .replace('## Who they are\n- Unknown', '## Who they are\nVern sent a greeting. [1]')
+                 .replace('- Also known as: Unknown', '- Also known as: Vern')
+                 .replace('- (none yet)', '- [1] gmail:a — 2026-10-16'))
+    path = tmp_path / 'candidate.md'
+    path.write_text(candidate)
+    items = [{'source': 'gmail:a', 'from': 'Vern Chan <vern.chan@unsw.edu.au>',
+              'text': 'Hello', 'timestamp': '2026-10-16T00:00:00Z'}]
+    # Settle the runner's normal formatting first so the comparison covers the whole page.
+    runner._promote_candidate(notebook, record, path, before, items, tmp_path, None)
+    before = notebook.read(record)
+    path.write_text(before)
+    value = next(line[2:] for line in before.splitlines() if line.startswith(f'- {field}:'))
+    finding = {'claim': value, 'issue': 'No adjacent citation', 'evidence': '',
+               'required_correction': 'Remove'}
+    monkeypatch.setattr(runner, 'run_claim_task', lambda *_args: {
+        'result': json.dumps({'verdict': 'FAIL', 'findings': [finding]})})
+
+    def no_repair(*_args):
+        raise AssertionError('An UNCITED-field finding must not trigger a repair turn')
+
+    runner.promote_with_repairs(notebook, record, path, before, items, tmp_path, {},
+                                workdir=tmp_path, config={}, stage='investigate', run=no_repair)
+    assert notebook.read(record) == before
+    report = json.loads((tmp_path / 'claim-review.json').read_text())
+    assert report['verdict'] == 'pass' and report['findings'] == []
+    assert json.loads((tmp_path / 'review.json').read_text())['accepted'] is True
+
+
+def test_uncited_field_findings_do_not_hide_a_refuted_phone(tmp_path):
+    candidate = ('# Vern Chan\n\n## Facts\n- Email: vern.chan@unsw.edu.au\n'
+                 '- Phone: 0400 000 000 [1]\n\n## Sources\n- [1] gmail:a\n')
+    findings = [{'claim': claim, 'issue': 'Wrong', 'evidence': '', 'required_correction': 'Remove'}
+                for claim in ['- Email: vern.chan@unsw.edu.au', 'Phone: 0400 000 000']]
+
+    def audited(*_args):
+        return {'result': json.dumps({'verdict': 'FAIL', 'findings': findings})}
+
+    report, _usage = project_claim_review.review(Notebook(tmp_path), candidate, {}, tmp_path, audited,
+                                                record='people/vern-chan.md',
+                                                items=[{'source': 'gmail:a', 'text': 'Hello'}])
+    assert report['verdict'] == 'fail' and report['findings'] == [findings[1]]
+
+
+@pytest.mark.parametrize('claim,carried_claim', [
+    ('Last contact: 2026-10-17', 'Last contact: 2026-10-17 [3]'),
+    ('Avery [3] leads\n the lab.', 'Avery\t leads [W2] the lab.'),
+])
+def test_carried_claim_findings_are_recorded_without_refusing(tmp_path, claim, carried_claim):
+    finding = {'claim': claim, 'issue': 'Unsupported', 'evidence': '', 'required_correction': 'Remove'}
+
+    def audited(*_args):
+        return {'result': json.dumps({'verdict': 'FAIL', 'findings': [finding]})}
+
+    candidate = '# Avery\n\n' + claim + '\n\n## Sources\n- [1] gmail:invented\n'
+    report, _ = project_claim_review.review(Notebook(tmp_path), candidate, {}, tmp_path, audited,
+        carried='# Avery\n\n' + carried_claim, items=[{'source': 'gmail:invented', 'text': 'Hello.'}])
+    assert report['findings'] == [] and report['verdict'] == 'pass'
+    assert report['carried_findings'] == [finding]
+
+
+def test_carried_findings_do_not_hide_a_new_claim(tmp_path):
+    claims = ['Avery leads the lab.', 'Avery approved the launch.']
+    findings = [{'claim': claim, 'issue': 'Unsupported', 'evidence': '', 'required_correction': 'Remove'}
+                for claim in claims]
+
+    def audited(*_args):
+        return {'result': json.dumps({'verdict': 'FAIL', 'findings': findings})}
+
+    candidate = '# Avery\n\n' + '\n'.join(claims) + '\n\n## Sources\n- [1] gmail:invented\n'
+    report, _ = project_claim_review.review(Notebook(tmp_path), candidate, {}, tmp_path, audited,
+        carried=claims[0], items=[{'source': 'gmail:invented', 'text': 'Hello.'}])
+    assert report['verdict'] == 'fail' and report['findings'] == findings[1:]
+    assert report['carried_findings'] == findings[:1]
+
+
+@pytest.mark.parametrize('stage', ['enrich', 'muse'])
+def test_last_resort_keeps_carried_claim_and_drops_only_new_claim(tmp_path, monkeypatch, stage):
+    prepare(tmp_path)
+    notebook, record = Notebook(tmp_path), 'projects/atlas.md'
+    notebook.stub_project(record, 'Atlas')
+    original = (notebook.read(record).replace('- Unknown — not investigated yet', '- Unknown')
+                .replace('## What it is\n- Unknown', '## What it is\nA local demo. [1]')
+                .replace('- (none yet)', '- [1] codex:invented — 2026-10-01'))
+    notebook.write(record, original)
+    candidate = tmp_path / 'candidate.md'
+    candidate.write_text(original.replace('A local demo. [1]', 'A local demo. [1]\nLaunch is approved. [1]'))
+    findings = [{'claim': claim, 'issue': 'Unsupported', 'evidence': '', 'required_correction': 'Remove'}
+                for claim in ['A local demo.', 'Launch is approved.']]
+    monkeypatch.setattr(runner, 'run_claim_task', lambda *args: {
+        'result': json.dumps({'verdict': 'FAIL', 'findings': findings})})
+    result = {}
+    runner.promote_with_repairs(notebook, record, candidate, original,
+        [{'source': 'codex:invented', 'text': 'What should we build?'}], tmp_path, result,
+        workdir=tmp_path, config={}, stage=stage, run=lambda *args: {})
+    assert result['repairs'] == 2 and result['refuted_claims'] == ['Launch is approved.']
+    assert 'A local demo.' in notebook.read(record) and 'Launch is approved.' not in notebook.read(record)
+    report = json.loads((tmp_path / 'claim-review.json').read_text())
+    assert report['carried_findings'] == findings[:1] and report['findings'] == findings[1:]
 
 
 def test_audit_sees_session_folder_without_promoting_it_to_subfolder_purpose(tmp_path, monkeypatch):
@@ -155,7 +304,8 @@ def test_failed_project_claim_review_preserves_previous_page(tmp_path, monkeypat
     assert json.loads((tmp_path / 'review.json').read_text())['factual_quality'] == 'bounded citation audit failed'
 
 
-def test_codex_audit_sends_private_sources_over_stdin(tmp_path, monkeypatch):
+@pytest.mark.parametrize('speed', ['fast', 'standard'])
+def test_codex_audit_sends_private_sources_over_stdin(tmp_path, monkeypatch, speed):
     codex = importlib.import_module('connectonion.useful_tools.codex')
 
     monkeypatch.setattr(codex, '_base_command', lambda: ['codex', 'app-server'])
@@ -168,10 +318,14 @@ def test_codex_audit_sends_private_sources_over_stdin(tmp_path, monkeypatch):
         return SimpleNamespace(returncode=0, stdout=json.dumps(event), stderr='')
 
     monkeypatch.setattr(runner.subprocess, 'run', completed)
-    config = {'runner': 'codex', 'model': 'gpt-6-luna', 'limits': {'timeout_seconds': 600}}
+    config = {'runner': 'codex', 'model': 'gpt-6-luna', 'speed': speed, 'limits': {'timeout_seconds': 600}}
     result = runner.run_claim_task(tmp_path, 'PRIVATE SOURCE BODY', config, 'claim-audit')
     assert seen['input'] == 'PRIVATE SOURCE BODY'
     assert 'PRIVATE SOURCE BODY' not in ' '.join(seen['command'])
+    if speed == 'fast':
+        assert seen['command'][seen['command'].index('-c') + 1] == 'service_tier="priority"'
+    else:
+        assert '-c' not in seen['command']
     assert result['usage'] == {'input_tokens': 42, 'cached_input_tokens': 0, 'output_tokens': 4}
 
 
@@ -182,3 +336,20 @@ def test_finished_task_keeps_rejection_reason_but_removes_audit_packet(tmp_path)
     assert all((tmp_path / name).is_file() for name in ('candidate.md', 'review.json', 'claim-review.json'))
     assert not (tmp_path / 'claim-input.txt').exists()
     assert (tmp_path / 'claim-review.json').stat().st_mode & 0o777 == 0o600
+
+
+def test_people_audit_keeps_an_unanswered_ask_open_and_an_overdue_promise_open(tmp_path):
+    """2026-10-20 request-vs-commitment case: the audit failed every open thread as "a past request",
+    and the last resort left Open threads Unknown on five of six runs."""
+    seen = []
+    candidate = '# Avery Lin\n\nAvery asked “Can you review it?” [1]\n\n## Sources\n- [1] gmail:a\n'
+
+    def audited(_workspace, prompt, *_args):
+        seen.append(prompt)
+        return {'result': '{"verdict":"PASS","findings":[]}'}
+
+    project_claim_review.review(Notebook(tmp_path), candidate, {}, tmp_path, audited,
+                                record='people/avery-lin.md', items=[{'source': 'gmail:a', 'text': 'Can you review it?'}])
+    assert "A dated ask or promise that no later message answers is open, however old" in seen[0]
+    assert "overdue, still open" in seen[0]
+    assert "a past ask is not a current debt" not in seen[0]

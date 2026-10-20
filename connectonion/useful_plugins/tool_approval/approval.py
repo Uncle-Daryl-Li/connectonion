@@ -819,7 +819,14 @@ def load_permission_patterns(co_dir=None) -> dict:
 # Not all of `.co/`: agents write `dashboard.html` on purpose — it *is* the Home
 # page, built by the dashboard skill — and logs, docs and skills are content
 # too. The line is what a file decides, not where it lives.
-CONTROL_FILES = ("host.yaml", "schedule.yaml", "admins.txt")
+#
+# approvals.jsonl is the record of what the agent did (#2408). An agent that
+# could edit it could hide what it did, so it is control too.
+#
+# The trust lists decide who may reach the agent at all (#2408's authority
+# class): an agent that could write whitelist.txt could admit anyone.
+CONTROL_FILES = ("host.yaml", "schedule.yaml", "admins.txt", "approvals.jsonl",
+                 "contacts.txt", "whitelist.txt", "blocklist.txt")
 CONTROL_DIRS = ("keys",)
 
 

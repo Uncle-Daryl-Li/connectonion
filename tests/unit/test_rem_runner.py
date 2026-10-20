@@ -12,7 +12,182 @@ import pytest
 from connectonion.rem.config import default_config, prepare
 from connectonion.rem.extract import run_extract
 from connectonion.rem.files import Notebook
+from connectonion.rem import runner
 from connectonion.rem.runner import RunFailed, run_stage, task_prompt
+
+
+@pytest.mark.parametrize('timeouts', [1, 2])
+@pytest.mark.parametrize('message', ['co ai timed out after 1200s', 'turn timed out after 1200s'])
+def test_stage_retries_a_timeout_once_and_counts_failed_usage(notebook, monkeypatch, timeouts, message):
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) <= timeouts:
+            raise RunFailed(message, {'input_tokens': 3})
+        return {'usage': {'input_tokens': 10}, 'result': 'done'}
+
+    monkeypatch.setattr(runner, 'run_task', run)
+    if timeouts == 1:
+        result = run_stage(notebook, [], default_config(), stage='abstract')
+        assert result['usage'] == {'input_tokens': 13}
+    else:
+        with pytest.raises(RunFailed, match='timed out') as caught:
+            run_stage(notebook, [], default_config(), stage='abstract')
+        assert caught.value.usage == {'input_tokens': 6}
+    assert len(calls) == 2 and calls[0] == calls[1]
+    metrics = json.loads(next((notebook.root / '.state/tasks').glob('*/result.json')).read_text())
+    assert metrics['timeouts_retried'] == 1
+    assert metrics['usage'] == {'input_tokens': 13 if timeouts == 1 else 6}
+    assert metrics['status'] == ('execution_finished' if timeouts == 1 else 'failed')
+
+
+def test_stage_does_not_retry_other_failures(notebook, monkeypatch):
+    calls = []
+
+    def run(*args):
+        calls.append(args)
+        raise RunFailed('provider at capacity', {'input_tokens': 3})
+
+    monkeypatch.setattr(runner, 'run_task', run)
+    with pytest.raises(RunFailed, match='at capacity'):
+        run_stage(notebook, [], default_config(), stage='abstract')
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('harness,expected', [('codex', 33), ('claude-code', 63)])
+def test_timeout_retry_resumes_same_thread_and_usage_survives_later_turns(notebook, monkeypatch, harness, expected):
+    record = 'people/avery-lin.md'
+    notebook.stub_person(record, 'Avery Lin', ['avery@example.com'], email='avery@example.com')
+    calls = []
+
+    def run(workdir, prompt, config, stage, **options):
+        calls.append((prompt, options))
+        if len(calls) == 2:
+            raise RunFailed('turn timed out after 1200s', {'input_tokens': 3})
+        usage = 10 if len(calls) == 1 else 20 if len(calls) == 3 else 30
+        return {'session_id': 'avery-thread', 'usage': {'input_tokens': usage}}
+
+    monkeypatch.setattr(runner, 'run_task', run)
+    result = run_stage(notebook, [{'role': 'page', 'record': record}],
+                       {**default_config(), 'runner': harness}, stage='enrich', turns=('first', 'second', 'third'))
+    assert calls[1] == calls[2] == ('second', {'session': 'avery-thread'})
+    assert result['usage'] == {'input_tokens': expected}
+
+
+def test_later_timeouts_without_usage_keep_prior_retry_usage(notebook, monkeypatch):
+    record = 'people/avery-lin.md'
+    notebook.stub_person(record, 'Avery Lin', ['avery@example.com'], email='avery@example.com')
+    calls = []
+
+    def run(*args, **options):
+        calls.append(options)
+        if len(calls) == 2:
+            return {'session_id': 'avery-thread', 'usage': {'input_tokens': 10}}
+        raise RunFailed('turn timed out after 1200s', {'input_tokens': 3} if len(calls) == 1 else None)
+
+    monkeypatch.setattr(runner, 'run_task', run)
+    with pytest.raises(RunFailed, match='timed out') as caught:
+        run_stage(notebook, [{'role': 'page', 'record': record}], default_config(),
+                  stage='enrich', turns=('first', 'second'))
+    assert len(calls) == 4
+    assert caught.value.usage == {'input_tokens': 13}
+
+
+@pytest.mark.parametrize('fails_twice', [False, True])
+@pytest.mark.parametrize('followup', ['one_more', 'search'])
+def test_followup_retries_timeout_and_counts_all_attempts(notebook, monkeypatch, fails_twice, followup):
+    record = 'people/avery-lin.md'
+    notebook.stub_person(record, 'Avery Lin', ['avery@example.com'], email='avery@example.com')
+    calls = []
+
+    def run(workdir, prompt, config, stage):
+        calls.append(prompt)
+        if len(calls) == 2 or len(calls) == 3 and fails_twice:
+            raise RunFailed('co ai timed out after 1200s', {'input_tokens': 3})
+        if len(calls) == 3 or followup == 'search':
+            next(workdir.glob('investigate-*/candidate.md')).write_text('# Avery Lin\n')
+        if followup == 'search':
+            next(workdir.glob('investigate-*')).joinpath('search-requests.json').write_text('["Avery Lin"]')
+        return {'usage': {'input_tokens': 10}}
+
+    monkeypatch.setattr(runner, 'run_task', run)
+    monkeypatch.setattr(runner, '_promote_candidate', lambda *a, **kw: None)
+    options = {'search': lambda queries: []} if followup == 'search' else {}
+    if fails_twice:
+        with pytest.raises(RunFailed, match='timed out') as caught:
+            run_stage(notebook, [{'role': 'page', 'record': record}], default_config(), stage='investigate', **options)
+        assert caught.value.usage == {'input_tokens': 16}
+    else:
+        result = run_stage(notebook, [{'role': 'page', 'record': record}], default_config(), stage='investigate', **options)
+        assert result['usage'] == {'input_tokens': 23}
+    assert len(calls) == 3 and calls[1] == calls[2]
+    metrics = json.loads(next((notebook.root / '.state/tasks').glob('*/result.json')).read_text())
+    assert metrics['usage'] == {'input_tokens': 16 if fails_twice else 23}
+    assert metrics['timeouts_retried'] == 1
+
+
+@pytest.mark.parametrize('fails_twice', [False, True])
+def test_resumed_repair_retries_timeout_and_counts_failed_usage(notebook, monkeypatch, fails_twice):
+    from connectonion.rem.files import write_json
+    record = 'people/avery-lin.md'
+    notebook.stub_person(record, 'Avery Lin', ['avery@example.com'], email='avery@example.com')
+    calls, reviews = [], []
+
+    def run(workdir, prompt, config, stage, **options):
+        calls.append(options)
+        if len(calls) == 2 or len(calls) == 3 and fails_twice:
+            raise RunFailed('turn timed out after 1200s', {'input_tokens': 150})
+        next(workdir.glob('enrich-*/candidate.md')).write_text('# Avery Lin\n')
+        return {'session_id': 'avery-thread', 'usage': {'input_tokens': 100 if len(calls) == 1 else 200}}
+
+    def promote(book, record, candidate, original, items, directory, usage, **options):
+        reviews.append(usage)
+        if len(reviews) == 1:
+            write_json(directory / 'review.json', {'errors': ['Missing section: Insight']})
+            raise RunFailed('Candidate rejected', usage)
+
+    monkeypatch.setattr(runner, 'run_task', run)
+    monkeypatch.setattr(runner, '_promote_candidate', promote)
+    if fails_twice:
+        with pytest.raises(RunFailed, match='timed out') as caught:
+            run_stage(notebook, [{'role': 'page', 'record': record}], default_config(), stage='enrich')
+        assert caught.value.usage == {'input_tokens': 300}
+    else:
+        result = run_stage(notebook, [{'role': 'page', 'record': record}], default_config(), stage='enrich')
+        assert result['usage'] == {'input_tokens': 350}
+        assert result['repair_usage'] == {'input_tokens': 250}
+    assert calls == [{}, {'session': 'avery-thread'}, {'session': 'avery-thread'}]
+    metrics = json.loads(next((notebook.root / '.state/tasks').glob('*/result.json')).read_text())
+    assert metrics['timeouts_retried'] == 1
+
+
+def test_review_and_audit_progress_separate_one_repair_from_model_turns(notebook, monkeypatch):
+    import re
+    from connectonion.rem import page_review, project_claim_review
+    record = 'people/avery-lin.md'
+    notebook.stub_person(record, 'Avery Lin', ['avery@example.com'], email='avery@example.com')
+    progress, calls, reviews = [], [], []
+
+    def run(workdir, prompt, config, stage, **options):
+        calls.append(options)
+        Path(re.search(r'(/\S+/candidate\.md)', prompt)[1]).write_text('# Avery Lin\n\nA finding.\n')
+        return {'session_id': 'avery-thread', 'usage': {'input_tokens': len(calls) * 10}}
+
+    def review(*args, **options):
+        reviews.append(options)
+        return ({'verdict': 'fail' if len(reviews) == 1 else 'pass',
+                 'findings': [{'claim': 'A finding.'}] if len(reviews) == 1 else []}, {})
+
+    monkeypatch.setattr(runner, 'run_task', run)
+    monkeypatch.setattr(page_review, 'validate', lambda *a, **kw: [])
+    monkeypatch.setattr(project_claim_review, 'review', review)
+    monkeypatch.setattr(project_claim_review, 'retain_cited_originals', lambda *a: None)
+    result = run_stage(notebook, [{'role': 'page', 'record': record}], default_config(),
+                       stage='enrich', turns=('first',), stage_progress=progress.append)
+    assert result['repairs'] == 1
+    assert progress == ['turn 1 of 1', 'reviewing', 'claim audit', 'repair 1', 'reviewing', 'claim audit']
+    assert calls == [{}, {'session': 'avery-thread'}]
 
 
 def test_model_access_probes_without_sources(tmp_path, monkeypatch):
@@ -67,6 +242,14 @@ def delegate(monkeypatch):
     return calls
 
 
+def test_run_task_drops_null_bytes_from_prompt(tmp_path, delegate):
+    result = runner.run_task(tmp_path, "Continue\0 investigating\0.", default_config(), "investigate")
+    argv = delegate[0][0]
+    assert all("\0" not in argument for argument in argv)
+    assert argv[-1] == "Continue investigating."
+    assert result["outcome"] == "natural"
+
+
 def test_model_runs_use_the_running_installation_not_the_first_co_on_path(notebook, monkeypatch):
     """`venv/bin/co rem ...` from a non-activated venv, with an older co earlier
     on PATH, sent every model turn to that older `co ai` (seen on 1.8.8b7)."""
@@ -93,15 +276,16 @@ def test_project_investigation_authorizes_live_repo_search(notebook, monkeypatch
         run_stage(notebook, [{'role': 'page', 'record': 'projects/reader.md',
                               'text': notebook.read('projects/reader.md'),
                               'source': 'investigation:page'}], default_config(), stage='investigate')
-    assert 'Inspect mapped repository paths' in prompts[0]
+    assert 'Start from the current line' in prompts[0]
     assert 'git log' in prompts[0] and 'git show' in prompts[0]
-    assert 'A branch, commit date or' in prompts[0] and 'belongs elsewhere' in prompts[0]
+    assert 'alone is not an insight. Each is about the project' in prompts[0]
+    assert 'None: `- Unknown`.' in prompts[0]
     assert 'local mail archives and project repositories' in prompts[0]
     assert 'stop using tools and return a brief coverage summary' in prompts[0]
     assert 'investigation:coverage, investigation:project-scope' in prompts[0]
     assert 'reading guides, never citable originals' in prompts[0]
     assert 'nearby checkouts outside those Paths cannot be retained' in prompts[0]
-    assert 'Every concrete purpose, architecture, command, URL' in prompts[0]
+    assert 'earlier rounds read sources this turn does not hold' in prompts[0]
     assert 'write bare Unknown, not a no-pending-work summary' in prompts[0]
 
 
@@ -184,15 +368,27 @@ def test_every_stage_uses_same_cli_and_explicit_harness(notebook, delegate, stag
     else:
         assert "--permission-mode" not in argv
     if harness == "codex":
+        assert argv[argv.index("--speed") + 1] == "fast"
         assert argv[argv.index("--sandbox") + 1] == (
             "danger-full-access" if investigating else "workspace-write")
     else:
+        assert "--speed" not in argv
         assert "--sandbox" not in argv
     assert options["material"] == [item]
     assert not list((notebook.root / ".state/tasks").glob("*/material.json")), "no private copy is left"
-    assert list((notebook.root / ".state/tasks").glob("*/result.json"))
+    metrics = json.loads(next((notebook.root / ".state/tasks").glob("*/result.json")).read_text())
+    assert (metrics["harness"], metrics["model"], metrics["speed"]) == (harness, "default", "fast")
     assert result["usage"] == {"input_tokens": 13}
     assert result["changed"] == []
+
+
+def test_codex_standard_speed_reaches_cli_and_task_metrics(notebook, delegate):
+    config = {**default_config(), "speed": "standard"}
+    run_stage(notebook, [], config)
+    argv = delegate[0][0]
+    assert argv[argv.index("--speed") + 1] == "standard"
+    metrics = json.loads(next((notebook.root / ".state/tasks").glob("*/result.json")).read_text())
+    assert metrics["speed"] == "standard"
 
 
 def test_claude_rem_does_not_inherit_an_api_billing_key(notebook, delegate, monkeypatch):
@@ -380,7 +576,7 @@ def test_one_bad_page_does_not_hold_back_the_rest_of_a_maintenance_batch(tmp_pat
     items = [{"role": "user", "source": "codex:abc:1", "text": "x", "timestamp": "2026-09-24T00:00:00+00:00"}]
     good = before["people/good.md"].replace("## Who they are\n- Unknown — not investigated yet",
                                              "## Who they are\n- Ships the agent. [1]").replace(
-        "## Sources\n- (none yet)", "## Sources\n- [1] `codex:abc:1`, 2026-09-24.")
+        "## Sources\n- (none yet)", "## Sources\n- [1] codex:abc:1, 2026-09-24.")
     bad = before["people/bad.md"].replace("## Who they are\n- Unknown — not investigated yet",
                                            "## Who they are\n- Invented. [1]").replace(
         "## Sources\n- (none yet)", "## Sources\n- [1] Outlook message 39.")
@@ -393,6 +589,34 @@ def test_one_bad_page_does_not_hold_back_the_rest_of_a_maintenance_batch(tmp_pat
     assert notebook.read("people/bad.md") == before["people/bad.md"]     # kept as it was
     assert [r["record"] for r in refusals] == ["people/bad.md"]
     assert (directory / "refused" / "people/bad.md").read_text() == bad  # the model's work is kept
+
+
+def test_a_maintenance_batch_that_guts_a_page_keeps_the_old_one(tmp_path):
+    """projects/connectonion went 14,356 -> 4,132 characters in one accepted
+    maintenance turn (2026-10-13): nothing it dropped was invalid, only gone."""
+    from connectonion.rem.config import prepare
+    from connectonion.rem.files import Notebook
+    from connectonion.rem.runner import _promote_maintenance
+    root, work = tmp_path / "rem", tmp_path / "work"
+    prepare(root)
+    prepare(work)
+    notebook, working = Notebook(root), Notebook(work)
+    notebook.stub_person("people/dora.md", "Dora", [])
+    lines = "\n".join(f"- Dora settled point {n} of the lease, in writing, with the agent. [{n}]" for n in range(1, 13))
+    sources = "\n".join(f"- [{n}] codex:abc:{n} — 2026-09-24" for n in range(1, 13))
+    full = notebook.read("people/dora.md").replace("## Who they are\n- Unknown — not investigated yet",
+                                                   f"## Who they are\n{lines}").replace(
+        "## Sources\n- (none yet)", f"## Sources\n{sources}")
+    notebook.write("people/dora.md", full)
+    gutted = full.replace(lines, lines.split("\n")[0]).replace(sources, sources.split("\n")[0])
+    working.write("people/dora.md", gutted)
+    items = [{"role": "user", "source": f"codex:abc:{n}", "text": "x", "timestamp": "2026-09-24T00:00:00+00:00"}
+             for n in range(1, 13)]
+    directory = tmp_path / "task"
+    directory.mkdir()
+    refusals = _promote_maintenance(notebook, working, {"people/dora.md": full}, items, directory, None, False)
+    assert notebook.read("people/dora.md") == full
+    assert any("kept the old page" in error for error in refusals[0]["errors"])
 
 
 def test_a_small_maintenance_prompt_carries_its_instructions_and_material(tmp_path):
@@ -520,6 +744,175 @@ def test_a_finished_investigation_waits_for_a_sync_instead_of_losing_its_page(tm
     assert "Leads the data team." in notebook.read("people/mia.md")
 
 
+def test_a_promoted_person_page_has_newest_first_history(notebook, tmp_path):
+    record = 'people/avery.md'
+    notebook.stub_person(record, 'Avery Lin', ['avery@example.com'], email='avery@example.com')
+    original = notebook.read(record)
+    older = '- 2026-09-01: introduction — agreed to a call. [1]'
+    newer = '- 2026-10-01: proposal — declined. [2]'
+    candidate = tmp_path / 'candidate.md'
+    candidate.write_text(original.replace('## History\n- Unknown — not investigated yet',
+                                          f'## History\n{older}\n{newer}')
+                         .replace('- (none yet)', '- [1] gmail:m:1\n- [2] gmail:m:2')
+                         .replace('- Unknown — not investigated yet', '- Unknown'))
+    runner._promote_candidate(notebook, record, candidate, original,
+                              [{'source': 'gmail:m:1'}, {'source': 'gmail:m:2'}], tmp_path, None)
+    page = notebook.read(record)
+    assert f'## History\n{newer}\n{older}\n' in page
+    assert json.loads((tmp_path / 'review.json').read_text())['accepted']
+
+
+@pytest.mark.parametrize('promotion', ['candidate', 'maintenance'])
+def test_person_promotion_repairs_owner_pronouns(notebook, tmp_path, promotion):
+    record = 'people/avery.md'
+    notebook.stub_person(record, 'Avery Lin', ['avery@example.com'], email='avery@example.com')
+    original = notebook.read(record)
+    line = 'The user said he would send the deck [1].'
+    repaired = 'The user said the user would send the deck [1].'
+    text = (original.replace('## Who they are\n- Unknown — not investigated yet',
+                             '## Who they are\n- ' + line)
+            .replace('- (none yet)', '- [1] gmail:avery-deck')
+            .replace('- Unknown — not investigated yet', '- Unknown'))
+    items = [{'source': 'gmail:avery-deck', 'role': 'user',
+              'speaker': 'user@example.com', 'text': 'I will send the deck.'}]
+    if promotion == 'candidate':
+        candidate = tmp_path / 'candidate.md'
+        candidate.write_text(text)
+        runner._promote_candidate(notebook, record, candidate, original, items, tmp_path, None)
+        review = json.loads((tmp_path / 'review.json').read_text())
+        assert review['accepted']
+        assert review['owner_pronouns_replaced'] == 1
+    else:
+        before = {r: notebook.read(r) for r in notebook.list()}
+        working = Notebook(tmp_path / 'working')
+        for r, page in before.items():
+            working.write(r, page)
+        working.write(record, text)
+        assert runner._promote_maintenance(notebook, working, before, items, tmp_path, None, False) == []
+        review = json.loads((tmp_path / 'review.json').read_text())
+        assert record in review['accepted']
+        assert review['repairs'][record]['owner_pronouns_replaced'] == 1
+    assert repaired in notebook.read(record)
+    assert line not in notebook.read(record)
+
+
+def test_upkeep_puts_back_a_quote_the_turn_dropped(notebook, tmp_path):
+    """2026-10-20 upkeep A/B: one-page upkeep dropped 1-2 of a page's quotes per run, with no repair turn."""
+    record = 'people/avery.md'
+    notebook.stub_person(record, 'Avery Lin', ['avery@example.com'], email='avery@example.com')
+    quoted = '- Avery asked: “Could you send the deck by Friday?” (2026-10-01) [1]'
+    page = (notebook.read(record).replace('## Who they are\n- Unknown — not investigated yet',
+                                          '## Who they are\n' + quoted)
+            .replace('- (none yet)', '- [1] gmail:avery-deck — 2026-10-01')
+            .replace('- Unknown — not investigated yet', '- Unknown'))
+    notebook.write(record, page)
+    items = [{'source': 'gmail:avery-deck', 'role': 'other', 'speaker': 'Avery <avery@example.com>',
+              'text': 'Could you send the deck by Friday?'}]
+    before = {r: notebook.read(r) for r in notebook.list()}
+    working = Notebook(tmp_path / 'working')
+    for r, text in before.items():
+        working.write(r, text)
+    working.write(record, page.replace(quoted, '- Avery asked for the deck by Friday [1].'))
+    assert runner._promote_maintenance(notebook, working, before, items, tmp_path, None, False) == []
+    assert '“Could you send the deck by Friday?”' in notebook.read(record)
+    assert json.loads((tmp_path / 'review.json').read_text())['repairs'][record]['restored_lines'] == 1
+
+
+def test_a_finished_people_page_waits_for_backfill_before_its_claim_audit(tmp_path, monkeypatch):
+    """2026-10-16: first-run backfill made the audit's zero-wait lock lose paid-for pages."""
+    from connectonion.rem import page_review, project_claim_review
+    monkeypatch.setattr(runner, "PROMOTE_WAIT_SECONDS", 5)
+    monkeypatch.setattr(project_claim_review, "review", lambda *args, **kwargs:
+                        ({"verdict": "pass"}, {"input_tokens": 0}))
+    prepare(tmp_path)
+    notebook = Notebook(tmp_path)
+    notebook.stub_person("people/mia.md", "Mia", ["mia@h.example"], email="mia@h.example")
+    original = notebook.read("people/mia.md")
+    candidate = tmp_path / "candidate.md"
+    candidate.write_text(original.replace("## Who they are\n- Unknown — not investigated yet",
+                                          "## Who they are\n- Leads the data team. [1]")
+                         .replace("- (none yet)", "- [1] gmail:m:1")
+                         .replace("- Unknown — not investigated yet", "- Unknown"))
+    threads, check_quotes = [], page_review.misquoted
+
+    def before_audit(*args):
+        errors = check_quotes(*args)
+        threads.append(_hold_lock(tmp_path, 1.0))
+        return errors
+
+    monkeypatch.setattr(page_review, "misquoted", before_audit)
+    audit_usage = runner._promote_candidate(notebook, "people/mia.md", candidate, original,
+                                           [{"source": "gmail:m:1"}], tmp_path, {"input_tokens": 123},
+                                           claim_config=default_config())
+    threads[0].join()
+    assert "Leads the data team." in notebook.read("people/mia.md")
+    assert audit_usage == {"input_tokens": 0}
+    assert json.loads((tmp_path / "review.json").read_text())["factual_quality"] == "bounded citation audit passed"
+
+
+@pytest.mark.parametrize('stage', ['enrich', 'muse', 'investigate', 'maintain'])
+def test_runner_claim_audit_carries_only_additive_stages(notebook, monkeypatch, tmp_path, stage):
+    from connectonion.rem import project_claim_review
+    record = 'projects/atlas.md'
+    notebook.stub_project(record, 'Atlas')
+    original = notebook.read(record)
+    candidate = tmp_path / 'candidate.md'
+    candidate.write_text(original.replace('- Unknown — not investigated yet', '- Unknown')
+                         .replace('## What it is\n- Unknown', '## What it is\nA local demo. [1]')
+                         .replace('- (none yet)', '- [1] codex:invented — 2026-10-01'))
+    seen = []
+
+    def review(*args, **kwargs):
+        seen.append(kwargs['carried'])
+        return {'verdict': 'fail' if len(seen) == 1 else 'pass',
+                'findings': [{'claim': 'A local demo.', 'issue': 'Unsupported'}]}, {}
+
+    monkeypatch.setattr(project_claim_review, 'review', review)
+    items = [{'source': 'codex:invented', 'text': 'A local demo.'}]
+    result = {}
+    runner.promote_with_repairs(notebook, record, candidate, original, items, tmp_path, result,
+        workdir=tmp_path, config={}, stage=stage, run=lambda *args: {})
+    assert seen == [original if stage in ('enrich', 'muse', 'maintain') else ''] * 2
+    assert result['repairs'] == 1
+
+
+@pytest.mark.parametrize('stage', ['enrich', 'muse'])
+def test_runner_restores_dropped_line_after_two_unsuccessful_repairs(notebook, tmp_path, stage):
+    from connectonion.rem.page_review import dropped
+    record = 'people/avery.md'
+    notebook.stub_person(record, 'Avery')
+    lost = '- Profile says “Small tools travel far” and “Keep the interface quiet”. [56][57]\n'
+    original = notebook.read(record).replace('- Unknown — not investigated yet', '- Unknown')
+    original = original.replace('## Who they are\n- Unknown', '## Who they are\n' + lost.rstrip())
+    original = original.replace('- (none yet)', '- [56] https://profile.example.test\n'
+                                '- [57] https://work.example.test')
+    notebook.write(record, original)
+    candidate = tmp_path / 'candidate.md'
+    candidate.write_text(original.replace(lost, '- Builds small research tools. [1]\n')
+                         .replace('- [56] https://profile.example.test\n- [57] https://work.example.test',
+                                  '- [1] codex:invented'))
+    prompts = []
+
+    def run(workdir, prompt, config, stage):
+        prompts.append(prompt)
+        return {'usage': {'input_tokens': 1}, 'result': 'done'}
+
+    result = {}
+    runner.promote_with_repairs(notebook, record, candidate, original,
+        [{'source': 'codex:invented', 'text': 'Builds small research tools.'}], tmp_path, result,
+        workdir=tmp_path, config={}, stage=stage, run=run)
+    saved = notebook.read(record)
+    assert result['repairs'] == len(prompts) == 2
+    assert all('Dropped quote the page had:' in prompt
+               and 'Dropped source id the page had: https://profile.example.test' in prompt
+               for prompt in prompts)
+    assert 'Builds small research tools. [1]' in saved
+    assert lost.replace('[56][57]', '[2][3]') in saved
+    assert dropped(original, saved) == []
+    review = json.loads((tmp_path / 'review.json').read_text())
+    assert review['accepted'] and review['restored_lines'] == 1
+
+
 def test_a_fact_whose_only_citation_is_dropped_loses_that_part_instead_of_failing_the_page(tmp_path):
     """1.9.2b3 trial: Lisa's Role cited a project file outside her material; the
     unresolved [7] was dropped, the half it supported was left uncited, and the
@@ -541,7 +934,8 @@ def test_a_fact_whose_only_citation_is_dropped_loses_that_part_instead_of_failin
     assert "- Role: Data lead [1]\n" in page and "tax customer" not in page
 
 
-def test_a_sync_that_outlasts_the_wait_leaves_the_page_where_it_can_be_found(tmp_path, monkeypatch):
+@pytest.mark.parametrize("audited", [False, True])
+def test_a_sync_that_outlasts_the_wait_leaves_the_page_where_it_can_be_found(tmp_path, monkeypatch, audited):
     from connectonion.rem import runner
     from connectonion.rem.runner import RunFailed
     monkeypatch.setattr(runner, "PROMOTE_WAIT_SECONDS", 0.5)
@@ -552,10 +946,14 @@ def test_a_sync_that_outlasts_the_wait_leaves_the_page_where_it_can_be_found(tmp
     candidate = tmp_path / "candidate.md"
     candidate.write_text(original)
     thread = _hold_lock(tmp_path, 2.0)
+    usage = {"input_tokens": 123}
     with pytest.raises(RunFailed) as error:
-        runner._promote_candidate(notebook, "people/mia.md", candidate, original, [], tmp_path, None)
+        runner._promote_candidate(notebook, "people/mia.md", candidate, original, [], tmp_path, usage,
+                                  claim_config=default_config() if audited else None)
     thread.join()
     assert str(candidate) in str(error.value) and candidate.is_file()
+    assert f"; the finished page is kept at {candidate}" in str(error.value)
+    assert error.value.usage == usage
 
 
 def test_finished_tasks_lose_their_private_copies_and_running_ones_are_left_alone(tmp_path):
@@ -583,6 +981,28 @@ def test_finished_tasks_lose_their_private_copies_and_running_ones_are_left_alon
 
 
 # ------------------------------------------------ #1974: private copies, one env
+
+
+def test_finished_tasks_are_scrubbed_once_per_process(tmp_path, monkeypatch):
+    calls = []
+    scrub = runner.scrub_task
+
+    def scrubbing(folder):
+        calls.append(folder)
+        scrub(folder)
+
+    monkeypatch.setattr(runner, 'scrub_task', scrubbing)
+    old = time.time() - runner.FINISHED_TASK_GRACE_SECONDS - 1
+    for name in ('investigate-a', 'investigate-b'):
+        folder = tmp_path / name
+        folder.mkdir()
+        result = folder / 'result.json'
+        result.write_text('{}')
+        os.utime(result, (old, old))
+        with runner._TASK_CLEANUP_LOCK:
+            runner.scrub_finished_tasks(tmp_path)
+            runner.scrub_finished_tasks(tmp_path)
+    assert calls == [tmp_path / 'investigate-a', tmp_path / 'investigate-b']
 
 
 def test_task_files_are_owner_only_even_those_the_model_writes(notebook, monkeypatch):
@@ -695,7 +1115,6 @@ def test_maintenance_adds_to_a_page_it_was_not_asked_to_finish(tmp_path):
     """#2014: the placeholder rule for a page's own investigation refused every
     one-page maintenance turn on a never-investigated page (290k tokens, 0 pages)."""
     from connectonion.rem import runner
-    from connectonion.rem.runner import RunFailed
     prepare(tmp_path)
     notebook = Notebook(tmp_path)
     notebook.stub_person("people/mia.md", "Mia", ["mia@h.example"], email="mia@h.example")
@@ -706,13 +1125,10 @@ def test_maintenance_adds_to_a_page_it_was_not_asked_to_finish(tmp_path):
     candidate = tmp_path / "candidate.md"
 
     candidate.write_text(one_line)
-    with pytest.raises(RunFailed, match="not investigated yet"):
-        runner._promote_candidate(notebook, "people/mia.md", candidate, original, [{"source": "gmail:m:1"}],
-                                  tmp_path, None)
-    candidate.write_text(one_line)
     runner._promote_candidate(notebook, "people/mia.md", candidate, original, [{"source": "gmail:m:1"}],
                               tmp_path, None, investigation=False)
-    assert "Leads the data team." in notebook.read("people/mia.md")
+    page = notebook.read("people/mia.md")
+    assert "Leads the data team." in page and "## Insight\n- Unknown — not investigated yet" in page
 
 
 def test_a_turn_that_writes_no_candidate_gets_one_more_turn(notebook, monkeypatch):
@@ -870,8 +1286,10 @@ def test_project_claim_audit_can_surface_new_findings_on_a_second_repair(noteboo
             write_json(directory / 'review.json', {'accepted': False,
                 'errors': ['Cited-claim audit did not pass; see claim-review.json']})
             write_json(directory / 'claim-review.json', {'verdict': 'fail',
-                'findings': [{'issue': 'A different adjacent claim needs correction'}]})
+                'findings': [{'claim': f'False claim {len(promotions)}',
+                              'issue': 'A different adjacent claim needs correction'}]})
             raise RunFailed('Claim audit failed', {'input_tokens': usage['input_tokens'] + 2})
+        write_json(directory / 'claim-review.json', {'verdict': 'pass', 'findings': []})
         book.write(record, candidate.read_text())
 
     monkeypatch.setattr('connectonion.rem.runner.run_task', run_model)
@@ -883,6 +1301,7 @@ def test_project_claim_audit_can_surface_new_findings_on_a_second_repair(noteboo
     assert all('exact Sessions, First seen, and Last seen lines' in prompt for prompt in prompts[1:])
     assert promotions == [10, 22, 34]
     assert result['usage'] == {'input_tokens': 34}
+    assert result['refuted_claims'] == ['False claim 1', 'False claim 2']
     assert 'Candidate 3' in notebook.read(record)
 
 
@@ -915,12 +1334,15 @@ def test_mistyped_skill_citation_repairs_the_finding_once_instead_of_losing_it(n
         result = run_stage(notebook, items, default_config(), stage='investigate')
         assert claim in notebook.read(record) and source in notebook.read(record)
         assert result['usage'] == {'input_tokens': 20}
+        assert len(prompts) == 2
     else:
-        with pytest.raises(RunFailed, match='Finding has unresolved citations') as caught:
+        # Two repairs, then the finding goes with its line; with nothing cited left, the page is refused.
+        with pytest.raises(RunFailed, match='no numbered evidence references') as caught:
             run_stage(notebook, items, default_config(), stage='investigate')
         assert notebook.read(record) == original
-        assert caught.value.usage == {'input_tokens': 20}
-    assert len(prompts) == 2 and 'copy the exact source ids' in prompts[1]
+        assert caught.value.usage == {'input_tokens': 30}
+        assert len(prompts) == 1 + runner.MAX_REPAIRS
+    assert 'copy the exact source ids' in prompts[1]
 
 
 def test_a_turn_may_ask_for_mail_searches_and_gets_one_more_turn_with_their_results(notebook, monkeypatch):
@@ -929,11 +1351,13 @@ def test_a_turn_may_ask_for_mail_searches_and_gets_one_more_turn_with_their_resu
     and the results come back as cited material for one more turn."""
     import json as jsonlib
     import re as regex
+    from connectonion.rem.config import set_config
+    set_config(notebook.root, ['schedule.timezone', 'Australia/Sydney'])
     record = 'people/first.md'
     notebook.stub_person(record, 'First', ['first@example.org'], email='first@example.org')
     prompts, asked, promoted = [], [], []
     found = [{'role': 'other', 'speaker': 'Second <second@example.org>', 'text': 'First runs the lab.',
-              'timestamp': '2025-08-06', 'subject': 'Intro', 'source': 'outlook:abc123abc123'}]
+              'timestamp': '2026-08-27T21:30:00Z', 'subject': 'Intro', 'source': 'outlook:abc123abc123'}]
 
     def search(queries):
         asked.append(queries)
@@ -945,10 +1369,14 @@ def test_a_turn_may_ask_for_mail_searches_and_gets_one_more_turn_with_their_resu
         candidate.write_text('# First\n')
         if len(prompts) == 1:
             (candidate.parent / 'search-requests.json').write_text(jsonlib.dumps(['First lab', 'from:x@y.z']))
+        else:
+            assert 'Date: 2026-08-27T21:30:00Z (2026-08-28 07:30 Australia/Sydney)' in (
+                candidate.parent / 'search-results.md').read_text()
         return {'usage': {'input_tokens': 10}, 'result': 'done'}
 
     def promote(book, record, candidate, original, items, directory, usage, **options):
         promoted.append([item['source'] for item in items])
+        assert items[-1]['local_time'] == '2026-08-28 07:30 Australia/Sydney'
 
     monkeypatch.setattr('connectonion.rem.runner.run_task', run_model)
     monkeypatch.setattr('connectonion.rem.runner._promote_candidate', promote)
@@ -958,6 +1386,7 @@ def test_a_turn_may_ask_for_mail_searches_and_gets_one_more_turn_with_their_resu
     assert len(prompts) == 2 and 'search-results.md' in prompts[1] and 'search-requests.json' in prompts[0]
     assert all(prompt.endswith('</co_rem_task>') for prompt in prompts)
     assert 'outlook:abc123abc123' in promoted[0]
+    assert 'local_time' not in found[0]
 
 
 def test_quick_first_pass_never_offers_or_runs_extra_mail_search(notebook, monkeypatch):
@@ -1022,3 +1451,123 @@ def test_a_run_names_the_codex_threads_that_ran_it(notebook, monkeypatch):
     monkeypatch.setattr("connectonion.rem.runner.subprocess.run", lambda argv, **kw: SimpleNamespace(
         returncode=0, stdout='{"outcome": "natural", "session_id": "01a12370-thread"}', stderr=""))
     assert run_stage(notebook, [], default_config())["threads"] == ["01a12370-thread"]
+
+
+def test_material_carries_local_times_without_changing_the_sources(notebook, delegate):
+    from zoneinfo import ZoneInfo
+    from connectonion.rem.config import set_config
+    from connectonion.rem.source import local_time, with_local_times
+    zone = ZoneInfo("Australia/Sydney")
+    stamp = "2026-08-27T21:30:00Z"
+    items = [{"source": "outlook:reply", "timestamp": stamp, "text": "Reply sent."},
+             {"source": "undated", "text": "No date."},
+             {"source": "non-iso", "timestamp": "yesterday", "text": "No exact time."},
+             {"source": "date-only", "timestamp": "2026-08-27", "text": "No exact time."}]
+    shown = with_local_times(items, zone)
+    assert local_time(stamp, zone) == "2026-08-28 07:30 Australia/Sydney"
+    assert list(shown[0]) == ["source", "timestamp", "local_time", "text"]
+    assert shown[1:] == items[1:] and all(copy is not item for copy, item in zip(shown, items))
+    assert all("local_time" not in item for item in items)
+    assert "timestamp: " + stamp + "\nlocal_time: 2026-08-28 07:30 Australia/Sydney" in runner.readable_material(shown)
+    set_config(notebook.root, ["schedule.timezone", "Australia/Sydney"])
+    run_stage(notebook, items, default_config())
+    assert delegate[0][1]["material"] == shown
+
+
+def test_every_page_turn_is_told_what_day_it_is_in_the_notebooks_timezone(notebook, delegate):
+    """Ody's page kept 13 and 14 October events as open threads on the 15th:
+    no turn was told the date."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from connectonion.rem.config import set_config
+    set_config(notebook.root, ["schedule.timezone", "Australia/Sydney"])
+    today = datetime.now(ZoneInfo("Australia/Sydney")).date().isoformat()
+    note = runner.today_note(notebook.root)
+    assert f"Today is {today} (Australia/Sydney)" in note and "never an open thread" in note
+    assert "local_time" in note
+    run_stage(notebook, [{"role": "page", "record": "notes/old.md", "text": "x"}], default_config(), stage="maintain")
+    argv, options = delegate[0]
+    handed = argv[-1] + "".join(path.read_text() for path in Path(options["cwd"]).rglob("*.md")
+                                if path.is_file())
+    assert f"Today is {today}" in handed
+
+
+def test_a_maintenance_turn_cannot_give_a_person_a_relay_or_a_stranger_s_address(tmp_path):
+    """Ody's Luma relay became his Email (contacts audit E2); a one-page sync turn is
+    held to the same contact rule as an investigation."""
+    from connectonion.rem.runner import _promote_maintenance
+    root, work = tmp_path / "rem", tmp_path / "work"
+    prepare(root)
+    prepare(work)
+    notebook, working = Notebook(root), Notebook(work)
+    notebook.stub_person("people/ody.md", "Ody Zhou", ["ody.zhou@example.com"], email="ody.zhou@example.com")
+    before = notebook.read("people/ody.md")
+    after = before.replace("- Email: ody.zhou@example.com",
+                           "- Email: ody.zhou@example.com; usr-abc@user.luma-mail.com; larry@estate.example")
+    working.write("people/ody.md", after)
+    directory = tmp_path / "task"
+    directory.mkdir()
+    refusals = _promote_maintenance(notebook, working, {"people/ody.md": before}, [], directory, None, False)
+    saved = notebook.read("people/ody.md")
+    assert not refusals
+    assert json.loads((directory / "review.json").read_text())["accepted"] == ["people/ody.md"]
+    assert "ody.zhou@example.com" in saved and "luma-mail" not in saved and "larry@" not in saved
+
+
+def test_a_refuted_first_contact_is_replaced_with_the_extracted_date_on_last_resort(notebook, tmp_path):
+    """2026-10-20: dropping an audited contact date must restore the extracted row."""
+    from connectonion.rem import facts
+    from connectonion.rem.files import write_json
+
+    record = 'people/avery.md'
+    notebook.stub_person(record, 'Avery Lin', ['avery@example.com'], email='avery@example.com')
+    original = notebook.read(record)
+    claim = 'First contact: 2025-08-26 (earliest mail found) [2]'
+    extracted = {'field': 'First contact', 'value': '2026-08-11', 'qualifier': 'earliest mail found',
+                 'source': 'gmail:avery-first', 'date': '2026-08-11'}
+    candidate = tmp_path / 'candidate.md'
+    candidate.write_text(original.replace('## Who they are\n- Unknown — not investigated yet',
+                                          '## Who they are\n- Avery Lin leads the pilot. [1]')
+                         .replace('- First contact: Unknown', '- ' + claim)
+                         .replace('- (none yet)', '- [1] gmail:avery-latest\n- [2] gmail:avery-cc')
+                         .replace('- Unknown — not investigated yet', '- Unknown'))
+    write_json(tmp_path / 'claim-review.json', {'verdict': 'fail', 'findings': [
+        {'claim': claim, 'issue': 'Avery was only cc’d on this mail; it was not direct contact.'}]})
+    items = [{'source': 'gmail:avery-latest'}, {'source': 'gmail:avery-cc'},
+             {'role': 'facts', 'facts': [extracted]}]
+
+    runner._promote_candidate(notebook, record, candidate, original, items, tmp_path, None, last_resort=True)
+
+    page = notebook.read(record)
+    assert facts.parse(page, record)['First contact'] == [
+        {'value': '2026-08-11', 'qualifier': 'earliest mail found', 'citations': ['2']}]
+    assert '- [2] gmail:avery-first — 2026-08-11\n' in page
+    assert '2025-08-26' not in page and '- First contact: Unknown' not in page
+    review = json.loads((tmp_path / 'review.json').read_text())
+    assert review['accepted']
+    assert {'field': 'First contact', 'source': 'gmail:avery-first'} in review['facts_restored']
+
+
+def test_a_page_whose_audit_emptied_its_lead_is_not_promoted():
+    """Ody Zhou (2026-10-15) was kept with no lead: the audit refuted a claim in
+    each sentence. `_lead` is what the last resort checks before keeping a page."""
+    from connectonion.rem.runner import _lead
+    assert _lead("# Ody Zhou\n\n\n## Facts\n- Email: x\n") == ""
+    assert _lead("# Ody Zhou\n\nOdy is a co-founder [1]. Last contact: 2026-10-15.\n\n## Facts\n") \
+        .startswith("Ody is a co-founder")
+
+
+def test_a_lead_that_lost_who_they_are_opens_with_their_cited_role():
+    """Tamara and Nina (2026-10-15): an audit finding about a missing citation
+    took the lead's first sentence, and Nina's page opened on an HR ticket."""
+    from connectonion.rem.runner import _keep_identity
+    facts = ("## Facts\n- Company: [UNSW Founders](../orgs/unsw.md) [4]\n- Role: Events Coordinator [4]\n\n"
+             "## Insight\n- Unknown\n")
+    before = "# Tamara Berryman\n\nTamara is the user's main MCIC contact [1]. The user owes her a card [5].\n\n" + facts
+    after = "# Tamara Berryman\n\nThe user owes her a card [5].\n\n" + facts
+    kept = _keep_identity("people/tamara.md", before, after)
+    assert kept.startswith("# Tamara Berryman\n\nTamara Berryman is Events Coordinator at "
+                           "[UNSW Founders](../orgs/unsw.md) [4]. The user owes her a card [5].\n\n## Facts")
+    assert _keep_identity("people/tamara.md", before, before) == before
+    emptied = _keep_identity("people/tamara.md", before, "# Tamara Berryman\n\n\n" + facts)
+    assert emptied.startswith("# Tamara Berryman\n\nTamara Berryman is Events Coordinator") and "\n\n## Facts" in emptied

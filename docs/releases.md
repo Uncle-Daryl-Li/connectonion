@@ -13,27 +13,211 @@ no `AsyncClient`, and every remote agent call crashed.
 
 ## Current release
 
-Stable **1.9.1** is the default production channel. co rem's first run now
-investigates every page, deepens people with two years of mail, edits pages in
-place and draws decisions and principles; Person pages lead with contact facts
-and cited mail opens as a message. See [1.9.1 notes](releases/1.9.1.md) and the
-[GitHub release](https://github.com/openonion/connectonion/releases/tag/v1.9.1).
+Stable **1.9.2** is the default production channel. Hand a coding session to someone else's
+agent: you see exactly what leaves, with private sentences taken out by your own agent; they paste
+one line, and the result comes back as a patch. Neither side gets more than the handoff. See
+[1.9.2 notes](releases/1.9.2.md) and the
+[GitHub release](https://github.com/openonion/connectonion/releases/tag/v1.9.2).
 
 ```bash
-python -m pip install --upgrade 'connectonion==1.9.1'
+python -m pip install --upgrade 'connectonion==1.9.2'
 ```
 
 ## Current preview
 
-Beta **1.9.2b10**: a handoff mail you can read on a phone, whose paste-in block
-installs co in its own environment and accepts in one go; one line installs
-co; an accepted handoff makes each side the other's contact. See [1.9.2b10 notes](releases/1.9.2b10.md).
+Release candidate **1.9.3rc11**: upkeep keeps its quotes. Daily upkeep checks a rewrite against
+the page it replaces and asks for dropped quotes back; pronoun repair only touches the owner; project
+pages get a quote round; deepen weighs activity above emptiness; the reader shows pages in Chinese
+after `co rem translate --all --to zh`. See
+[1.9.3rc11 notes](releases/1.9.3rc11.md).
 
 ```bash
-python -m pip install --upgrade 'connectonion==1.9.2b10'
+python -m pip install --upgrade 'connectonion==1.9.3rc11'
 ```
 
 ## Previous previews
+
+Release candidate **1.9.3rc10**: 1.9.3rc9 with one correction. The packaged handoff blog post
+now tells its story with a fictional sender instead of a real person; the code is unchanged. See
+[1.9.3rc10 notes](releases/1.9.3rc10.md).
+
+```bash
+python -m pip install --upgrade 'connectonion==1.9.3rc10'
+```
+
+Release candidate **1.9.3rc9**: pages that quote people. The quote floor, first contact, History
+order and owner pronouns are enforced in code (mean quotes per person page 6.8 to 22.4 on notebook
+copies); enrich reads long histories period by period; gathering at 16 workers is about twice as
+fast; the reader shows quotes and the owner's language. A handoff pasted into a conversation about
+other work now stops and asks for a new one. See [1.9.3rc9 notes](releases/1.9.3rc9.md).
+
+```bash
+python -m pip install --upgrade 'connectonion==1.9.3rc9'
+```
+
+Release candidate **1.9.3rc8**: a changed person or organisation without retained
+routing continuity no longer regains the old subject's contact dates. The next
+successful pass compacts the Investigation footer to the latest of each known
+kind. These fixes do not repair old claims or establish reader maturity.
+See [1.9.3rc8 notes](releases/1.9.3rc8.md). After publication:
+
+```bash
+python -m pip install --upgrade 'connectonion==1.9.3rc8'
+```
+
+Release candidate **1.9.3rc7**: REM excludes internal Windows task sessions from new
+context imports, skill invocation counts and cached evidence samples. This prevents
+model probes and repair instructions from being treated as the owner's words. It does
+not purge old messages or repair existing claims. See [1.9.3rc7 notes](releases/1.9.3rc7.md).
+
+After this candidate is published, install its exact pin:
+
+```bash
+python -m pip install --upgrade 'connectonion==1.9.3rc7'
+```
+
+Release candidate **1.9.3rc6**: a forwarded link no longer takes the name. A handoff addressed to
+one agent's mailbox and accepted by another agent is saved under the acceptor's own name, the
+addressed name keeps its own key, and names rc5 already re-pointed read as mail contacts again. See
+[1.9.3rc6 notes](releases/1.9.3rc6.md).
+
+```bash
+python -m pip install --upgrade 'connectonion==1.9.3rc6'
+```
+
+
+Release candidate **1.9.3rc5**: handoffs are end-to-end encrypted. `send` seals the handoff on
+your machine and the key travels after `#` in the link; after acceptance every message between the
+two agents is boxed to the other's key. The backend holds ciphertext. See
+[1.9.3rc5 notes](releases/1.9.3rc5.md).
+
+Release candidate **1.9.3rc4**: enrich and muse, fixed. A Codex sub-agent finishing no longer
+ends the main turn; enrich's ledger for a project page holds its coding sessions, GitHub issues and
+pull requests and the git log, and the review gate accepts what the ledger lists. On a test project
+page, enrich then muse took quotes from 3 to 15 and cited sources from 10 to 40. See
+[1.9.3rc4 notes](releases/1.9.3rc4.md).
+
+Release candidate **1.9.3rc3**: deepen one page. `co rem enrich PAGE` follows the leads a page has
+not followed (links, attachments, older threads) and adds what they establish; `co rem muse PAGE`
+asks many questions of a page, studies the five best and writes only on insight. Both pass
+investigate's review gate. See [1.9.3rc3 notes](releases/1.9.3rc3.md).
+
+Release candidate **1.9.3rc2**: Agent sessions. `co rem import sessions` keeps one page per
+Codex or Claude Code conversation you typed in, with what it produced and its project;
+`--summarise` adds a title, summary, topics and outcome, and the reader lists them by topic with one
+search. Also reader fixes from the first rc. See [1.9.3rc2 notes](releases/1.9.3rc2.md).
+
+Release candidate **1.9.3rc1**: `co rem` you can show. The reader opens on what is waiting on
+you, a person page opens on what is between you, and every citation names who, where and when and
+opens the original beside the line. On a real 180-day first run, 66 pages were accepted with none
+refused or lost to the notebook lock. See [1.9.3rc1 notes](releases/1.9.3rc1.md).
+
+Beta **1.9.3b5**: `co rem` pages you can trust on the first run. Quotes and contact facts are
+checked against their sources, review repairs a page instead of refusing it, and `co rem open`
+serves a live reader that can show a page in your language. See
+[1.9.3b5 notes](releases/1.9.3b5.md).
+
+Beta **1.9.3b4**: the line a recipient pastes, the mail and the help now say a handoff passes on
+the context of a session, not a task. See [1.9.3b4 notes](releases/1.9.3b4.md).
+
+Beta **1.9.3b3**: the thread a handoff adds in Codex now shows in `/resume` and the app's
+sidebar in a Codex that had been used before, and the receiving agent names it when it
+reports. See [1.9.3b3 notes](releases/1.9.3b3.md).
+
+Release candidate **1.9.2rc1**: handing a session to someone else's agent, checked end to end
+between Claude Code and Codex in both directions. See [1.9.2rc1 notes](releases/1.9.2rc1.md).
+
+Beta **1.9.2b31**: accepting a handoff gives the other side nothing but messages about that
+handoff; using your agent stays your own decision. See [1.9.2b31 notes](releases/1.9.2b31.md).
+
+Beta **1.9.2b30**: hand off a session from Gemini CLI, opencode, droid, Cursor or Grok, not
+only Codex and Claude Code. See [1.9.2b30 notes](releases/1.9.2b30.md).
+
+Beta **1.9.2b29**: before you see a handoff's preview, your own Codex or Claude Code takes
+out the private sentences, in the page and in the session copy, and tells you where. See
+[1.9.2b29 notes](releases/1.9.2b29.md).
+
+Beta **1.9.2b28**: what you change in a handoff's draft is what goes, in the session copy
+too, and the preview points at messages about health, visas, the law or money. See
+[1.9.2b28 notes](releases/1.9.2b28.md).
+
+Beta **1.9.2b27**: the copy of your session that goes with a handoff is only the
+conversation you approved, never commands or their output, and only the person who accepts
+it can read it. See [1.9.2b27 notes](releases/1.9.2b27.md).
+
+Beta **1.9.2b26**: a handoff no longer carries anyone else's email address, phone
+number or IP, and you can take its page down at once; status says where it stands in one
+line. See [1.9.2b26 notes](releases/1.9.2b26.md).
+
+Beta **1.9.2b25**: the handoff mail reads like a note from you, in your own voice and
+language; the conversation shows up in the recipient's Codex app with your name on each
+message; only the code you worked on goes. See [1.9.2b25 notes](releases/1.9.2b25.md).
+
+Beta **1.9.2b24**: the person you hand work to reads it on a web page first, then
+copies one line into a new Codex conversation. Accepting someone's handoff lets
+them send you handoffs, not run tools on your machine. See
+[1.9.2b24 notes](releases/1.9.2b24.md).
+
+Beta **1.9.2b23**: the handoff mail is a short note from the sender's own mailbox
+(their AI's mail tool, their Gmail or Outlook, the agent mailbox only last), in the
+language they wrote in, and `co handoff open` keeps the session going until it is
+done. See [1.9.2b23 notes](releases/1.9.2b23.md).
+
+Beta **1.9.2b22**: everything arrives with `co handoff accept`: the code the
+recipient cannot fetch and the sender's session copy, and the pasted block tells
+their agent to do the work without waiting. See
+[1.9.2b22 notes](releases/1.9.2b22.md).
+
+Beta **1.9.2b21**: a handoff opens on what the sender discussed and concluded.
+The mail is a reminder and a three-line paste; `co handoff accept` fetches the
+handoff, and a question the sender left open reaches them by mail. See
+[1.9.2b21 notes](releases/1.9.2b21.md).
+
+Beta **1.9.2b20**: a `co handoff` runs without the person stepping in. The
+recipient's agent accepts, does the work and says when it is done; the result
+comes back to the sender's `co handoff status`. See
+[1.9.2b20 notes](releases/1.9.2b20.md).
+
+Beta **1.9.2b19**: one host serves the agent, REM and your channels however you
+start it, and the new `co host` works right after the one-line installer. See
+[1.9.2b19 notes](releases/1.9.2b19.md).
+
+Beta **1.9.2b18**: a `co handoff` starts cleanly on a machine that has never
+seen co, inside Codex's sandbox too, and the sender sees each question's state
+every time. See [1.9.2b18 notes](releases/1.9.2b18.md).
+
+Beta **1.9.2b17**: the session copy sent with a handoff answer also drops
+credentials the AI wrote through a tool call. See [1.9.2b17 notes](releases/1.9.2b17.md).
+
+Beta **1.9.2b16**: the first `co handoff` mail reads like an introduction:
+who sent it, the task, three steps and one block to paste, in every inbox. See
+[1.9.2b16 notes](releases/1.9.2b16.md).
+
+Beta **1.9.2b15**: in `co handoff`, every question is answered exactly once,
+including weeks later, when two programs check at once, or when the session is
+long or gone. See [1.9.2b15 notes](releases/1.9.2b15.md).
+
+Beta **1.9.2b14**: your agent keeps a record of everything it does for anyone
+(`co approvals`), and three kinds of action (credentials and money, anything
+that cannot be undone, acting as you in your own accounts) wait for you when
+someone else asks and nobody is connected. See [1.9.2b14 notes](releases/1.9.2b14.md).
+
+Beta **1.9.2b13**: when the agent that took over your handoff asks a question,
+your agent answers by itself and sends a copy of the session, tool calls
+included, with credentials removed. See [1.9.2b13 notes](releases/1.9.2b13.md).
+
+Beta **1.9.2b12**: after the first handoff mail, agents talk through an inbox
+on our backend instead of email: questions, answers and later handoffs to a
+contact go straight to the other agent. See [1.9.2b12 notes](releases/1.9.2b12.md).
+
+Beta **1.9.2b11**: a handoff carries every message you typed, word for word,
+and the AI's replies in summary, across every compaction, plus where the code
+is; the recipient's questions come back to `co handoff status --wait`. See
+[1.9.2b11 notes](releases/1.9.2b11.md).
+
+Beta **1.9.2b10**: a handoff mail you can read on a phone, whose paste-in block
+installs co in its own environment and accepts in one go; one line installs
+co; an accepted handoff makes each side the other's contact. See [1.9.2b10 notes](releases/1.9.2b10.md).
 
 Beta **1.9.2b9** adds `co mcp` (Experimental): call the connectors and MCP
 servers you already have in Codex, such as Gmail, from the terminal, with no

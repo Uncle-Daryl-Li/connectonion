@@ -19,7 +19,8 @@ validator, maintenance and the reader all read the same way:
   (work, mobile, personal) and then its citations `[n]`, numbers defined under
   `## Sources`. A value may be a Markdown link.
 - Dates are `YYYY-MM-DD`. Every value is cited except the identity fields the
-  map fills from addresses (`UNCITED`).
+  map fills from addresses (`UNCITED`); an Email is checked against the mail
+  instead (`page_review.verify_contacts`).
 
 `parse(page)` returns `{label: [{"value", "qualifier", "citations"}]}` in field
 order, `[]` for Unknown. A page written before 1.9.0a9 has `## Contact` with
@@ -35,6 +36,7 @@ FIELDS = {
     "projects": ("Repository", "Stack", "Status", "People", "Organisation", "Started", "Last activity"),
     "orgs": ("What they do", "Website", "Location", "Legal entity", "Your contacts", "First contact",
              "Last contact"),
+    "sessions": ("Date", "Agent", "Project", "Folder", "Session", "Turns"),
 }
 UNCITED = ("Email", "Handles", "Also known as")
 # Fields that hold several values: a value the extractor found is added beside
@@ -144,8 +146,8 @@ def _block(record: str, raw_lines: list[str]) -> str:
 
 
 def upgrade(record: str, text: str, insight: str = "- Unknown") -> str:
-    """Bring a page to the Facts shape without dropping a word: rename a legacy
-    `## Contact`, add a missing Facts section or label as `Unknown`, and give a
+    """Bring a page to the Facts shape: rename a legacy `## Contact`, normalize
+    missing values to `Unknown`, add a missing Facts section or label, and give a
     person or project page its Insight section. A page already in shape is returned as is."""
     labels = fields(record)
     if not labels:
@@ -166,6 +168,9 @@ def upgrade(record: str, text: str, insight: str = "- Unknown") -> str:
             if re.search(plain, body):
                 body = re.sub(rf"(?m)^- {re.escape(label)}:[ \t]*Unknown[ \t]*\n?", "", body)
                 body = re.sub(plain, rf"- {label}: \1", body)
+        # 2026-10-16 trial: `Company: Unknown; email domain: student.unsw.edu.au [8]`
+        # is missing data; everything after Unknown is commentary, even after a semicolon.
+        body = re.sub(r"(?mi)^(- [^:\n]{1,40}:[ \t]*)Unknown\b[^\n]*$", r"\1Unknown", body)
         present = set(re.findall(r"(?m)^- ([^:\n]{1,40}):", body))
         if body != original or not set(labels) <= present:
             block = _block(record, body.strip("\n").splitlines())
@@ -181,6 +186,9 @@ def _digits(value: str) -> str:
 
 
 def _on_page(row: dict, text: str) -> bool:
+    # 2026-10-20 trial: the same date in Last contact must not leave First contact Unknown.
+    if row["field"] in ("First contact", "Last contact"):
+        return any(v["value"] == row["value"] for v in values(_lines(text).get(row["field"], "")))
     text = text.partition("\n## Sources\n")[0]   # a source's date is not a contact date
     if row["field"] == "Phone":
         return _digits(row["value"]) in {_digits(m) for m in re.findall(r"\+?\d[\d\s().-]{6,}\d", text)}
@@ -256,6 +264,39 @@ def drop_uncited(record: str, text: str, original: str = "") -> tuple[str, list[
     return text, touched
 
 
+def identity_sentence(record: str, text: str) -> str:
+    """Who a person is, from their own cited Role and Company: `Tamara is Events Coordinator at UNSW Founders [4].`"""
+    found = parse(text, record)
+    role, company = (found.get("Role") or [None])[0], (found.get("Company") or [None])[0]
+    if kind(record) != "people" or not role or not role["citations"]:
+        return ""
+    name = text.partition("\n")[0].lstrip("# ").strip()
+    at = f" at {company['value']}" if company and company["citations"] else ""
+    cites = sorted({*role["citations"], *(company["citations"] if at else [])}, key=lambda n: int(n.lstrip("W")))
+    return f"{name} is {role['value']}{at} " + "".join(f"[{n}]" for n in cites) + "."
+
+
+def drop_foreign_labels(record: str, text: str, original: str = "") -> tuple[str, list[str]]:
+    """A Facts line whose label the page shape does not have goes; one the page already had stays.
+
+    Richard Lai (2026-10-15) gained "- First recorded contact: 2026-09-22 [3]"
+    beside "- First contact: Unknown". The roster reads only the shape's labels,
+    so the line was a second answer nobody would see in the right place.
+    """
+    span, labels = _bounds(text, "Facts"), fields(record)
+    if not span or not labels:
+        return text, []
+    kept = set(_lines(original)) if original else set()
+    body, dropped = [], []
+    for line in text[span[0]:span[1]].splitlines(keepends=True):
+        label = re.match(r"^- ([^:\n]{1,40}):", line)
+        if label and label[1] not in labels and label[1] not in kept and label[1] != LEGACY:
+            dropped.append(label[1])
+            continue
+        body.append(line)
+    return text[:span[0]] + "".join(body) + text[span[1]:], dropped
+
+
 def keep_extracted(record: str, text: str, rows: list[dict]) -> tuple[str, list[dict]]:
     """Put back a certain fact the extractor found that appears nowhere on the page.
 
@@ -263,10 +304,17 @@ def keep_extracted(record: str, text: str, rows: list[dict]) -> tuple[str, list[
     holds several. A bare contact date citing the exact extracted original uses
     its notebook-calendar day; other interpretations stay. Returns the page and
     the rows restored or corrected.
+
+    A phone or address comes back only when the subject sent the mail and it is
+    theirs (`own`: their From line, or their own signed block). Restoring every
+    extracted number made one bad read certain: a facilities manager's mobile
+    came back onto Nina's page after the turn had left it off (contacts audit P1, #2348).
     """
     restored = []
     for row in rows:
         if row["field"] not in RESTORABLE or row["field"] not in fields(record):
+            continue
+        if row["field"] in ("Phone", "Email") and not row.get("own"):
             continue
         corrected = _correct_contact_date(text, row)
         if corrected != text:
@@ -287,17 +335,26 @@ def keep_extracted(record: str, text: str, rows: list[dict]) -> tuple[str, list[
     return text, restored
 
 
+# A spelling the page itself says is wrong: "周泽楷 (corrected by Ody)" sat in
+# Ody's Also known as after he wrote "我中文名字是周泽凯 不是周泽楷" (contacts audit A1).
+REJECTED_NAME = re.compile(r"\b(?:corrected|wrong|incorrect|misspel\w*|typo|rejected)\b|not (?:his|her|their) name"
+                           r"|不是", re.I)
+
+
 def names_not_addresses(record: str, text: str) -> str:
-    """Also known as holds names; an address there only repeats the Email line.
+    """Also known as holds names they answer to; an address there only repeats the Email line.
 
     The map once seeded every handle into it, and a turn copies the Email line
     across, so the reader showed Ody's address three times (1.9.2b3 review).
-    A half address (`name@gmail`) goes too.
+    A half address (`name@gmail`) goes too, and a spelling marked as one they rejected.
     """
     if kind(record) != "people":
         return text
     match = re.search(r"(?m)^- Also known as:[ \t]*(.*)$", text)
-    if not match or "@" not in match[1]:
+    if not match:
         return text
-    names = [part for part in _split(match[1]) if "@" not in part]
+    parts = _split(match[1])
+    names = [part for part in parts if "@" not in part and not REJECTED_NAME.search(part)]
+    if names == parts:
+        return text
     return text[:match.start(1)] + ("; ".join(names) or "Unknown") + text[match.end(1):]

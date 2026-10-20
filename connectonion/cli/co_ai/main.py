@@ -130,6 +130,8 @@ def start_server(
     full_access_turns: int = 100,
     agent_factory=None,
     invite_code: str = None,
+    launch: bool = True,
+    listen: list | None = None,
 ):
     """Start AI coding agent web server.
 
@@ -185,7 +187,7 @@ def start_server(
         create = agent
 
     # Open chat URL after agent successfully starts (2 second delay)
-    if addr_data:
+    if addr_data and launch:
 
         def open_chat_delayed():
             time.sleep(2)
@@ -200,7 +202,7 @@ def start_server(
 
         trust = TrustAgent("careful", invite_code=invite_code, co_dir=co_dir)
     if agent_factory is None:
-        host(create, port=port, trust=trust, co_dir=co_dir, rem_root=Path.home() / ".co/rem")
+        host(create, port=port, trust=trust, co_dir=co_dir, listen=listen)
         return
 
     from ...network.host.session import SessionStorage
@@ -243,18 +245,11 @@ def start_server(
 
     runtime = SessionWatchRuntime(store, storage, run_watch_turn)
 
-    from ...handoff import watch as handoff_watch
-    handoff_stop = []
-
     async def start_watches():
-        runtime.start()
-        handoff_stop.append(handoff_watch.start())   # acceptances/questions on handoffs we sent
+        runtime.start()   # handoffs we sent are watched by host() itself (#2453)
 
     async def stop_watches():
         runtime.stop()
-        for stop in handoff_stop:
-            stop.set()
 
-    host(session_agent, port=port, trust=trust, co_dir=co_dir,
-         rem_root=Path.home() / ".co/rem",
+    host(session_agent, port=port, trust=trust, co_dir=co_dir, listen=listen,
          on_agent_startup=start_watches, on_agent_shutdown=stop_watches)

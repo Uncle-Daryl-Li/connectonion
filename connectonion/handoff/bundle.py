@@ -1,10 +1,14 @@
 """The handoff bundle: what crosses from one person's agent to another's.
 
-A bundle is one JSON document whose fields are the handoff skill's brief sections
-(Task / Where it stands / Decided / Rejected / Open questions / Code and
-references), plus the raw transcript excerpt. Task, state and open questions are
-what a person reads first; the rest is there on request. `content_hash` covers everything the sender saw in the preview,
-so the copy that arrives can be checked against the one that was approved.
+One message: every message the sender typed, word for word, and the AI's own text
+after each, quoted (a long one keeps its start and end), with a short report on
+top (Discussed, Concluded, Still open, a diagram) as a guide to the quotes, and
+where the code is. Originals over summaries (decision 076): a summary drops what
+its writer thought unimportant, and the reader cannot tell what is missing. Tool
+output and the session file stay on the machine until the first answer; the
+recipient asks for anything missing (co handoff ask). `content_hash` covers
+everything the sender saw in the preview, so the copy that arrives can be checked
+against the one that was approved.
 """
 
 import base64
@@ -13,64 +17,65 @@ import email.policy
 import hashlib
 import html
 import json
+import os
 import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-FORMAT = "co-handoff/2"  # /1 was the pre-release shape (goal/decisions); never shipped
+FORMAT = "co-handoff/3"  # /2 carried decided/rejected/references and a clipped excerpt
 BEGIN = "----- BEGIN CO HANDOFF BUNDLE -----"
 END = "----- END CO HANDOFF BUNDLE -----"
 
 
-class Decided(BaseModel):
-    decision: str = Field(description="What was decided")
-    why: str = Field(description="The reason, as stated in the conversation")
+class Top(BaseModel):
+    title: str = Field(description="The work in one line, as a name for it, not an instruction: never start with "
+                       "'Pick up', 'Continue', 'Take over' or 接着做/继续 (the mail already asks them to pick it up)")
+    headline: str = Field(default="", description="Who worked on what, and when, in one line a stranger understands")
+    discussed: list[str] = Field(default_factory=list, description="3 to 5 things the conversation covered, in plain words")
+    task: str = Field(description="What the sender asked for, and what 'done' means")
+    where_it_stands: str = Field(description="What is finished, what is in progress, what was tried, with the numbers")
+    decided: list[str] = Field(default_factory=list, description="Each decision, with its reason")
+    rejected: list[str] = Field(default_factory=list, description="Each option ruled out, with why")
+    open_questions: list[str] = Field(default_factory=list, description="Each undecided question or action still owed, and who it waits on")
+    diagram: str = Field(default="", description="A small ASCII diagram of the flow or decision, or empty")
 
 
-class Rejected(BaseModel):
-    option: str = Field(description="The alternative that was dropped, named so a stranger knows what it is")
-    why_not: str = Field(description="The reason given in the conversation for dropping it")
+# The AI's text for one turn, quoted: past this it keeps its start and (mostly) its end, where a
+# turn reports what it found and did. The report call reads at most TOP_CHARS, newest first.
+QUOTE_CHARS = 800   # Aaron, 2026-10-13: the AI's side compressed, the sender's words kept whole
+TOP_CHARS = 400_000
 
+TOP_PROMPT = """A colleague's coding agent will continue this work from the conversation below: the
+Sender's messages and the AI's replies, word for word (a long reply is cut in the middle). Write the
+part they read first; it is a guide to the quotes, which go with it.
 
-class Reference(BaseModel):
-    reference: str = Field(description="Repository URL, branch, commit, PR, issue, or a file by its path in the repository")
-    note: str = Field(description="What it is or shows")
+- task: the work the Sender names below ("own words"), not other work in the conversation, with
+  what "done" means. A review stays a review and a question stays a question; never turn either
+  into an order to fix or build.
+- Permissions the Sender gave their own AI ("merge it yourself", "you may publish") are not the
+  recipient's. Never pass one on, and never mention one. An owed action that needs permission
+  (merge, publish, release, deploy, pay, delete) waits on the Sender, unless the Sender gave that
+  permission to the recipient by name.
+- Limits the Sender put on their own AI ("don't change files", "just explain", "read only") are not
+  passed on either: they were for that session. The Sender's own words about what to hand off say what
+  the recipient does, and "done" is that. Never list such a limit as decided, rejected or open.
+- where_it_stands: what is finished, in progress and tried, with the numbers. Later messages
+  override earlier ones: something requested early and done later is done.
+- decided / rejected: every decision and every ruled-out option, each with its reason.
+- open_questions: what is undecided or still owed (an action such as "revoke the key"), and who it waits on.
+- headline: one line a stranger understands: who, on what, and when ("Alice and Codex, 11 Oct: storing
+  the login token"). discussed: 3 to 5 plain bullets a person can read on a phone.
+- diagram: at most 10 lines of ASCII (─ │ ├ └ ► and spaces) showing the flow or the decision, with the
+  open branch marked "(open)"; empty when there is nothing to draw. Every box in it must come from the
+  conversation.
+Write only what the conversation established; if something is uncertain, say so.
 
+{who} Write every field in {lang}, the language the Sender mostly wrote in.
+The Sender's own words about what to hand off: {what}
 
-class Draft(BaseModel):
-    """The brief, in the same sections as the handoff skill (Codex's compaction structure)."""
-    title: str = Field(description="The task in one line")
-    task: str = Field(description="What to do, and what 'done' means")
-    may_do: list[str] = Field(default_factory=list, description="What the recipient may do, only as the sender stated; empty if not discussed")
-    where_it_stands: str = Field(description="What is finished, what is in progress, what was tried")
-    decided: list[Decided] = Field(default_factory=list)
-    rejected: list[Rejected] = Field(default_factory=list)
-    open_questions: list[str] = Field(default_factory=list, description="Each undecided question, and who is waiting on it")
-    references: list[Reference] = Field(default_factory=list)
-
-
-DRAFT_PROMPT = """You write a handoff brief so a colleague's coding agent can continue a task
-without the sender rewriting the background. Use ONLY the conversation below.
-
-- Write only what the conversation established. If something is uncertain, say so.
-- Readable on its own: "the file", "option B" and "what we said" mean nothing to a
-  stranger, so name the thing ("option B (localStorage)").
-- Record every decision with its reason, and every rejected alternative with the
-  reason it was rejected. The recipient will ask "why not X?".
-- Proposals that were not settled go in open_questions.
-- References are concrete: repository, branch, commit, PR, issue, or a file by its
-  path inside the repository. Never a path under a home directory (/Users/you/..., /home/you/...,
-  ~/...), never an internal hostname or IP, never invented.
-- may_do lists only permissions the sender stated; leave it empty otherwise.
-- Never copy a credential, token, password, key or invite code.
-- A "summary" turn is the client's own summary of earlier conversation; "earlier"
-  turns are the user's messages kept from before a compaction.
-
-The sender's own words about what to hand off: {what}
-
-Conversation (oldest first):
 {transcript}"""
 
 
@@ -78,29 +83,94 @@ def new_id() -> str:
     return "ho-" + uuid.uuid4().hex[:8]
 
 
-def draft(turns: list[dict], what: str, model: str = None) -> Draft:
-    """One llm_do call turns the excerpt into the structured summary."""
+AGENTS = {"codex": "Codex", "claude": "Claude Code", "gemini": "Gemini CLI", "opencode": "opencode", "droid": "droid",
+          "cursor": "Cursor", "grok": "Grok"}
+
+
+def draft(exchanges: list[dict], what: str, model: str = None, sender: str = "",
+          agent: str = "", lang: str = "") -> Top:
+    """The report on top, written from the newest TOP_CHARS of the conversation with every AI turn quoted."""
     from ..llm_do import llm_do
-    transcript = "\n\n".join(f"[{t['role']}] {t['text']}" for t in turns)
-    prompt = DRAFT_PROMPT.format(what=what or "(not stated; infer the task from the conversation)",
-                                 transcript=transcript)
     kwargs = {"model": model} if model else {}
-    return llm_do(prompt, output=Draft, **kwargs)
+    said = {n: quote(e["ai"]) for n, e in enumerate(exchanges, 1) if e["ai"]}
+    turns = [f"[{n}] Sender: {e['user']}" + (f"\nAI: {said[n]}" if n in said else "") for n, e in enumerate(exchanges, 1)]
+    kept = turns
+    while len(kept) > 1 and sum(len(t) + 2 for t in kept) > TOP_CHARS:
+        kept = kept[1:]
+    transcript = (f"[Messages 1 to {len(turns) - len(kept)} are left out here.]\n\n" if len(kept) < len(turns) else "") + "\n\n".join(kept)
+    day = next((e["at"][:10] for e in reversed(exchanges) if e["at"]), "")
+    who = (f"The Sender is {sender or 'unnamed'}, working with {AGENTS.get(agent, 'their AI')}"
+           + (f", on {day}." if day else "."))
+    han = len(re.findall(r"[\u4e00-\u9fff]", said_by_sender := " ".join(e["user"] for e in exchanges)))
+    lang = {"zh": "Chinese", "en": "English"}.get(lang) or (
+        "Chinese" if han > len(re.findall(r"[A-Za-z]+", said_by_sender)) / 2 else "English")
+    top = llm_do(TOP_PROMPT.format(who=who, lang=lang, what=what or "(not stated; infer the task from the conversation)",
+                                   transcript=transcript), output=Top, **kwargs)
+    top.diagram = diagram_lines(top.diagram)
+    top.title = ORDER.sub("", top.title).strip() or top.title
+    return top
 
 
-def assemble(*, handoff_id: str, sender: str, to: str, what: str, source: dict,
-             summary: Draft, turns: list[dict]) -> dict:
+# The subject names the title ("Handing you the context of “{title}”"); a title that is itself an order
+# reads as one more verb in front of it (b26 review), so its leading verb goes.
+ORDER = re.compile(r"^\s*(?:(?:pick up|continue(?: with)?|take over|hand off|finish)\b[\s:：-]*|(?:接着做|继续做|继续|接手)[\s:：-]*)",
+                   re.I)
+
+
+def diagram_lines(diagram: str) -> str:
+    """Models sometimes return the diagram's line breaks as a literal backslash-n (seen live, 1.9.2b21)."""
+    return diagram.replace("\\n", "\n").rstrip()
+
+
+def quote(text: str) -> str:
+    """The AI's own words for one turn; a long one keeps its start and its end, and says how much was cut."""
+    if len(text) <= QUOTE_CHARS:
+        return text
+    head, tail = QUOTE_CHARS // 4, QUOTE_CHARS - QUOTE_CHARS // 4
+    start, end = text[:head], text[-tail:]
+    # Cut between lines where a line ends near the limit, so no word or `code` span is cut in half.
+    start = start[:start.rindex("\n")] if "\n" in start[head // 2:] else start
+    end = end[end.index("\n") + 1:] if "\n" in end[:tail // 2] else end
+    return (f"{start}\n[… {len(text) - len(start) - len(end):,} characters cut; the full session comes with the "
+            f"first answer]\n{end}")
+
+
+def _turn(exchange: dict) -> dict:
+    """One turn as the recipient reads it: the sender's words whole, the AI's final reply quoted, and how
+    many running remarks came before it (the session copy has those)."""
+    final = exchange.get("final", exchange["ai"])
+    return {"at": exchange["at"], "user": exchange["user"], "ai": quote(final) if final else "",
+            **({"steps": exchange["steps"]} if exchange.get("steps") else {})}
+
+
+def assemble(*, handoff_id: str, sender: str, to: str, what: str, source: dict, code: list[dict],
+             top: Top, exchanges: list[dict], titles: dict[str, str] = None,
+             sender_name: str = "", keep: list[str] = (), lang: str = "", keep_names: list[str] = (),
+             names: list[str] = ()) -> dict:
+    """`names` are people's names found besides co rem's (the private-sentence pass, #2500)."""
+    said = [_turn(e) for e in exchanges]
+    whole = json.dumps([top.model_dump(), said], ensure_ascii=False)
+    emails, phones = others(whole, [sender, to, *keep])
+    names = sorted({n for n in [*rem_names([sender_name, *keep_names], to), *names] if n in whole}, key=len, reverse=True)
     bundle = {
         "format": FORMAT,
         "id": handoff_id,
         "from": sender,
+        **({"from_name": sender_name} if sender_name else {}),
+        **({"lang": lang} if lang else {}),
         "to": to,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "task": what,
         "source": source,
-        **summary.model_dump(),
-        "excerpt": turns,
+        "asked": what,
+        **_masked(top.model_dump(), emails, names),
+        "code": code,
+        "conversation": _masked(said, emails, names),
+        "masked": {"emails": len(emails), "phones": len(phones), "names": len(names)},
+        "ai_quoted": True,   # 1.9.2b21: "ai" is the AI's own text, not a summary of it
     }
+    # Each #N the handoff mentions, named from what the session itself read; numbers alone mean nothing.
+    mentioned = dict.fromkeys(re.findall(r"#(\d{1,6})\b", json.dumps(bundle, ensure_ascii=False)))
+    bundle["mentioned"] = {n: (titles or {})[n] for n in mentioned if n in (titles or {})}
     return seal(bundle)
 
 
@@ -120,8 +190,10 @@ CREDENTIAL_PATTERNS = {
     "Google API key": r"\bAIza[0-9A-Za-z_-]{35}\b",
     "private key block": r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
     "ConnectOnion invite code": r"\b[A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}\b",
+    # A handoff code is the secret that accepts or asks on one handoff (replies.make_code).
+    "ConnectOnion handoff code": r"\bcoh[123]\.[A-Za-z0-9_-]{40,}",
     "JWT": r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
-    "secret assignment": r"(?i)\b[A-Z0-9_]*(?:api[_-]?key|secret|token|password|passwd)[A-Z0-9_]*\s*[:=]\s*['\"]?[A-Za-z0-9_\-/+=.]{16,}",
+    "secret assignment": r"(?i)\b[A-Z0-9_]*(?:api[_-]?key|secret|token|password|passwd)[A-Z0-9_]*\\*['\"]?\s*[:=]\s*\\*['\"]?[A-Za-z0-9_\-/+=.]{16,}",
 }
 
 
@@ -138,20 +210,143 @@ def find_credentials(bundle: dict, known_secrets: list[str] = ()) -> list[str]:
     return hits
 
 
+def redact(text: str, known_secrets: list[str] = ()) -> str:
+    """`text` with every credential-looking string replaced: for the session copy, which no one reviews
+    line by line the way a person reviews the brief's preview."""
+    for kind, pattern in CREDENTIAL_PATTERNS.items():
+        text = re.sub(pattern, f"[removed: {kind}]", text)
+    for secret in known_secrets:
+        text = text.replace(secret, "[removed: a value from keys.env]")
+    return text
+
+
+# Other people's contact details. A handoff page opens for anyone with its link, and a session that
+# ran co rem has read a mailbox: a relative's address reached a live page (Aaron, 2026-10-14). The
+# sender's and the recipient's own addresses stay, and so do example ones (RFC 2606) and git@host.
+# Tool output quotes JSON, so a literal \\n can sit right before an address: it is not part of it.
+_START = r"(?:(?<=\\[nrt])|(?<![A-Za-z0-9_.%+\\-]))"   # ASCII: 邮箱abc@x.com starts at the a
+EMAIL = re.compile(_START + r"[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+PHONE = re.compile(r"\+\d[\d \-]{7,}\d"                               # +61 412 000 111
+                   r"|(?<!\d)04\d{2}[ -]?\d{3}[ -]?\d{3}(?!\d)"          # 0412 000 111
+                   r"|(?<![\d.])\(?0[2378]\)?[ -]?\d{4}[ -]?\d{4}(?!\d|\.\d)"  # (02) 9065 4432, 0873918410
+                   r"|(?<!\d)1[38]00[ -]?\d{3}[ -]?\d{3}(?!\d)"           # 1800 737 633
+                   r"|(?<![\d.])(?:\+86[ -]?)?1[3-9]\d[ -]?\d{4}[ -]?\d{4}(?!\d)")   # 138 0013 8000
+IP = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+NOT_AN_IP = {"127.0.0.1", "0.0.0.0"}
+NOT_A_PERSON = re.compile(r"^git@|@(?:[\w-]+\.)*(?:example\.(?:com|org|net)|example|test|invalid|localhost)$", re.I)
+# Pointers at a person that are not an address: co rem's people/<name>-<10 hex>.md (bare too, but not
+# orgs/ or projects/ ones), a LinkedIn id, and the name in a mail header whose address was masked.
+PERSON_PAGE = re.compile(r"(?:(?<=\\[nrt])|(?<![A-Za-z0-9_/\\-]))[a-z][a-z0-9]*(?:-[a-z0-9]+)*-[0-9a-f]{10}(?=\.md|[^\w-]|$)")
+PEOPLE_PATH = re.compile(r"(?:(?<=\\[nrt])|(?<![A-Za-z0-9_]))people/[^\s/'\"`)\]>,;:|*]+")
+LINKEDIN = re.compile(r"(linkedin\.com/in/)[\w%-]+")
+HEADER_NAME = re.compile(r"(?:\"[^\"<>\n]{1,60}\"|(?:(?<=\\[nrt])|(?<![\w'’-]))[A-Z][\w'’-]{0,30}\.?(?: [A-Z][\w'’-]{0,30}\.?){0,3}"
+                         r"|(?<![\u4e00-\u9fff])[\u4e00-\u9fff·][\u4e00-\u9fff· ]{1,8})\s*(?=<\[email removed\]>)")
+
+
+def others(text: str, keep=()) -> tuple[set[str], set[str]]:
+    """The email addresses and phone numbers in `text` that belong to neither side of the handoff."""
+    kept = {k.lower() for k in keep if k}
+    emails = {m for m in EMAIL.findall(text) if m.lower() not in kept and not NOT_A_PERSON.search(m)}
+    return emails, set(PHONE.findall(text))
+
+
+# A handoff page's link is a capability: whoever holds it can read the page and its code (#2495 review).
+HANDOFF_LINK = re.compile(r"(?:https?://)?o\.openonion\.ai/h/[A-Za-z0-9_-]{16,}(?:/codex)?")
+
+
+def rem_people_dir() -> Path:
+    return Path.home() / ".co" / "rem" / "people"
+
+
+def rem_names(keep_names=(), to: str = "") -> list[str]:
+    """The names of the people co rem keeps pages on here, from each page's title, except the sender's
+    and the recipient's (`keep_names`, and the page that holds the `to` address): a session that ran
+    co rem talks about them by name (#2495 review)."""
+    folder = rem_people_dir()
+    pages = [p.read_text(encoding="utf-8", errors="replace") for p in folder.glob("*.md")] if folder.is_dir() else []
+    kept = {w.lower() for k in keep_names if k for w in k.split()}
+    kept |= {w.lower() for page in pages if to and to.lower() in page.lower() for w in _title(page).split()}
+    named = set()
+    for title in [part.strip() for page in pages for part in _names_in(_title(page))]:
+        words = title.split()
+        if len(title) < 2 or re.fullmatch(r"[\w.+-]+@[\w.-]+|[A-Z0-9]+", title) or kept & {w.lower() for w in words}:
+            continue   # an address, an acronym ("GIF"), or the sender or recipient
+        named.add(title)
+        if len(words) == 2 and all(re.fullmatch(r"[\u4e00-\u9fff]+", w) for w in words):
+            named |= {words[1], "".join(words)} if len(words[1]) >= 2 else {"".join(words)}   # 谢 红瑛: 红瑛, 谢红瑛
+        # A session says "Sasha" or "Larry" as often as the whole title: each name-like word goes too.
+        named |= {w for w in words if len(words) > 1 and re.fullmatch(r"[A-Z][a-z]{3,}", w)}
+    return sorted(named, key=len, reverse=True)
+
+
+def _title(page: str) -> str:
+    return page.split("\n", 1)[0].lstrip("# ").strip()
+
+
+def _names_in(title: str) -> list[str]:
+    """"Mei-Ling Wu (Mimi)" → the name and the nickname: the session said the nickname, not the name (2026-10-14)."""
+    nicknames = re.findall(r"[(（]([^()（）]+)[)）]", title)
+    return [re.sub(r"\s*[(（][^()（）]*[)）]", "", title), *nicknames]
+
+
+def mask(text: str, keep=(), emails: set[str] = None, names=()) -> str:
+    """`text` with other people's addresses, numbers and IPs removed, and what else points at them.
+    `emails` names the addresses when they were found across more than this one text; `names` are
+    people's names to remove (rem_names)."""
+    emails = others(text, keep)[0] if emails is None else emails
+    text = HANDOFF_LINK.sub("[handoff link]", text)
+    if names:
+        text = re.sub(r"(?<![A-Za-z])(?:" + "|".join(map(re.escape, names)) + r")(?![A-Za-z])", "[person]", text)
+    text = EMAIL.sub(lambda m: "[email removed]" if m.group(0) in emails else m.group(0), text)   # one pass
+    # What is left of one on its own ("kevin.chin1@ (all @student…)", "grep ivvli0000"), when it cannot be
+    # an ordinary word: "anyone@x.com" must not turn "anyone can read it" into "someone can".
+    names = sorted({a.split("@")[0] for a in emails if re.search(r"[\d._]", a.split("@")[0])}, key=len, reverse=True)
+    if names:
+        text = re.sub(r"(?<![A-Za-z0-9_.-])(?:" + "|".join(map(re.escape, names)) + r")(?![A-Za-z0-9_])", "someone", text)
+    text = PEOPLE_PATH.sub("people/[person]", text)
+    text = PERSON_PAGE.sub("[person]", text)
+    text = LINKEDIN.sub(r"\1[person]", text)
+    text = HEADER_NAME.sub("[person] ", text)
+    text = IP.sub(lambda m: m.group(0) if m.group(0) in NOT_AN_IP or max(map(int, m.group(0).split("."))) > 255
+                  else "[ip removed]", text)
+    return PHONE.sub("[phone removed]", text)
+
+
+def _masked(value, emails, names=()):
+    if isinstance(value, str):
+        return mask(value, emails=emails, names=names)
+    if isinstance(value, list):
+        return [_masked(v, emails, names) for v in value]
+    if isinstance(value, dict):
+        return {k: _masked(v, emails, names) for k, v in value.items()}
+    return value
+
+
+def known_secrets() -> list[str]:
+    """Values of credential-named keys in the environment: any of them in a handoff is a leak."""
+    names = ("KEY", "TOKEN", "SECRET", "PASSWORD", "INVITE")
+    return [v for k, v in os.environ.items() if any(n in k.upper() for n in names) and len(v) >= 12]
+
+
 # Not secrets, but not the recipient's business either: they are shown in the
 # preview so the sender removes or keeps each one knowingly (the skill's audit).
 PRIVATE_PATTERNS = {
     "home directory path": r"(?:/Users|/home)/[A-Za-z0-9._-]+(?:/[^\s`'\")\]]*)?",
     "agent config path": r"~/\.(?:codex|claude|co)\b[^\s`'\")\]]*",
+    "email address": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+    "phone number": r"\+\d[\d \-]{7,}\d",
+    "IP address": r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
 }
 
 
 def find_private(bundle: dict) -> list[str]:
-    """Private paths in the bundle, as 'field: match' (deduplicated)."""
+    """Private paths, email addresses and phone numbers in the bundle, as 'field: match' (deduplicated).
+    The sender's and recipient's addresses are the header, and `code` holds repository URLs on purpose."""
+    own = {bundle.get("from"), bundle.get("to")}
     hits = []
-    for field, text in _strings(bundle):
+    for field, text in _strings({k: v for k, v in bundle.items() if k not in ("from", "to", "code")}):
         for pattern in PRIVATE_PATTERNS.values():
-            hits += [f"{field}: {m}" for m in re.findall(pattern, text)]
+            hits += [f"{field}: {m}" for m in re.findall(pattern, text) if m not in own]
     return list(dict.fromkeys(hits))
 
 
@@ -169,53 +364,156 @@ def _strings(value, field: str = ""):
 # ---- how a bundle travels in a mail body ----
 
 _FONT = "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
-_BOX = ("white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;margin:0;padding:14px 16px;"
-        "background:#f3f8f4;border:1px solid #cfe3d4;border-radius:8px;"
-        "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.5;color:#1f2a22")
+_INK, _MUTED, _GREEN, _TINT, _LINE = "#1f2a22", "#4b5b4f", "#15803d", "#f3f8f4", "#cfe3d4"
+# Outlook's Word engine ignores padding, border and wrapping on <pre>, so the frame is the cell.
+_FRAME = f"padding:14px 16px;background:{_TINT};border:1px solid {_LINE}"
+_PRE = ("margin:0;white-space:pre-wrap;word-break:normal;overflow-wrap:anywhere;"
+        f"font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.5;color:{_INK}")
+GUIDE = "https://connectonion.com"   # a short public page, not the 310-line engineering doc (b24 audit)
 
 
-def to_mail(bundle: dict, prompt: str) -> tuple[str, str]:
-    """(subject, HTML body) for a person reading on any screen.
+CLIENT_NAMES = {"claude": "Claude Code", "codex": "Codex"}
 
-    Top: who handed what, the task, where it stands, the open questions. Then the block to
-    paste into Codex or Claude Code, in a box that wraps (a bare <pre> ran off a phone's
-    edge, 2026-10-11). Last, in small grey type, the bundle co handoff open reads (base64,
-    so no mail system rewrites it). HTML because the mail service sends the body as HTML.
-    """
-    subject = f"[co handoff] {_one_line(bundle['title'], 70)} (from {bundle['from']})"
+WORDS = {   # the mail in the language the sender wrote in, in their own voice (Aaron, 2026-10-13:
+           # "不是以我作为第一人称写的 有点好像是 AI 写的 这个不够亲切友好 不够能够取得别人的信任")
+    "en": {"subject": "Handing you the context of “{title}”",
+           "lead": "Hi, I've been working on “{title}” with {client}. Here's the whole context, in case you can take it from here.",
+           "talked": "Where we got to: {point}.",
+           "view": "See the context I'm passing you",
+           "how": "Or carry on straight away: open a new conversation in Codex or Claude Code and paste the line "
+                  "below. My session continues there, with the code. Nothing runs until you paste it.",
+           "select": "Triple-click the line to select it, then copy it (Cmd+C on a Mac, Ctrl+C elsewhere).",
+           "sign": "Thanks,\n{name}",
+           "footer": "Sent with ConnectOnion (open source).", "guide": "What's this?",
+           "space": " ", "colon": " "},
+    "zh": {"subject": "把「{title}」的上下文交给你",
+           "lead": "你好，我最近在用 {client} 做「{title}」。这是完整的上下文，想请你帮忙接着做下去。",
+           "talked": "我们目前讨论到：{point}。",
+           "view": "看看我交给你的上下文",
+           "how": "如果想直接接着做：在 Codex 或 Claude Code 里新开一个对话，粘贴下面这一行，我的会话和代码会在那里接着进行。"
+                  "粘贴之前，什么都不会运行。",
+           "select": "在这一行上连点三下即可选中，然后复制（Mac 按 Cmd+C，其他电脑按 Ctrl+C）。",
+           "sign": "谢谢！\n{name}",
+           "footer": "通过 ConnectOnion（开源）发送。", "guide": "这是什么？",
+           "space": "", "colon": ""},
+}
+
+
+def language(bundle: dict) -> str:
+    """"zh" or "en": the bundle's own "lang", else whichever the sender's own words are mostly written in."""
+    if bundle.get("lang") in WORDS:
+        return bundle["lang"]
+    said = " ".join([bundle.get("asked", "")] + [e["user"] for e in bundle.get("conversation", [])])
+    han = len(re.findall(r"[\u4e00-\u9fff]", said))
+    return "zh" if han > len(re.findall(r"[A-Za-z]+", said)) / 2 else "en"
+
+
+def _sentence_case(text: str) -> str:
+    """"Shortcomings of …" reads mid-sentence as "shortcomings of …"; "API limits" stays as it is."""
+    return text[0].lower() + text[1:] if len(text) > 1 and text[1].islower() else text
+
+
+SOMEONE = {"en": "Someone", "zh": "有人"}
+
+
+def person_name(bundle: dict) -> str:
+    """The sender as a person reading a mail knows them: their name, else "Someone". An agent address
+    (0x…@mail.openonion.ai) is not a name; the b22 mail said "0x9c0a8bf90c@… passed you some work"."""
+    name = sender_name(bundle)
+    if re.fullmatch(r"0x[0-9a-f]+@\S+", name, re.I):
+        return SOMEONE[language(bundle)]
+    return name.split("@")[0] if "@" in name else name
+
+
+def notice(bundle: dict, prompt: str, viewer: str = "", carry_bundle: bool = False) -> dict:
+    """{subject, text, html}: the mail a person gets, short, like a note from someone they know (#2478).
+
+    Aaron, 2026-10-13: the 1.9.2b22 mail ("[co handoff] … (from …)", a ConnectOnion banner, every
+    finding laid out, from an agent mailbox) looked like spam and was overwhelming. So: a short
+    subject without co's words, one or two sentences on who worked on what with their AI and what
+    they talked through, the block, one line of footer, in the language the sender wrote in. What
+    they decided reaches the agent when it accepts. It goes from the sender's own mailbox when there
+    is one (transport.hand_over). The HTML keeps the block in the first <pre> and the bundle hidden
+    at the end, which co handoff inbox and open read back."""
+    words = WORDS[language(bundle)]
+    name, title = person_name(bundle), _one_line(bundle["title"], 80)
+    client = CLIENT_NAMES.get(bundle.get("source", {}).get("kind"), "AI")
+    lead = words["lead"].format(name=name, title=title, client=client)
+    points = bundle.get("discussed") or []
+    same = points and (bool(re.search(r"[\u4e00-\u9fff]", points[0])) == (language(bundle) == "zh"))
+    talked = words["talked"].format(point=_sentence_case(_one_line(points[0].rstrip(".。"), 160))) if same else ""
+    said = words["space"].join(part for part in (lead, talked) if part)
+    subject = words["subject"].format(title=_one_line(bundle["title"], 60))
+    sign = words["sign"].format(name=name) if name != SOMEONE[language(bundle)] else words["sign"].split("\n")[0]
+    how = words["how"].format(name=name)
+    view = words["view"].format(name=name)
+    text = (f"{said}\n\n" + (f"{view}: {viewer}\n\n" if viewer else "") + f"{how}\n\n"
+            f"{words['select']}\n\n{prompt.strip()}\n\n{sign}\n\n"
+            f"{words['footer']}{words['space']}{words['guide']}{words['colon']}{GUIDE}\n")
+    # The hidden copy is for an agent that reads this mail (co handoff inbox); a person has the page,
+    # and a plain-text reader showed it as a wall of base64. Only the inbox copy carries it, boxed: in a
+    # mail to an agent mailbox it would be plaintext on ConnectOnion's mail service, so that agent opens
+    # the sealed page from the mail's link instead.
+    carry = carry_bundle
     encoded = base64.b64encode(json.dumps(bundle, ensure_ascii=False).encode()).decode()
     wrapped = "\n".join(encoded[i:i + 76] for i in range(0, len(encoded), 76))
-    questions = "".join(f"<li>{html.escape(q)}</li>" for q in bundle.get("open_questions", []))
-    body = (
-        f'<div style="{_FONT};max-width:640px;font-size:15px;line-height:1.55;color:#1f2a22">'
-        f'<p style="margin:0 0 4px;color:#15803d;font-size:13px;font-weight:600">'
-        f'{html.escape(bundle["from"])} handed you a task</p>'
-        f'<h2 style="margin:0 0 12px;font-size:20px">{html.escape(bundle["title"])}</h2>'
-        f'<p style="margin:0 0 12px">{html.escape(bundle["task"])}</p>'
-        f'<p style="margin:0 0 12px"><b>Where it stands:</b> {html.escape(bundle["where_it_stands"])}</p>'
-        + (f'<p style="margin:0 0 4px"><b>Open questions</b></p><ul style="margin:0 0 12px">{questions}</ul>'
-           if questions else "")
-        + '<p style="margin:20px 0 8px"><b>Continue it with your AI agent.</b> Copy everything in the box '
-          'into Codex or Claude Code. It installs co if needed, tells the sender you have it, '
-          'and asks you before it changes anything.</p>'
-        f'<pre style="{_BOX}">{html.escape(prompt.strip())}</pre>'
-        '<p style="margin:16px 0;color:#4b5b4f;font-size:14px">No AI agent at hand? '
-        'Reply to this email with any question.</p>'
-        f'<pre style="white-space:pre-wrap;word-break:break-all;margin:24px 0 0;color:#9aa69d;font-size:9px;'
-        f'line-height:1.2;font-family:monospace">{BEGIN}\n{wrapped}\n{END}</pre>'
-        "</div>\n"
+    e = html.escape
+    page = (
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff">'
+        '<tr><td style="padding:16px 12px">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        f'style="max-width:600px;{_FONT};font-size:15px;line-height:1.55;color:{_INK}"><tr><td>'
+        f'<p style="margin:0 0 14px">{e(said)}</p>'
+        + (_button(viewer, view) if viewer else "")
+        + f'<p style="margin:0 0 14px">{e(how)}</p>'
+        f'<p style="margin:0 0 6px;color:{_MUTED};font-size:13px">{e(words["select"])}</p>'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+        f'<tr><td style="{_FRAME}"><pre style="{_PRE}">{e(prompt.strip())}</pre></td></tr></table>'
+        f'<p style="margin:18px 0 0">{e(sign).replace(chr(10), "<br>")}</p>'
+        '<div style="height:18px"></div>'
+        f'<p style="margin:0;color:{_MUTED};font-size:13px">{e(words["footer"])}{words["space"]}'
+        f'<a href="{GUIDE}" style="color:{_GREEN}">{e(words["guide"])}</a></p>'
+        '</td></tr></table></td></tr></table>'
+        + (f'<div style="display:none;max-height:0;overflow:hidden;mso-hide:all">{BEGIN}\n{wrapped}\n{END}</div>\n'
+           if carry else "")
     )
-    return subject, body
+    return {"subject": subject, "text": text, "html": page}
+
+
+def _button(href: str, label: str) -> str:
+    """A link drawn as a button that every mail client renders, Outlook included (a padded table cell)."""
+    # Gmail on iOS dropped the cell's `background` and left white text on white (2026-10-13): the colour
+    # goes on the cell as an attribute and a property, and on the link itself, so any one survives.
+    return ('<table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 18px"><tr>'
+            f'<td bgcolor="{_GREEN}" style="background-color:{_GREEN};border-radius:8px">'
+            f'<a href="{html.escape(href)}" style="display:inline-block;padding:12px 20px;background-color:{_GREEN};'
+            f'border:1px solid {_GREEN};border-radius:8px;color:#ffffff;font-weight:600;text-decoration:none;{_FONT}">'
+            f'<span style="color:#ffffff">{html.escape(label)}</span></a></td></tr></table>')
 
 
 def from_saved_mail(text: str) -> dict | None:
     """The bundle in a mail saved by any client: `co email read` output, the pasted body, or a downloaded .eml,
     whose text part may be quoted-printable or base64 encoded."""
+    return from_mail(saved_mail_text(text))
+
+
+def saved_mail_text(text: str) -> str:
+    """A saved mail's readable text: a downloaded .eml's parts decoded (quoted-printable splits long links)."""
     message = email.message_from_string(text, policy=email.policy.default)
     if message["MIME-Version"] or message["Content-Type"]:
-        body = message.get_body(preferencelist=("plain",))
-        text = body.get_content() if body else ""
-    return from_mail(text)
+        parts = [message.get_body(preferencelist=(kind,)) for kind in ("plain", "html")]
+        text = "\n".join(part.get_content() for part in parts if part)
+    return text
+
+
+def prompt_in(body: str) -> str:
+    """The block a person pastes: the first <pre> of a handoff mail, or for a mail read as plain text,
+    everything before its bundle block."""
+    box = re.search(r"(?s)<pre[^>]*>(.*?)</pre>", body or "")
+    if box and not re.search(_marker(BEGIN), box.group(1)):
+        return html.unescape(box.group(1)).strip()
+    found = re.search(r"(?s)(.*?)" + _marker(BEGIN), html.unescape(re.sub(r"<[^>]+>", "", body or "")))
+    return found.group(1).strip() if found else ""
 
 
 def from_mail(body: str) -> dict | None:
@@ -242,62 +540,91 @@ def _one_line(text: str, width: int) -> str:
 
 # ---- what a person reads: one format everywhere ----
 
-def task_section(bundle: dict) -> str:
-    return bundle["task"]
-
-
-def decided_text(bundle: dict) -> str:
-    return "\n".join(f"- {d['decision']} (why: {d['why']})" for d in bundle.get("decided", [])) or "- none recorded"
-
-
-def rejected_text(bundle: dict) -> str:
-    return "\n".join(f"- {r['option']}: {r['why_not']}" for r in bundle.get("rejected", [])) or "- none recorded"
-
-
 def questions_text(bundle: dict) -> str:
     return "\n".join(f"- {q}" for q in bundle.get("open_questions", [])) or "- none"
 
 
-def references_text(bundle: dict) -> str:
-    lines = [f"- {r['reference']}: {r['note']}" for r in bundle.get("references", [])]
-    source = bundle.get("source", {})
-    lines.append(f"- Transcript excerpt: {_count(bundle.get('excerpt'), 'turn')} of the sender's "
-                 f"{source.get('kind', '?')} session{' (compacted; earlier part as kept by the client)' if source.get('compacted') else ''}")
+def code_text(bundle: dict) -> str:
+    places = bundle.get("code") or []
+    if not places:
+        return "- The session did not work in a git repository. Ask the sender where the code is."
+    lines = []
+    for code in places:
+        travels = "sha256" in (code.get("patch") or {})
+        pushed = ("pushed" if code["pushed"] and not travels else
+                  "not pushed; it goes with this handoff and accept rebuilds it" if travels else
+                  "not pushed yet: ask the sender to push it")
+        branch = "detached" if code["branch"] == "HEAD" else f"branch {code['branch']}"
+        lines.append(f"- {code['repository'] or 'a repository with no remote'}, {branch}, "
+                     f"commit {code['commit']} ({pushed})")
+        if code["uncommitted"]:
+            lines.append(f"  {code['uncommitted']} changed file(s) on the sender's machine are not in that commit"
+                         + ("; they go with this handoff too" if travels else ""))
     return "\n".join(lines)
 
 
-def excerpt_text(bundle: dict) -> str:
-    return "\n\n".join(f"[{t['role']}] {t['text']}" for t in bundle.get("excerpt", []))
+def _asked(bundle: dict) -> str:
+    """The sender's own words about what to hand off lead the task, so the summary cannot replace them."""
+    return f"Handed off as: {bundle['asked']}\n\n" if bundle.get("asked") else ""
+
+
+def _mentioned(bundle: dict) -> str:
+    return "\n".join(f"- #{n}: {title}" for n, title in bundle["mentioned"].items())
+
+
+def _listed(items: list[str]) -> str:
+    return "\n".join(f"- {item}" for item in items) or "- none recorded"
+
+
+def conversation_text(bundle: dict, chars: int = None) -> str:
+    label = "AI" if bundle.get("ai_quoted") else "AI, in summary"
+    turns = [f"[{n}] {sender_name(bundle)}:\n{e['user']}" + (f"\n\n{label}: {e['ai']}" if e["ai"] else "")
+             for n, e in enumerate(bundle["conversation"], 1)]
+    kept = turns
+    while chars and len(kept) > 1 and sum(len(t) + 2 for t in kept) > chars:
+        kept = kept[1:]
+    if len(kept) == len(turns):
+        return "\n\n".join(turns)
+    return (f"[Messages 1 to {len(turns) - len(kept)} are left out to keep this mail short; the sender's agent "
+            f"sends the whole session with its first answer.]\n\n" + "\n\n".join(kept))
 
 
 def header(bundle: dict) -> str:
     # A blank line, not a single newline: the mail service joins single newlines in the text part.
-    lines = [f"# Handoff: {bundle['title']}",
-             f"From: {bundle['from']} · To: {bundle['to']} · {bundle['created_at'][:10]} · {bundle['id']}"]
-    if bundle.get("may_do"):
-        lines.append("Recipient may: " + "; ".join(bundle["may_do"]))
-    return "\n\n".join(lines)
+    return (f"# Handoff: {bundle['title']}\n\n"
+            f"From: {person_name(bundle)} · To: {bundle['to']} · {bundle['created_at'][:10]} · {bundle['id']}")
 
 
-def summary_text(bundle: dict) -> str:
-    """The first screen: task, where it stands, open questions, and what else there is."""
-    return (f"{header(bundle)}\n\n## Task\n{task_section(bundle)}\n\n"
-            f"## Where it stands\n{bundle['where_it_stands']}\n\n## Open questions\n{questions_text(bundle)}\n\n"
-            f"{_count(bundle.get('decided'), 'decision')}, {_count(bundle.get('rejected'), 'rejected option')}, "
-            f"{_count(bundle.get('references'), 'reference')}, {len(bundle.get('excerpt', []))}-turn excerpt.")
+def sender_name(bundle: dict) -> str:
+    """The sender as a person knows them: their name when the bundle carries it, else their address."""
+    return bundle.get("from_name") or bundle["from"]
 
 
-def brief_markdown(bundle: dict) -> str:
-    """The whole brief in the handoff skill's sections: preview, mail body and HANDOFF.md."""
-    return (f"{header(bundle)}\n\n"
-            f"## Task\n{task_section(bundle)}\n\n"
+def report(bundle: dict) -> str:
+    """What a person reads first (#2460): who and what, what was discussed and concluded, what is
+    still open, and a small diagram. Bundles from before 1.9.2b21 have no headline: it is skipped."""
+    parts = [bundle["headline"]] if bundle.get("headline") else []
+    if bundle.get("discussed"):
+        parts.append(f"## Discussed\n{_listed(bundle['discussed'])}")
+    if bundle.get("decided"):
+        parts.append(f"## Concluded\n{_listed(bundle['decided'])}")
+    parts.append(f"## Still open\n{questions_text(bundle)}")
+    if bundle.get("diagram", "").strip():
+        parts.append(f"```\n{bundle['diagram'].rstrip()}\n```")
+    return "\n\n".join(parts)
+
+
+def brief_markdown(bundle: dict, conversation_chars: int = None) -> str:
+    """The whole handoff: preview, HANDOFF.md and co handoff show all print this. The report
+    first, then the detail for whoever wants it.
+
+    `conversation_chars` keeps the newest messages that fit."""
+    return (f"{header(bundle)}\n\n{report(bundle)}\n\n"
+            f"## Task\n{_asked(bundle)}{bundle['task']}\n\n"
             f"## Where it stands\n{bundle['where_it_stands']}\n\n"
-            f"## Decided\n{decided_text(bundle)}\n\n"
-            f"## Rejected\n{rejected_text(bundle)}\n\n"
-            f"## Open questions\n{questions_text(bundle)}\n\n"
-            f"## Code and references\n{references_text(bundle)}\n")
-
-
-def _count(items, noun: str) -> str:
-    n = len(items or [])
-    return f"{n} {noun}" + ("" if n == 1 else "s")
+            + (f"## Rejected\n{_listed(bundle['rejected'])}\n\n" if bundle.get("rejected") else "")
+            + f"## Code\n{code_text(bundle)}\n\n"
+            + (f"## Issues and PRs mentioned\n{_mentioned(bundle)}\n\n" if bundle.get("mentioned") else "")
+            + f"## Conversation\nEvery message {sender_name(bundle)} wrote, word for word; the AI's replies "
+            + ("word for word, a long one cut in the middle. " if bundle.get("ai_quoted") else "in summary. ")
+            + f"Anything not here, ask the sender.\n\n{conversation_text(bundle, conversation_chars)}\n")

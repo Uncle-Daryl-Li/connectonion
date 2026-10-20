@@ -19,9 +19,9 @@ from connectonion.cli.main import app
 
 runner = CliRunner()
 REM = get_command(app).commands["rem"]
-ROOT_COMMANDS = ["init", "investigate", "open", "list", "show", "search", "start", "stop", "status",
+ROOT_COMMANDS = ["init", "investigate", "enrich", "muse", "deepen", "open", "list", "show", "search", "start", "stop", "status",
                  "sync", "sources", "config", "logs", "doctor"]
-ADVANCED = ["scan", "map-skills", "stub", "merge", "reflect", "reflections", "propose", "review", "abstract", "capture",
+ADVANCED = ["scan", "map-skills", "import", "stub", "merge", "translate", "reflect", "reflections", "propose", "review", "abstract", "capture",
             "projects"]
 OLD_NAMES = {"unfinished": "investigate", "people": "list people --aliases", "daily": "sync",
              "subscriptions": "sources", "subscribe": "sources add", "unsubscribe": "sources remove",
@@ -50,9 +50,13 @@ def test_every_command_and_subcommand_has_a_page():
     names = set(pages())
     for command in [*ROOT_COMMANDS, *ADVANCED, "advanced"]:
         assert f"co rem {command}" in names, command
-    for group in ("sources", "config", "projects"):
+    for group in ("sources", "config", "projects", "import"):
         for sub in REM.commands[group].commands:
             assert f"co rem {group} {sub}" in names, (group, sub)
+
+
+def test_config_help_describes_speed_default_and_override():
+    assert "speed                          fast (default) | standard: Codex's Fast tier, 1.5x speed" in pages()["co rem config"]
 
 
 def test_every_command_is_on_the_root_page_the_advanced_page_or_is_an_old_name():

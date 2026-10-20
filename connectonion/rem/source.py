@@ -1,13 +1,15 @@
 """Incremental read-only importers for local session transcripts (Codex, Claude Code)."""
 
 import copy
+import fnmatch
 import hashlib
 import json
+import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .files import RemError, safe_path
 
@@ -112,9 +114,38 @@ def timestamp(value: str) -> datetime:
         raise RemError("Source contains an invalid timestamp") from error
 
 
+LOCAL_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T[^\s]*(?:Z|[+-]\d{2}:?\d{2})")
+
+
+def local_time(stamp, zone) -> str:
+    # A Sydney reply's prose said 27 August but Sources said 28 August (2026-10-16).
+    if LOCAL_TIMESTAMP.fullmatch(str(stamp)):
+        return timestamp(str(stamp)).astimezone(zone).strftime("%Y-%m-%d %H:%M ") + str(zone)
+    return ""
+
+
+def with_local_times(items, zone) -> list[dict]:
+    result = []
+    for item in items:
+        local = local_time(item.get("timestamp"), zone)
+        copied = {}
+        for key, value in item.items():
+            if key == "local_time" and local:
+                continue
+            copied[key] = value
+            if key == "timestamp" and local:
+                copied["local_time"] = local
+        result.append(copied)
+    return result
+
+
 def rem_task(cwd) -> bool:
     """A session run in a notebook's .state/tasks: REM's own work, never the user's words."""
-    parts = PurePosixPath(str(cwd or "")).parts
+    value = str(cwd or "")
+    windows = PureWindowsPath(value)
+    # Transcript paths belong to their producer, not the machine reading them.
+    # Drive/UNC paths use Windows separators and case; POSIX keeps its case.
+    parts = tuple(part.casefold() for part in windows.parts) if windows.drive else PurePosixPath(value).parts
     return any(parts[i:i + 2] == (".state", "tasks") for i in range(len(parts) - 1))
 
 
@@ -140,9 +171,12 @@ def _codex_meta(first: dict) -> dict:
     # sidechain: its user slot is what the parent agent wrote or quoted back, and a
     # forked worker starts with a copy of the parent's messages. Its tool calls are
     # still the session's (a skill it loads was loaded), so only messages are refused.
+    # Exec prompts are program-written too: on 2026-10-15 a person investigation
+    # cited one as "the user's Codex note". Reuse the same message exclusion.
     source = payload.get("source")
     return {"id": payload.get("id"), "cwd": payload.get("cwd", ""),
-            "subagent": isinstance(source, dict) and "subagent" in source,
+            "subagent": (isinstance(source, dict) and "subagent" in source
+                         or source == "exec" or payload.get("originator") == "codex_exec"),
             "interactive_cli": source == "cli" and payload.get("originator") in ("codex-tui", "codex_cli_rs"),
             "desktop": payload.get("originator") == CODEX_DESKTOP,
             "native_desktop": payload.get("originator") == CODEX_DESKTOP and source == "vscode"}
@@ -232,6 +266,17 @@ def _claude_meta(first: dict) -> dict:
     return {"id": first.get("sessionId"), "cwd": first.get("cwd", "")}
 
 
+def automated(row: dict) -> bool:
+    """A prompt a program sent through `claude -p` or the SDK, not one the user typed.
+
+    A launchd job's "The user explicitly authorized a campaign of weekly LinkedIn
+    articles. Schedule exactly one article…" became the user's request to
+    schedule it on projects/layeredvisions (2026-10-14). On this machine 1,437
+    of 1,454 sessions opened that way were schedulers, harnesses and REM's own
+    turns; the user types into `entrypoint: cli`."""
+    return str(row.get("entrypoint") or "").startswith("sdk") or row.get("promptSource") in ("sdk", "system")
+
+
 def _claude_message(row: dict, since: datetime, meta: dict | None = None) -> dict | None:
     role = row.get("type")
     if role not in CODING_SPEAKERS:
@@ -245,7 +290,7 @@ def _claude_message(row: dict, since: datetime, meta: dict | None = None) -> dic
     # is: a meta row (a skill body, a caveat, a system reminder), a sidechain row (a
     # prompt the assistant wrote for its own subagent -- "You are one finder angle in
     # a code review…"), and the shape of the content.
-    if row.get("isMeta") or row.get("isSidechain") or rem_task(row.get("cwd")):
+    if row.get("isMeta") or row.get("isSidechain") or rem_task(row.get("cwd")) or automated(row):
         return SKIPPED
     content = message.get("content")
     if isinstance(content, str):
@@ -290,8 +335,20 @@ def source_files(subscription: dict) -> list[Path]:
     if root.is_symlink():
         raise RemError("Session source root cannot be a symlink")
     pattern = KINDS[subscription.get("kind", "codex")]["glob"]
-    paths = sorted(root.rglob(pattern))
-    return [safe_path(root, path.relative_to(root).as_posix()) for path in paths]
+    # os.walk does not descend into linked folders, so only each file needs the
+    # link check; safe_path checked every folder of every file, 41 s of an
+    # 80-second scan over 15,000 rollouts (2026-10-20).
+    paths = []
+    for current, dirs, files in os.walk(root):
+        folder = Path(current)
+        inside = folder.relative_to(root).parts
+        for name in files:
+            if fnmatch.fnmatchcase(name, pattern):
+                path = folder / name
+                if any(part.startswith(".") for part in (*inside, name)) or path.is_symlink():
+                    safe_path(root, "/".join((*inside, name)))  # raises the same error it always did
+                paths.append(path)
+    return sorted(paths)
 
 
 def pending_metadata(subscription: dict, progress: dict) -> dict:
@@ -377,10 +434,19 @@ def collect(subscription: dict, progress: dict, max_items: int, max_chars: int) 
     # lookback and walks forward is also the only way to exercise, in a test, what a
     # year of maintenance does to the pages. Progress is per file; order changes
     # nothing else. (`sync --all` is what makes a long backfill finish in one go.)
-    for path in sorted(source_files(subscription), key=lambda p: p.stat().st_mtime_ns):
-        name = path.relative_to(root).as_posix()
-        old, stat = progress.get(name, {}), path.stat()
+    # One stat per file, and names cut from the root's prefix: Path.relative_to on
+    # 15,000 rollouts was half of a warm scan (2026-10-20).
+    prefix = len(str(root).rstrip("/")) + 1
+    for path, stat in sorted(((path, path.stat()) for path in source_files(subscription)),
+                             key=lambda pair: pair[1].st_mtime_ns):
+        name = str(path)[prefix:].replace("\\", "/")
+        old = progress.get(name, {})
         if stat.st_size == old.get("offset") and stat.st_mtime_ns == old.get("mtime_ns"):
+            continue
+        if old.get("skipped"):
+            # Whether a session is read is decided by its first line, which an append
+            # cannot change: a grown skipped session stays skipped, unopened. Its entry
+            # is left as it was, so a running REM turn never reads as new progress.
             continue
         # Messages are appended with their own time, so a file last written before the
         # lookback cannot hold one inside it. On first start this is most of the store.
@@ -390,9 +456,11 @@ def collect(subscription: dict, progress: dict, max_items: int, max_chars: int) 
             if source is None:
                 changed_files.append(name)
                 continue
-            if meta.get("skip"):
-                continue
-            if subscription.get("project") and kind == "codex" and meta.get("cwd") != subscription["project"]:
+            if meta.get("skip") or (subscription.get("project") and kind == "codex"
+                                    and meta.get("cwd") != subscription["project"]):
+                # Recorded, or every scan reopened it: 11,473 of REM's own Codex turns
+                # were reopened on each 80-second scan of one machine (2026-10-20).
+                updated[name] = {"offset": stat.st_size, "mtime_ns": stat.st_mtime_ns, "skipped": True}
                 continue
             # A subject scope keeps whole sessions, so its items are held until the
             # session says whether it is about that subject. Grouping by directory

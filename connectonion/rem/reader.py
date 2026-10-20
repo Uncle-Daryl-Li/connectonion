@@ -9,17 +9,20 @@ served site later would hand it the same object over HTTP instead.
 import hashlib
 import json
 import os
+import posixpath
 import re
 import tempfile
 import webbrowser
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .files import CATEGORIES, MAP_DAYS, Notebook
-from .service import run_logs, status, subscriptions
+from .files import CATEGORIES, MAP_DAYS, Notebook, RemError
+from .service import run_logs, seen_outcome, status, subscriptions
 
 TEMPLATE = Path(__file__).with_name("reader.html")
 PLACEHOLDER = "/*__REM_DATA__*/null"
+BARE_DOMAIN = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
 
 
 def _title(record: str, text: str) -> str:
@@ -27,6 +30,39 @@ def _title(record: str, text: str) -> str:
         if line.startswith("#"):
             return line.lstrip("#").strip() or record
     return Path(record).stem.replace("-", " ")
+
+
+def _org_name(domain: str, text: str) -> str:
+    """Find a capitalised spelling of the first domain label in the page itself."""
+    body = re.sub(r"^## Sources[ \t]*\n.*?(?=^## |\Z)", "", text, flags=re.I | re.M | re.S)
+    body = re.sub(r"^#[ \t]+.*$", "", body, flags=re.M)
+    label = re.sub(r"[^a-z]", "", domain.split(".")[0])
+    tokens = list(re.finditer(r"(?<![A-Za-z0-9])[A-Z][A-Za-z0-9]*(?:[’']s)?(?![A-Za-z0-9])", body))
+    names = Counter()
+    for start, first in enumerate(tokens):
+        words, end = [], first.start()
+        for token in tokens[start:start + 4]:
+            if words and not body[end:token.start()].isspace():
+                break
+            words.append(re.sub(r"[’']s$", "", token.group()))
+            end = token.end()
+            if re.sub(r"[^a-z]", "", "".join(words).lower()) == label:
+                names[" ".join(words)] += 1
+    return names.most_common(1)[0][0] if names else ""
+
+
+def _org_company_name(path: str, records: list[dict]) -> str:
+    """People's Company facts can name an organisation whose own prose does not."""
+    names = Counter()
+    for person in records:
+        if person["category"] != "people":
+            continue
+        for fact in re.findall(r"^-[ \t]+Company:[ \t]*(.+)$", person["text"], re.M):
+            for name, link in re.findall(r"\[([^\]]+)\]\(([^)#]+)", fact):
+                linked = posixpath.normpath(posixpath.join(posixpath.dirname(person["path"]), link))
+                if linked == path and not BARE_DOMAIN.fullmatch(name.lower()):
+                    names[name.strip()] += 1
+    return names.most_common(1)[0][0] if names else ""
 
 
 def mail_facts(root: Path) -> dict:
@@ -92,11 +128,16 @@ def contact_candidates(root: Path) -> tuple[list[dict], dict]:
                    "mailbox_errors": len(errors), "automated": len(mapped.get("automated_correspondents", []))}
 
 
-def snapshot(root: Path) -> dict:
-    """Everything the page shows, read once; no model, no writes into the notebook."""
+def snapshot(root: Path, local: bool = False) -> dict:
+    """Everything the page shows, read once; no model, no writes into the notebook.
+
+    `local`: this machine's own reader (the file snapshot, the loopback live
+    reader). Labelled excerpts are added only then; the O Chat view never has them.
+    """
     from .map import needs_review
     from .project_pages import private
     from .reviews import listing
+    from .sessions import mentions, reader_fields
     notebook = Notebook(root)
     records = []
     for record in notebook.list():
@@ -113,6 +154,11 @@ def snapshot(root: Path) -> dict:
     found = pages(root)
     mail, index = mail_facts(root), index_rows(root)
     for record in records:
+        if record["category"] == "orgs" and BARE_DOMAIN.fullmatch(record["title"]):
+            domain = record["title"]
+            name = _org_name(domain, record["text"]) or _org_company_name(record["path"], records)
+            if name:
+                record.update(title=name, domain=domain)
         if record["path"] in mail:
             record["mail"] = mail[record["path"]]
         if record["path"] in index:
@@ -125,6 +171,14 @@ def snapshot(root: Path) -> dict:
             record["private_project"] = private(record["path"], record["text"])
             from .project_material import page_state
             record["project_coverage"] = page_state(root, record["path"]).get("last_page_coverage")
+        if record["category"] == "sessions":
+            record.update(reader_fields(record["text"]))
+    owner = owner_record(root)
+    people = [record for record in records if record["category"] == "people" and record["path"] != owner]
+    mentioned = mentions(people, [record for record in records if record["category"] == "sessions"])
+    for record in people:
+        if record["path"] in mentioned:
+            record["session_mentions"] = mentioned[record["path"]]
     groups = {}
     for record in records:
         if record["path"].startswith("skills/catalog/") and record["path"] != "skills/catalog/index.md":
@@ -141,7 +195,7 @@ def snapshot(root: Path) -> dict:
     links = relationships(records)
     for record in records:
         record["relations"] = links.get(record["path"], [])
-    contexts = cited_context(root, records)
+    contexts = cited_context(root, records, private=local)
     from .project_material import stored
     for record in records:
         if record["category"] != "projects":
@@ -150,14 +204,27 @@ def snapshot(root: Path) -> dict:
             context = contexts.get(message["source"])
             if context:
                 context.setdefault("mapped_session_folder", message["cwd"])
+    from .config import read_config
+    from .translate import cached_languages
+    from .languages import language_of, owner_languages, spoken
+    for record in records:
+        record["translations"] = cached_languages(root, record["path"])
+        # For the "Read in" menu: what the page is written in, and what this person speaks.
+        record["written_in"] = language_of(record["text"])
+        if record["category"] == "people":
+            record["speaks"] = spoken(record["text"])
     candidates, contact_coverage = contact_candidates(root)
-    return {"as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "root": str(root), "categories": list(CATEGORIES), "records": records,
+    return {"language": read_config(root, validated=False).get("language") or "en",
+            "your_languages": owner_languages(root)["languages"], "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "root": str(root), "default_root": root.resolve() == (Path.home() / ".co" / "rem").resolve(),
+            "categories": list(CATEGORIES), "records": records,
             "contact_candidates": candidates, "contact_coverage": contact_coverage,
-            "source_context": contexts, "conversations": cited_conversations(root, contexts),
+            "source_context": contexts, "conversations": cited_conversations(root, contexts, private=local),
+            "shared": not local,
             "status": status(root), "subscriptions": subscriptions(root),
-            "logs": run_logs(root)[:20], "reviews": listing(root), "counts": counts(root, found),
-            "owner": owner_record(root)}
+            "logs": [{**log, "outcome": seen_outcome(log)} for log in run_logs(root)[:20]],
+            "reviews": listing(root), "counts": counts(root, found),
+            "owner": owner}
 
 
 def owner_record(root: Path) -> str:
@@ -167,8 +234,10 @@ def owner_record(root: Path) -> str:
     return owner.get("record", "") if isinstance(owner, dict) else ""
 
 
-def render(root: Path) -> str:
-    data = json.dumps(snapshot(root), ensure_ascii=False, default=str)
+def render(root: Path, *, live: bool = False, local: bool = False) -> str:
+    """`live`: served by the Host (rem_http.py), so the page may ask it to translate.
+    `local`: read on this machine by its owner (see `snapshot`)."""
+    data = json.dumps({**snapshot(root, local), "live": live}, ensure_ascii=False, default=str)
     # Inside a script block only "</script" and the U+2028/9 terminators can break
     # out. Escaping "<" as \u003c keeps the JSON valid and makes note text inert.
     data = data.replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
@@ -185,7 +254,7 @@ def reader_path(root: Path) -> Path:
 
 
 def write_reader(root: Path) -> Path:
-    page = render(root)
+    page = render(root, local=True)
     path = reader_path(root)
     # The public name is predictable. Write a private random file, then replace
     # the directory entry atomically so a planted link can never be truncated.
@@ -222,12 +291,11 @@ LIVE_REM_URL = "https://chat.openonion.ai/{address}/rem"
 # The /rem route is paired with O Chat; old /wiki links redirect there.
 LIVE_REM_SERVED = True
 
-# Is the live view what a bare `co rem open` opens? No, by the owner's decision
-# (2026-09-27, #1828): opening locally is the default and works offline; the
-# live view through the Host is a feature asked for with --live.
-LIVE_IS_DEFAULT = False
-
-LIVE_HINT = "co rem open --live   (the live view in O Chat; needs your co ai Host online)"
+# A bare `co rem open` opens the live reader on this computer, served by the
+# co ai Host and able to translate (owner, 2026-10-15; before, #1828 made the
+# snapshot the default). The snapshot is the fallback, or asked for with --local;
+# the O Chat view, for another device, with --live.
+LIVE_HINT = "co rem open --live   (the live view in O Chat; starts co ai automatically)"
 
 
 def host_online(address: str, timeout: float = 3.0) -> bool:
@@ -265,6 +333,26 @@ def open_snapshot(root: Path, *, launch: bool, **notes) -> dict:
             "note": "a snapshot of the notebook as it is now; co rem open again shows later changes", **notes}
 
 
+def local_or_snapshot(root: Path, address, *, launch: bool) -> dict:
+    """What a bare `co rem open` shows: the reader served by this computer's co ai
+    Host (started when none runs), or the snapshot, saying why."""
+    if not address:
+        return open_snapshot(root, launch=launch, live=(
+            "only the default notebook (~/.co/rem) with a co ai identity has a live reader"))
+    from .live_host import ensure_local
+    try:
+        url, failure = ensure_local(address)
+    except (OSError, RemError) as error:
+        url, failure = None, f"could not start co ai: {error}; run `co ai` to diagnose"
+    if failure:
+        # The page the owner asked for still opens: a fallback, not a failure.
+        return open_snapshot(root, launch=launch, live=f"Live reader unavailable: {failure}; showing a snapshot")
+    if launch:
+        webbrowser.open(url)
+    return {"page": url.split("?")[0], "link": url, "launched": launch,
+            "note": "the live reader, served by co ai on this computer; it can translate a page"}
+
+
 def live_or_snapshot(root: Path, address, *, live: bool, launch: bool) -> dict:
     """What `co rem open` shows: the live view only when it is wanted, belongs to
     this notebook, and its Host answers; otherwise the snapshot, saying why."""
@@ -274,9 +362,14 @@ def live_or_snapshot(root: Path, address, *, live: bool, launch: bool) -> dict:
         return open_snapshot(root, launch=launch, live=(
             "only the default notebook (~/.co/rem) with a co ai identity has a live view"))
     if not host_online(address):
-        return open_snapshot(root, launch=launch, live=(
-            f"your Host {address[:10]}... is not online, so the live view would not load. "
-            "Start it with `co ai`, then run `co rem open --live` again"))
+        from .live_host import ensure_online
+        try:
+            failure = ensure_online(address)
+        except (OSError, RemError) as error:
+            failure = f"could not start co ai: {error}; run `co ai` to diagnose"
+        if failure:
+            return open_snapshot(root, launch=launch, live=f"Live startup failed: {failure}; showing a snapshot",
+                                 live_startup_failed=True)
     url = LIVE_REM_URL.format(address=address)
     if launch:
         webbrowser.open(url)

@@ -120,7 +120,7 @@ def env_file_callback(ctx: typer.Context, value: Optional[Path]):
 START_HERE = (
     ("Start here:", (
         "co init                  Set up your identity and keys (~/.co/keys.env)",
-        "co create my-agent       New project; then: cd my-agent && python agent.py",
+        "co create my-agent       New project; then: cd my-agent && co host",
         "co auth                  Log in to OpenOnion for managed models and credits",
         "co commands              Every command and subcommand; add --help to any",
     )),
@@ -262,6 +262,25 @@ def create(
         raise typer.Exit(1)
 
 
+@app.command(epilog="Example:  co host  |  co host --port 8001")
+def host(
+    port: Optional[int] = typer.Option(None, "--port", "-p", help="Port, instead of the one in .co/host.yaml"),
+):
+    """Serve the agent in this directory: runs ./agent.py with co's own Python, so it works however co was installed.
+
+    One host serves everything: the agent over HTTP, WebSocket and the relay, REM for you, and the
+    channels in .co/host.yaml's listen:. Runs until stopped.
+    """
+    import os
+    import subprocess
+    if not Path("agent.py").exists():
+        console.print("[red]No agent.py in this directory.[/red] Make one: co create my-agent, then cd my-agent")
+        raise typer.Exit(2)
+    # install.sh puts co in a uv tool environment the system python cannot import from (#2438).
+    env = {**os.environ, **({"AGENT_PORT": str(port)} if port else {})}
+    raise typer.Exit(subprocess.call([sys.executable, "agent.py"], env=env))
+
+
 @app.command(epilog="Example:  co deploy  |  co deploy --to prod")
 def deploy(
     template: Optional[str] = typer.Option(None, "-t", "--template", help="Create and deploy a template project"),
@@ -386,6 +405,18 @@ def status(
     """Show your credit balance, account, credential sources and deployments. Read-only."""
     from .commands.status_commands import handle_status
     handle_status(reveal=reveal)
+
+
+@app.command(epilog="Example:  co approvals  |  co approvals --who 0x3f5a...c9e1  |  co approvals --class money")
+def approvals(
+    who: str = typer.Option(None, "--who", help="Only this identity: 0x…, an email, provider:sender, or key:/email:/chat: form"),
+    klass: str = typer.Option(None, "--class", help="Only this class: credentials, authority, money, irreversible, as_owner"),
+    last: int = typer.Option(50, "--last", "-n", help="How many of the newest entries to show"),
+    json_output: bool = typer.Option(False, "--json", help="Print the entries as JSON"),
+):
+    """Show the record of what this agent did or declined, for whom: tool calls, EXEC, Remote Browser and trust changes. Read-only."""
+    from .commands.approvals_commands import handle_approvals
+    handle_approvals(who=who, klass=klass, last=last, json_output=json_output)
 
 
 @app.command(epilog="Example:  co reset")
@@ -707,6 +738,7 @@ def ai(
         None, "--listen", metavar="feishu[,lark]",
         help="Answer these channels instead of the ones in .co/host.yaml",
     ),
+    launch: bool = typer.Option(True, "--launch/--no-launch", help="Open the web chat when the Host starts"),
     no_listen: bool = typer.Option(
         False, "--no-listen", help="Do not answer any channel this run"
     ),
@@ -727,6 +759,10 @@ def ai(
         help="Claude Code headless permissions. The default is manual; select a broader mode explicitly.",
     ),
     timeout: int = typer.Option(600, "--timeout", min=1, help="Delegated harness task timeout, in seconds"),
+    speed: Optional[str] = typer.Option(
+        None, "--speed", metavar="fast|standard",
+        help="Codex only: fast selects the Fast tier; standard leaves your configured tier unchanged.",
+    ),
 ):
     """Start AI coding agent or run one-shot prompt. Runs an agent whose tools can edit files and run commands here, with approval."""
     from .commands.ai_commands import handle_ai
@@ -747,10 +783,12 @@ def ai(
         invite_code=invite_code,
         invite_code_file=invite_code_file,
         listen=channels,
+        launch=launch,
         harness=harness,
         sandbox=sandbox,
         permission_mode=permission_mode,
         timeout=timeout,
+        speed=speed,
     )
 
 
@@ -1374,11 +1412,13 @@ def trust_callback(ctx: typer.Context):
         handle_trust_list()
 
 
-@trust_app.command("list", epilog="Example:  co trust list")
-def trust_list():
+@trust_app.command("list", epilog="Example:  co trust list --global")
+def trust_list(global_: bool = typer.Option(False, "--global", "-g",
+                                            help="The global identity in ~/.co, which co ai and co handoff use")):
     """List every address on each trust list. Read-only."""
     from .commands.trust_commands import handle_trust_list
-    handle_trust_list()
+    from ..environment import global_config_dir
+    handle_trust_list(global_config_dir() if global_ else None)
 
 
 @trust_app.command("level", epilog=f"Example:  co trust level {EXAMPLE_ADDRESS}")
@@ -1524,7 +1564,7 @@ app.add_typer(email_app, name="email")
 from .commands.handoff_commands import make_handoff_app
 
 app.add_typer(make_handoff_app(_typer_app), name="handoff",
-              short_help="Experimental: hand a task from your Codex/Claude Code session to another person's agent.")
+              short_help="Experimental: hand the context of your Codex/Claude Code session to another person's agent.")
 
 
 @email_app.callback(invoke_without_command=True)
@@ -2487,7 +2527,7 @@ from .commands.import_feedback import ImportFeedbackCommand, ImportFeedbackGroup
 jira_app = _typer_app(
     cls=ImportFeedbackGroup,
     help="Verify Jira access, list projects, and read selected issues. JIRA_URL and JIRA_EMAIL can be set with 'co env set'. JIRA_API_TOKEN must be supplied only as a temporary, non-persistent shell environment variable; use the no-echo setup procedure documented in the Jira Skill, then unset it after the command.",
-    epilog="Examples: co jira verify; co jira projects --json; co jira issues ALPHA ALPHA-1 --json",
+    epilog="Example:  co jira verify",
 )
 app.add_typer(jira_app, name="jira")
 

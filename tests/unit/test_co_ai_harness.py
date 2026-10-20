@@ -161,6 +161,40 @@ def test_cli_passes_timeout_to_shared_delegate(monkeypatch, capsys):
     assert seen[0]["timeout"] == 37
 
 
+@pytest.mark.parametrize("speed", ["fast", "standard"])
+def test_cli_speed_reaches_codex_tool(monkeypatch, speed):
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return json.dumps({"last_message": "done", "exit_code": 0})
+
+    monkeypatch.setattr(codex_module, "codex", fake)
+    result = CliRunner().invoke(app, ["ai", "--harness", "codex", "--speed", speed, "--json", "do it"])
+    assert result.exit_code == 0, result.output
+    assert seen["speed"] == speed
+
+
+@pytest.mark.parametrize("harness", ["ours", "claude-code"])
+@pytest.mark.parametrize("speed", ["fast", "standard"])
+def test_cli_rejects_explicit_speed_for_other_harnesses(harness, speed):
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+
+    result = CliRunner().invoke(app, ["ai", "--harness", harness, "--speed", speed, "--json", "do it"])
+    assert result.exit_code == 2
+    assert "--speed applies only to --harness codex" in json.loads(result.stdout)["error"]
+
+
+def test_cli_rejects_unknown_speed(capsys):
+    with pytest.raises(typer.Exit):
+        ai_commands.handle_ai(prompt="do it", harness="codex", speed="turbo", json_output=True)
+    assert "Use fast or standard" in json.loads(capsys.readouterr().out)["error"]
+
+
 def test_claude_permission_reaches_native_delegate(monkeypatch):
     import importlib
     module = importlib.import_module("connectonion.useful_tools.claude_code")
@@ -286,3 +320,31 @@ def test_an_unknown_sandbox_lists_the_real_ones():
     problem = harness_mod.validate_sandbox("codex", "wide-open")
     for level in harness_mod.SANDBOXES:
         assert level in problem
+
+
+@pytest.mark.parametrize("harness", ["codex", "claude-code"])
+def test_resume_session_reaches_native_delegate(monkeypatch, harness):
+    import importlib
+
+    module = importlib.import_module("connectonion.useful_tools." + harness.replace("-", "_"))
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return json.dumps({"last_message": "done", "result": "done", "exit_code": 0})
+
+    monkeypatch.setattr(module, "codex" if harness == "codex" else "_run_claude_code", fake)
+    harness_mod.run(harness, "next turn", "", session_id="abc")
+    assert seen["session_id"] == "abc"
+
+
+def test_cli_resume_reaches_shared_delegate(monkeypatch):
+    from typer.testing import CliRunner
+    from connectonion.cli.main import app
+
+    seen = []
+    monkeypatch.setattr(harness_mod, "run", lambda *a, **kw: seen.append(kw) or {
+        "result": "done", "outcome": "natural", "error": None, "usage": None})
+    result = CliRunner().invoke(app, ["ai", "--json", "--harness", "codex", "--resume", "abc", "prompt"])
+    assert result.exit_code == 0, result.output
+    assert seen[0]["session_id"] == "abc"

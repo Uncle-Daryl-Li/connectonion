@@ -3,8 +3,8 @@
 The material is `project_material`'s: per page, what the user typed to Codex
 and Claude Code in its folders. A page is written once from all of it, and
 afterwards updated from only what is new -- the daily round's unit of work.
-One model call per page, through the configured runner, reviewed exactly like
-an investigated page before it replaces the old one.
+Through the configured runner, reviewed exactly like an investigated page
+before it replaces the old one, with one optional quote edit after acceptance.
 """
 
 from __future__ import annotations
@@ -75,6 +75,8 @@ def queue(root: Path, *, recent_days: int = RECENT_DAYS, now: datetime | None = 
         last = page_state(root, record).get("last_activity") or messages[-1]["timestamp"]
         if since and mode == "first" and not timestamp(last) > timestamp(since):
             continue
+        if since and mode == "update" and not _update_due(page_state(root, record), len(messages), now):
+            continue
         # What the call will carry: the messages as the model reads them, and the page.
         from .runner import readable_material
         chars = len(readable_material(_message_items(sent))) + len(Notebook(root).read(record))
@@ -84,6 +86,19 @@ def queue(root: Path, *, recent_days: int = RECENT_DAYS, now: datetime | None = 
     # private journal came before LayeredVisions (28 sessions) (#2079).
     return sorted(rows, key=lambda r: (-r["new_messages"], not r["recent"], _negated(r["last_activity"]),
                                        r["record"]))
+
+
+# A page written in the last UPDATE_HOURS waits for the next day unless this
+# many messages are pending: projects/connectonion was rewritten at 06:05,
+# 07:10 and 08:05 on 2026-10-13, for 1-3 messages each time, a full turn each.
+UPDATE_HOURS = 20
+UPDATE_MESSAGES = 10
+
+
+def _update_due(state: dict, pending_messages: int, now: datetime) -> bool:
+    written = state.get("written_at") or ""
+    return (pending_messages >= UPDATE_MESSAGES or not written
+            or timestamp(written) <= now - timedelta(hours=UPDATE_HOURS))
 
 
 # A folder that holds the owner's own life rather than their work. Its
@@ -179,8 +194,11 @@ def repository_snapshots(items: list[dict]) -> list[dict]:
 
 
 def retain_repository_context(root: Path, items: list[dict], cited: set[str]) -> int:
-    """Keep cited packet bodies under the caller's maintenance lock, after acceptance."""
-    from .reader_model import PRIVATE
+    """Keep cited packet bodies under the caller's maintenance lock, after acceptance.
+
+    A labelled ([personal]/[sensitive]) body is kept too: it stays in .state,
+    and `repository_context` shows it only to the owner's own local reader.
+    """
     count = 0
     for item in items:
         source, origin, text = item.get("source", ""), item.get("origin", ""), item.get("text", "")
@@ -190,7 +208,7 @@ def retain_repository_context(root: Path, items: list[dict], cited: set[str]) ->
                 or item.get("role") not in ("readme", "project-file", "checkout-state", "recent-commits")
                 or not isinstance(origin, str) or not origin.startswith(("git:", "file:"))
                 or not isinstance(text, str) or not 0 < len(text) <= limit
-                or SECRET_SHAPES.search(text) or PRIVATE.search(text)
+                or SECRET_SHAPES.search(text)
                 or source != "project-source:" + hashlib.sha256((origin + "\0" + text).encode()).hexdigest()):
             continue
         path = state_path(root, "project-sources/" + source.split(":")[1] + ".json")
@@ -207,8 +225,11 @@ def retain_repository_context(root: Path, items: list[dict], cited: set[str]) ->
     return count
 
 
-def repository_context(root: Path, source: str) -> dict | None:
-    """Use the retained packet only; never reread a mutable Git ref or working file."""
+def repository_context(root: Path, source: str, private: bool = False) -> dict | None:
+    """Use the retained packet only; never reread a mutable Git ref or working file.
+
+    `private`: the reader is the owner's own, on this machine, so a labelled body may show.
+    """
     from .reader_model import PRIVATE
     if source.startswith("file:"):
         saved = read_json(state_path(root, "project-sources/live-" + hashlib.sha256(source.encode()).hexdigest() + ".json"), {})
@@ -239,7 +260,7 @@ def repository_context(root: Path, source: str) -> dict | None:
     text, origin = saved.get("text"), saved.get("origin", "")
     limit = FILE_SNAPSHOT_CHARS + len("\n[truncated]") if _file_snapshot(saved.get("snapshot_kind"), origin) else REPOSITORY_EVIDENCE_CHARS
     if (saved.get("id") != source or not isinstance(text, str) or not isinstance(origin, str)
-            or not 0 < len(text) <= limit or SECRET_SHAPES.search(text) or PRIVATE.search(text)
+            or not 0 < len(text) <= limit or SECRET_SHAPES.search(text) or (PRIVATE.search(text) and not private)
             or source != "project-source:" + hashlib.sha256((origin + "\0" + text).encode()).hexdigest()):
         return None
     return {"excerpt": text.strip()[:REPOSITORY_EXCERPT_CHARS],
@@ -264,7 +285,9 @@ def live_file_snapshot(page: str, source: str) -> dict | None:
     raw = path.read_bytes()
     if len(raw) > FILE_SNAPSHOT_CHARS or hashlib.sha256(raw).hexdigest() != match[2] or b"\0" in raw:
         return None
-    text = raw.decode("utf-8")
+    # A Windows-encoded file in a real repository ("\x93", a curly quote) crashed
+    # the short-term-rental-agent page twice (2026-10-15); the hash pins the bytes.
+    text = raw.decode("utf-8", errors="replace")
     if SECRET_SHAPES.search(text) or PRIVATE.search(text):
         return None
     return {"id": source, "text": text, "captured_at": datetime.now(timezone.utc).isoformat(),
@@ -287,7 +310,7 @@ def live_git_snapshot(page: str, source: str) -> dict | None:
                              capture_output=True)
     if content.returncode or len(content.stdout) > FILE_SNAPSHOT_CHARS or b"\0" in content.stdout:
         return None
-    text = content.stdout.decode("utf-8")
+    text = content.stdout.decode("utf-8", errors="replace")
     if SECRET_SHAPES.search(text) or PRIVATE.search(text):
         return None
     date = subprocess.run(["git", "-C", str(repo), "show", "-s", "--format=%cI", match[2]],
@@ -347,38 +370,11 @@ def _readme(page: str, stamp: str) -> list[dict]:
 
 def _repository_evidence(page: str, stamp: str, newest_session: str, *, requests: str = "") -> list[dict]:
     """A small local packet that can verify more than the owner's requests."""
-    from .investigate import (CURRENT_REFS, _git, checkout_state, collapse_worktree_paths,
-                              project_file_inventory, project_file_texts, project_paths)
-    for folder in project_paths(collapse_worktree_paths(page))[:2]:
-        if not (Path(folder) / ".git").exists():
-            continue
-        ref = next((name for name in CURRENT_REFS if _git(folder, "rev-parse", "--verify", "--quiet",
-                                                         name + "^{commit}")), "HEAD")
-        revision = _git(folder, "rev-parse", ref + "^{commit}")
-        items = []
-        for name in ("README.md", "README.rst", "README.txt", "README"):
-            content = _git(folder, "show", f"{revision}:{name}")
-            if content:
-                items.append({"role": "readme", "source": f"git:{folder}:{revision}:{name}",
-                              "timestamp": stamp, "text": _excerpt(content, README_CHARS)})
-                break
-        for name in ("pyproject.toml", "package.json", "Cargo.toml", "Package.swift"):
-            content = _git(folder, "show", f"{revision}:{name}")
-            if content:
-                items.append({"role": "project-file", "source": f"git:{folder}:{revision}:{name}",
-                              "timestamp": stamp, "text": _excerpt(content, 1_500)})
-            if len(items) >= 3:
-                break
-        state = checkout_state(folder, newest_session)
-        if state:
-            state += "\nWorking tree status (not the fixed revision):\n" + (_git(folder, "status", "--short") or "clean")
-            items.append({"role": "checkout-state", "source": f"git:{folder}:checkout-state",
-                          "timestamp": stamp, "text": _excerpt(state, 1_000)})
-        commits = _git(folder, "log", "-5", "--date=short", "--format=%h %ad %s", revision)
-        if commits:
-            items.append({"role": "recent-commits", "source": f"git:{folder}:{revision}:recent-commits",
-                          "timestamp": stamp, "text": "Local commits, not proof of tests or deployment:\n"
-                          + _excerpt(commits, 1_500)})
+    from .investigate import project_file_inventory, project_file_texts
+    found = current_line(page)
+    if found:
+        folder, ref, revision = found
+        items = current_line_packet(folder, ref, revision, stamp, newest_session)
         if re.search(r"\b(?:CI|CICD|SEO)\b|CI/CD|workflow|GitHub Actions", requests, re.I):
             budget = REPOSITORY_EVIDENCE_CHARS - sum(len(item["text"]) for item in items)
             items += _workflow_evidence(folder, revision, stamp, requests, budget)
@@ -393,6 +389,108 @@ def _repository_evidence(page: str, stamp: str, newest_session: str, *, requests
                       if path not in files and not Path(path).name.lower().startswith("readme")]
     items += project_file_texts(implementation, max_files=IMPLEMENTATION_FILES, chars_per_file=FILE_SNAPSHOT_CHARS)
     return items
+
+
+def current_line(page: str) -> tuple[str, str, str] | None:
+    """(repository, ref, full revision) of the first mapped Git checkout's current line, or None."""
+    from .investigate import CURRENT_REFS, _git, collapse_worktree_paths, project_paths
+    for folder in project_paths(collapse_worktree_paths(page))[:2]:
+        if not (Path(folder) / ".git").exists():
+            continue
+        ref = next((name for name in CURRENT_REFS if _git(folder, "rev-parse", "--verify", "--quiet",
+                                                         name + "^{commit}")), "HEAD")
+        return folder, ref, _git(folder, "rev-parse", ref + "^{commit}")
+    return None
+
+
+def current_line_packet(folder: str, ref: str, revision: str, stamp: str, newest_session: str) -> list[dict]:
+    """README, manifests, checkout state and history at the project's current line, not its working tree.
+
+    oo-api's main checkout sat on an August branch while origin/main gained 48
+    commits; read from the working tree, its page described August (2026-10-15).
+    """
+    from .investigate import _git, checkout_state
+    # Dated by the revision, not by when it was read: a README cited "2026-10-15"
+    # said nothing about when the project was described that way.
+    committed = _git(folder, "show", "-s", "--format=%cI", revision) or stamp
+    items = []
+    for name in ("README.md", "README.rst", "README.txt", "README"):
+        content = _git(folder, "show", f"{revision}:{name}")
+        if content:
+            items.append({"role": "readme", "source": f"git:{folder}:{revision}:{name}",
+                          "timestamp": committed, "text": _excerpt(content, README_CHARS)})
+            break
+    for name in ("pyproject.toml", "package.json", "Cargo.toml", "Package.swift"):
+        content = _git(folder, "show", f"{revision}:{name}")
+        if content:
+            items.append({"role": "project-file", "source": f"git:{folder}:{revision}:{name}",
+                          "timestamp": committed, "text": _excerpt(content, 1_500)})
+        if len(items) >= 3:
+            break
+    state = checkout_state(folder, newest_session)
+    remote = re.sub(r"//[^/@]+@", "//", _git(folder, "remote", "get-url", "origin"))
+    if state and remote:
+        state += f" Remote origin: {remote}."
+    if state:
+        state += "\nWorking tree status (not the fixed revision):\n" + (_git(folder, "status", "--short") or "clean")
+        items.append({"role": "checkout-state", "source": f"git:{folder}:checkout-state",
+                      "timestamp": stamp, "text": _excerpt(state, 1_000)})
+    history = _history(folder, ref, revision)
+    if history:
+        items.append({"role": "recent-commits", "source": f"git:{folder}:{revision}:recent-commits",
+                      "timestamp": committed, "text": history})
+    return items
+
+
+# The current line's commits a page is checked against: what was finished, and when.
+HISTORY_COMMITS = 80
+HISTORY_CHARS = 4_000
+# A branch beside the current line committed this recently is work in flight:
+# oo-api's unmerged email-worker fix was six weeks old (2026-10-15).
+BRANCH_DAYS = 60
+
+
+def _history(folder: str, ref: str, revision: str) -> str:
+    """The current line's commits, newest first, then branches still open beside it."""
+    from .investigate import _git
+    commits = _git(folder, "log", f"-{HISTORY_COMMITS}", "--date=short", "--format=%h %ad %s", revision)
+    if not commits:
+        return ""
+    roots = _git(folder, "rev-list", "--max-parents=0", revision).split()
+    first = _git(folder, "show", "-s", "--date=short", "--format=%h %ad %s", roots[-1]) if roots else ""
+    text = (f"Commits on {ref} ({revision[:12]}), newest first. A commit shows what was committed, "
+            "not that tests passed or it was deployed:\n" + _excerpt(commits, HISTORY_CHARS)
+            + (f"\n\nFirst commit: {_excerpt(first, 200)}" if first else ""))
+    branches = _open_branches(folder, revision)
+    if branches:
+        text += (f"\n\nBranches with commits not on {ref}, committed in the last {BRANCH_DAYS} days "
+                 "(work in flight, abandoned, or merged under another message; check before calling it open):\n" + "\n".join(branches))
+    return text
+
+
+def _open_branches(folder: str, revision: str) -> list[str]:
+    """Branches whose tip is not on the current line, newest first; a squash-merged tip is on it."""
+    from .investigate import _git
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=BRANCH_DAYS)).date().isoformat()
+    landed = {_subject(line) for line in _git(folder, "log", "-400", "--format=%s", revision).splitlines()}
+    rows = _git(folder, "for-each-ref", "--sort=-committerdate", f"--no-merged={revision}",
+                "--format=%(committerdate:short) %(refname:short) %(objectname:short) %(subject)",
+                "refs/heads", "refs/remotes").splitlines()
+    seen, kept = set(), []
+    for row in rows:
+        parts = row.split(" ", 3)
+        if len(parts) < 4 or parts[0] < cutoff or parts[1].endswith("/HEAD") or _subject(parts[3]) in landed:
+            continue
+        short = parts[1].removeprefix("origin/")
+        if short not in seen:
+            seen.add(short)
+            kept.append(_excerpt(row, 160))
+    return kept[:12]
+
+
+def _subject(line: str) -> str:
+    """A commit subject without the `(#123)` a squash merge appends."""
+    return re.sub(r"\s*\(#\d+\)\s*$", "", line).strip().casefold()
 
 
 def _implementation_evidence(folder: str, revision: str, stamp: str, *, requests: str = "") -> list[dict]:
@@ -416,7 +514,7 @@ def _implementation_evidence(folder: str, revision: str, stamp: str, *, requests
         if size > FILE_SNAPSHOT_CHARS:
             continue
         content = subprocess.run(["git", "-C", folder, "show", f"{revision}:{name}"],
-                                 capture_output=True, text=True, check=True, timeout=10).stdout
+                                 capture_output=True, text=True, errors="replace", check=True, timeout=10).stdout
         if content:
             items.append(_implementation_item(folder, revision, name, content, stamp))
     listing = (f"Tracked tree at {revision}; {len(tree)} entries. Contents supplied for {len(items)} of "
@@ -540,10 +638,89 @@ def prompt(directory: Path, items: list[dict], candidate: Path, page_chars: int 
         "with one line: how many messages you read and the dates they span.")
 
 
+PROJECT_QUOTE_NOTE = ("Quote round: an edit, not a rewrite. The page has {quotes} quotes and {decisions} "
+                      "Key decisions without the owner's words. Put the owner's exact sentence that carries "
+                      "each decision, the purpose in Why it exists, and each open ask as “…” cited to the "
+                      "message it comes from, character for character in the original language, replacing "
+                      "the paraphrase; Where it stands and Open threads quote the owner's newest asks too. Aim for "
+                      "eight quotes or more where the messages hold the words. Read the messages from the oldest: "
+                      "a choice the owner made that Key decisions lacks (a price, provider, default, deploy method, "
+                      "what to drop) is added there, dated, with the sentence that makes it. Keep every section, "
+                      "fact and citation. Add no other claim. Then stop.")
+
+
+def _project_quote_counts(page: str) -> tuple[int, int]:
+    from .page_review import QUOTE, prose, unquoted_decisions
+    return len(QUOTE.findall(prose(page).partition('\n## Sources\n')[0])), len(unquoted_decisions(page))
+
+
+def project_falls_short(page: str, messages: int) -> tuple[int, int] | None:
+    """Quote and unquoted-decision counts when this write has enough owner material for an edit."""
+    quotes, decisions = _project_quote_counts(page)
+    if messages > 10 and (quotes < 8 or decisions):
+        return quotes, decisions
+    return None
+
+
+def _project_quote_turn(notebook, record, page, items, counts, config, run, workdir, turn, progress):
+    """Edit the saved page with at most one repair, then remove the task's private material."""
+    from .investigate import _keep_unless_lost
+    from .page_review import quotes, restore_dropped
+    from .runner import language_note, promote_with_repairs, scrub_task, today_note
+    directory = Path(tempfile.mkdtemp(prefix="projects-quotes-", dir=workdir))
+    try:
+        candidate = directory / "candidate.md"
+        candidate.write_text(page, encoding="utf-8")
+        quote_items = [{**items[0], "text": f"The page as it stands, at {record}:\n\n{page}"},
+                       {"role": "round", "source": "investigation:round",
+                        "text": PROJECT_QUOTE_NOTE.format(quotes=counts[0], decisions=counts[1])},
+                       # The whole first-write material: given only the messages, the claim
+                       # audit refuted sections that cite the repository (2026-10-20, 4 of 6).
+                       *items[1:]]
+        text = prompt(directory, quote_items, candidate, len(page)) + today_note(notebook.root) + language_note(notebook.root)
+        if progress:
+            progress("quote round")
+        turn.update(run(workdir, text, config, "investigate"))
+        promote_with_repairs(notebook, record, candidate, page, quote_items, directory, turn,
+                             workdir=workdir, config=config, stage="investigate", run=run, repairs=1)
+        # A quote the edit dropped is put back beside its rewrite, as upkeep does;
+        # discarding the whole edit threw away four of six (2026-10-20).
+        edited = restore_dropped(page, notebook.read(record))
+        notebook.write(record, edited)
+        reason = _keep_unless_lost(notebook, record, page)
+        # A quote edit must keep even the small losses the general maintenance guard tolerates.
+        lost = bool(reason or quotes(page) - quotes(notebook.read(record)))
+        if lost:
+            notebook.write(record, page)
+        write_json(directory / "result.json", {"stage": "projects-quotes", "record": record,
+                                                "status": "restored" if lost else "candidate_accepted",
+                                                "usage": turn.get("usage")})
+    finally:
+        scrub_task(directory)
+
+
+def _project_quote_round(notebook, record, items, config, run, workdir, result, progress):
+    """One optional edit; a failed or lossy edit leaves the accepted write intact."""
+    from .runner import RunFailed, _add_usage
+    page = notebook.read(record)
+    counts = project_falls_short(page, sum(item.get("role") == "user" for item in items))
+    if counts is None:
+        return None
+    turn, after = {}, counts
+    try:
+        _project_quote_turn(notebook, record, page, items, counts, config, run, workdir, turn, progress)
+        after = _project_quote_counts(notebook.read(record))
+    except (RemError, OSError) as error:
+        notebook.write(record, page)
+        turn["usage"] = error.usage if isinstance(error, RunFailed) else turn.get("usage")
+    result["usage"] = _add_usage(result.get("usage"), turn.get("usage"))
+    return {"quotes": [counts[0], after[0]], "unquoted_decisions": [counts[1], after[1]]}
+
+
 def write_page(root: Path, record: str, *, config: dict | None = None, run=None,
                now: datetime | None = None, progress=None) -> dict:
-    """One call: write the page from its pending messages; save it only if it passes review."""
-    from .runner import RunFailed, _one_more_turn, promote_or_drop, run_task
+    """Write pending messages, then optionally edit quotes; save only pages that pass review."""
+    from .runner import RunFailed, _one_more_turn, promote_with_repairs, run_task
     config = config or read_config(root)
     run = run or run_task
     notebook = Notebook(root)
@@ -553,28 +730,35 @@ def write_page(root: Path, record: str, *, config: dict | None = None, run=None,
     directory = Path(tempfile.mkdtemp(prefix="projects-", dir=workdir))
     candidate = directory / "candidate.md"
     original = notebook.read(record)
-    text = prompt(directory, items, candidate, len(original))
+    from .runner import language_note, today_note
+    text = prompt(directory, items, candidate, len(original)) + today_note(root) + language_note(root)
     if progress:
         progress("writing page")
     started, result = time.monotonic(), {}
     metrics = {"stage": "projects", "record": record, "harness": config["runner"], "model": config["model"],
+               "speed": config["speed"],
                "input_items": len(items), "prompt_chars": len(text)}
     try:
         result = run(workdir, text, config, "investigate")
         if not candidate.is_file():
             result = _one_more_turn(workdir, text, config, "investigate", candidate, result, run)
-        promote_or_drop(notebook, record, candidate, original, items, directory, result.get("usage"))
+        promote_with_repairs(notebook, record, candidate, original, items, directory, result,
+                             workdir=workdir, config=config, stage="investigate", run=run)
     except (RemError, OSError) as error:
         usage = error.usage if isinstance(error, RunFailed) else result.get("usage")
         write_json(directory / "result.json", {**metrics, "status": "failed", "error": str(error),
                                                 "usage": usage, "duration_seconds": time.monotonic() - started})
         if "rejected" in str(error):
+            from .refusals import material_sources, remember_refusal
             mark_refused(root, record, through, str(error), now=now)
+            remember_refusal(root, record, material_sources(items), str(error), stage="projects")
         raise RunFailed(str(error), usage) from error
     finally:
         # A refused page left its material.json/material.md behind (#2029).
         from .runner import scrub_task
         scrub_task(directory)
+    quote_round = _project_quote_round(notebook, record, items, config, run, workdir, result, progress)
+    metrics["quote_round"] = quote_round
     messages = sum(1 for item in items if item["role"] == "user")
     tools = sorted({i["tool"] for i in items if i.get("tool")})
     with maintenance_lock(root, wait=WRITE_WAIT_SECONDS):
@@ -583,13 +767,15 @@ def write_page(root: Path, record: str, *, config: dict | None = None, run=None,
         notebook.note_pass(record, "written", "own messages: " + ", ".join(tools))
         mark_written(root, record, through, now=now, inputs_read=messages,
                      inputs_available=len(pending(root, record)[0]))
+        from .refusals import forget_refusal
+        forget_refusal(root, record)
         from .store import refresh_safely
         refresh_safely(root)
     write_json(directory / "result.json", {**metrics, "status": "candidate_accepted", "usage": result.get("usage"),
                                             "duration_seconds": time.monotonic() - started})
     return {"record": record, "changed": [record], "items": messages, "through": through,
             "usage": result.get("usage"), "chars_gathered": sum(len(i["text"]) for i in items),
-            "report": str(result.get("result") or "")[:1000]}
+            "report": str(result.get("result") or "")[:1000], "quote_round": quote_round}
 
 
 def write_pages(root: Path, *, limit: int = 5, recent_days: int = RECENT_DAYS, write=None,

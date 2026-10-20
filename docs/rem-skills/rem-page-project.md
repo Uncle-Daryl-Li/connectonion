@@ -166,3 +166,33 @@ supported activity. Writers must exclude unrelated workspace topics from that
 date. Reader and CLI counts use the same census, without file modification time.
 The reader labels the mapping count `Mapped sessions` to distinguish it from
 the fuller archived input coverage used during investigation.
+
+## Why it exists and Key decisions quote the user (decision 076)
+
+A project's decisions were retold, and the retelling drifted: "the user said it
+was not right" where the session read "他说有一个 websocket 有一个没有搞对". So
+`Why it exists` opens with the user's own words that started the work, and each
+`Key decisions` line is a short label followed by the sentence that made the
+choice, in its original language; a reversal is its own line quoting the
+reversal. `Open threads` quotes the ask and gives its status, looked up first in
+later messages and the git history. The runner checks every quote against its
+cited session line, and the cited-claim audit reads the same originals.
+
+A project page with folders is written only by the project writer from the
+user's messages in those folders. The sync's one-page turn also reached it by
+name and shrank it each time the writer grew it: projects/connectonion went
+14,356 → 4,132 → 9,610 → 3,112 → 2,108 characters on 2026-10-13/14.
+
+## Facts the history earns; no hedges (2026-10-20)
+
+A real project page read `Status: Apache-2.0 license`, `Started: Unknown` and
+`People: Unknown` while the history packet held the first commit and every
+session was the owner's; its Insight was about the wording of an outreach
+message and ended "behavior remains unverified". So: `Status` is never a
+licence or `Unknown` while anything is dated; `Started` is the packet's `First
+commit` line; `People` starts with the user. A page says what is, dated, and
+never what the evidence lacks. `Key decisions` and `Open threads` quote the
+owner's one sentence that carries the choice. An update keeps `What it is`,
+`Why it exists`, `Key decisions`, `Insight` and every quote unless new messages
+change them: fifteen updates from three days of launch messages had turned the
+page into a page about one direct message.

@@ -439,14 +439,17 @@ def session_turns(path: Path, kind: str, limit: int = SHORT_SESSION_TURNS + 1) -
     """How many turns the user started in one session file, counted up to `limit`.
 
     Claude Code: messages the user typed (the same reading `sync` does). Codex:
-    `turn_context` records, one per turn -- a desktop Codex message carries
-    metadata the typed-message reader does not take as typed.
+    `turn_context` records, one per turn, except in program-written sessions.
     """
     from .source import KINDS
     since = datetime(1970, 1, 1, tzinfo=timezone.utc)
     turns = 0
     try:
         with path.open("rb") as handle:
+            if kind == "codex":
+                meta = KINDS[kind]["meta"](json.loads(handle.readline(1_000_000)))
+                if meta.get("skip") or meta.get("subagent"):
+                    return 0
             for line in handle:
                 if kind == "codex":
                     turns += b'"turn_context"' in line[:200]
@@ -474,7 +477,8 @@ def scan_projects(subscriptions: dict, days: int, rem_root: Path | None = None,
                                                 "files": []})
     for name, sub in subscriptions.items():
         kind = sub.get("kind")
-        if sub.get("enabled") is False or kind not in KINDS or not Path(sub.get("root", "")).is_dir():
+        if (sub.get("enabled") is False or not sub.get("consented")
+                or kind not in KINDS or not Path(sub.get("root", "")).is_dir()):
             continue
         files = source_files(sub)
         for number, path in enumerate(files, 1):
@@ -485,8 +489,18 @@ def scan_projects(subscriptions: dict, days: int, rem_root: Path | None = None,
                 continue
             try:
                 with path.open("rb") as handle:
-                    first = json.loads(handle.readline(1_000_000))
-                meta = KINDS[kind]["meta"](first) if isinstance(first, dict) else {}
+                    meta, remaining = {}, 1_000_000
+                    # Claude Code can put mode/queue records before the first cwd.
+                    # Bound discovery without guessing from lossy folder names.
+                    for _ in range(256 if kind == "claude-code" else 1):
+                        line = handle.readline(remaining)
+                        if not line:
+                            break
+                        remaining -= len(line)
+                        first = json.loads(line)
+                        meta = KINDS[kind]["meta"](first) if isinstance(first, dict) else {}
+                        if kind != "claude-code" or meta.get("cwd") or not remaining:
+                            break
             except (ValueError, UnicodeError, RemError):
                 continue
             cwd = (meta or {}).get("cwd") or ""

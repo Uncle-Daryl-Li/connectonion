@@ -134,7 +134,7 @@ def _file_messages(path, kind, parse, read_meta, since, rem_root, counts, owner)
                        "timestamp": timestamp(item["timestamp"]).isoformat(),
                        "cwd": cwd, "text": SECRET_SHAPES.sub(REDACTED, item["text"]),
                        **({"input_scope": item["input_scope"]} if item.get("input_scope") else {})}
-            if why == CONTAINER:
+            if why == CONTAINER or (why == "temporary execution directory" and owner.worktree(cwd)):
                 held.append((at, message))
             elif why:
                 counts["excluded"][why] = counts["excluded"].get(why, 0) + 1
@@ -237,13 +237,16 @@ def _paths(text: str, here: str) -> set[str]:
 
 
 class _Owners:
-    """A path's deepest project folder inside a workspace: a page's folder, or one with its own `.git`."""
+    """A path's project folder, following worktrees home or to a page named by their work."""
 
     def __init__(self, folders: dict, rem_root: Path | None):
-        self.folders, self.cache = folders, {}
+        self.folders, self.cache, self.worktrees = folders, {}, {}
         self.rem = str(rem_root.resolve()) if rem_root else ""
 
     def __call__(self, path: str, container: str) -> str | None:
+        worktree = self.worktree(path)
+        if worktree:
+            return worktree
         if not path.startswith(container.rstrip("/") + "/"):
             return None  # the workspace itself, or outside it: no evidence
         if path not in self.cache:
@@ -252,6 +255,45 @@ class _Owners:
             else:
                 self.cache[path] = self(os.path.dirname(path), container)
         return self.cache[path]
+
+    def worktree(self, path: str) -> str | None:
+        if path not in self.worktrees:
+            self.worktrees[path] = self._worktree(Path(path))
+        return self.worktrees[path]
+
+    def _worktree(self, path: Path) -> str | None:
+        for folder in (path, *path.parents):
+            git = folder / ".git"
+            if git.is_file():
+                match = re.fullmatch(r"gitdir:\s*(.+?)\s*", git.read_text(errors="replace"))
+                gitdir = Path(os.path.normpath(folder / match[1])) if match else git
+                if gitdir.parent.name != "worktrees" or gitdir.parent.parent.name != ".git":
+                    return None
+                repo = gitdir.parent.parent.parent
+                head = gitdir / "HEAD"
+                ref = head.read_text(errors="replace").strip() if head.is_file() else ""
+                branch = ref.removeprefix("ref: refs/heads/") if ref.startswith("ref: refs/heads/") else ""
+                named = self._named_owner([folder.name, branch], repo.name)
+                return named or (str(repo) if repo.is_dir() and self._usable(str(repo))
+                                 and (str(repo) in self.folders or (repo / ".git").exists()) else None)
+            if git.exists():
+                return None
+        temporary = re.match(r"^/(?:private/)?(?:tmp/|var/folders/)(.*)", str(path))
+        if temporary and not path.exists():
+            # 2026-10-20: pruned worktrees leave their task name in recorded paths.
+            return self._named_owner(Path(temporary[1]).parts)
+        return None
+
+    def _named_owner(self, names, repo_name="") -> str | None:
+        for folder in sorted(self.folders):
+            name = Path(folder).name
+            if len(name) < 4 or name.casefold() == repo_name.casefold():
+                continue
+            token = rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])"
+            if any(re.search(token, value, re.IGNORECASE) for value in names):
+                if Path(folder).is_dir() and self._usable(folder):
+                    return folder
+        return None
 
     def _usable(self, folder: str) -> bool:
         inside_rem = self.rem and (folder == self.rem or folder.startswith(self.rem + "/"))
@@ -297,7 +339,7 @@ def stored(root: Path, record: str) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def retain_cited_sessions(root: Path, items: list[dict], cited: set[str]) -> None:
+def retain_cited_sessions(root: Path, items: list[dict], cited: set[str], *, replace: bool = False) -> None:
     """Keep only cited inputs from an explicit investigation's live session scan."""
     for item in items:
         source, body = item.get("source"), item.get("text")
@@ -309,14 +351,14 @@ def retain_cited_sessions(root: Path, items: list[dict], cited: set[str]) -> Non
         text = SECRET_SHAPES.sub(REDACTED, body)
         path = state_path(root, "session-sources/" + hashlib.sha256(source.encode()).hexdigest() + ".json")
         previous = read_json(path, {})
-        if previous and (previous.get("source") != source or previous.get("text") != text):
+        if previous and not replace and (previous.get("source") != source or previous.get("text") != text):
             raise RemError("Retained session citation has conflicting content")
-        if not previous:
+        if not previous or replace:
             write_json(path, {"source": source, "text": text, "timestamp": item.get("timestamp") or "",
                               "input_scope": item.get("input_scope") or ""})
 
 
-def retained_session_context(root: Path, source: str) -> dict | None:
+def retained_session_context(root: Path, source: str, private: bool = False) -> dict | None:
     """A cited original unavailable in the mapped archive, from the accepted run."""
     from .reader_model import PRIVATE
     if not re.fullmatch(r"(?:codex|claude-code):[^\s:]+:\d+", source):
@@ -325,7 +367,7 @@ def retained_session_context(root: Path, source: str) -> dict | None:
     saved = read_json(path, {})
     body = saved.get("text")
     if (saved.get("source") != source or not isinstance(body, str)
-            or SECRET_SHAPES.search(body) or PRIVATE.search(body)):
+            or SECRET_SHAPES.search(body) or (PRIVATE.search(body) and not private)):
         return None
     excerpt = body.strip()[:4_096]
     return {"excerpt": excerpt, "truncated": len(body.strip()) > len(excerpt),
@@ -360,7 +402,9 @@ def extract(root: Path, subscriptions: dict, *, since: datetime | None = None, f
     A folder with messages and no page gets the map's page if its newest message
     is within `recent_days`; older ones stay listed as `unmapped`. Init passes
     `create_pages=False` after showing its map so unmatched folders remain
-    candidates instead of silently changing the project count. `lock_held`
+    candidates instead of silently changing the project count. The map itself
+    extracts the full window with page creation first: the owner's client repo
+    was missing because its sessions began in a workspace container. `lock_held`
     says the caller already holds the maintenance lock the new pages need.
     """
     now = now or datetime.now(timezone.utc)
@@ -372,9 +416,9 @@ def extract(root: Path, subscriptions: dict, *, since: datetime | None = None, f
         since = (timestamp(previous) - OVERLAP) if previous and not full else now - timedelta(days=days)
     folders = page_folders(notebook)
     messages, counts = session_messages(subscriptions, since=since, rem_root=root, folders=folders)
-    created = (_new_pages(root, _unmapped(messages, folders), now - timedelta(days=recent_days), lock_held)
-               if create_pages else [])
-    if created:
+    filed_rows, created = (_new_pages(root, _unmapped(messages, folders), now - timedelta(days=recent_days), lock_held)
+                           if create_pages else ([], []))
+    if create_pages:
         folders = page_folders(notebook)
     by_page = {}
     for message in messages:
@@ -393,7 +437,8 @@ def extract(root: Path, subscriptions: dict, *, since: datetime | None = None, f
         from .store import refresh_safely
         indexed = refresh_safely(root)
     return {"since": since.isoformat(), "files_read": counts["files"], "messages": len(messages),
-            "pages": pages, "created": created, "workspace": workspace, "unmapped": index["unmapped"],
+            "pages": pages, "created": created, "filed_rows": filed_rows,
+            "workspace": workspace, "unmapped": index["unmapped"],
             "excluded": counts["excluded"], "harness_blocks_skipped": counts["harness"],
             "unfamiliar_skipped": counts["unfamiliar"], "store": indexed}
 
@@ -414,16 +459,18 @@ def _unmapped(messages: list[dict], folders: dict) -> list[dict]:
             for row in sorted(rows.values(), key=lambda r: r["last"], reverse=True)]
 
 
-def _new_pages(root: Path, unmapped: list[dict], cutoff: datetime, lock_held: bool) -> list[str]:
-    """The map's page for each folder active since `cutoff` that has none; returns the records made.
+def _new_pages(root: Path, unmapped: list[dict], cutoff: datetime, lock_held: bool) -> tuple[list[dict], list[str]]:
+    """File folders active since `cutoff`; return their rows and the records newly made.
 
     Made by the map's own code (`map.project_groups`, `map.file_project`), so a
     page is the stub, the record name and the worktree-joins-its-repository
-    grouping `co rem init` would have given it.
+    grouping `co rem init` would have given it. Return the counts and paths too:
+    the map needs to list pages found only through attributed workspace messages
+    before it archives pages it thinks are no longer used.
     """
     recent = [row for row in unmapped if timestamp(row["last"]) >= cutoff]
     if not recent:
-        return []
+        return [], []
     from .map import file_project, project_groups
     from .scan import _repo_identity
     rows = []
@@ -432,14 +479,15 @@ def _new_pages(root: Path, unmapped: list[dict], cutoff: datetime, lock_held: bo
         rows.append({"path": row["path"], "sessions": row["sessions"], "turns": row["messages"],
                      "first": row["first"][:10],
                      "last": row["last"][:10], "repo": repo.get("toplevel", ""), "origin": repo.get("origin", "")})
-    created = []
+    filed, created = [], []
     with nullcontext() if lock_held else maintenance_lock(root, wait=WRITE_WAIT_SECONDS):
         notebook = Notebook(root)
         for identity, group in project_groups(rows).items():
             record, made = file_project(notebook, identity, group, refresh=False)
+            filed.append({**group, "record": record})
             if made:
                 created.append(record)
-    return created
+    return filed, created
 
 
 def _merge(root: Path, record: str, new: list[dict], *, full: bool, now: datetime) -> dict:

@@ -7,11 +7,12 @@ import pytest
 from typer.testing import CliRunner
 
 from connectonion.cli.main import app
-from connectonion.rem.config import prepare
+from connectonion.rem.config import prepare, set_config
 
 
-@pytest.mark.parametrize("category", ["orgs", "all"])
-def test_category_runs_every_pending_page_with_ten_workers(tmp_path, monkeypatch, category):
+@pytest.mark.parametrize("category", ["orgs", "all", "projects"])
+@pytest.mark.parametrize("workers", [None, 3])
+def test_category_runs_every_pending_page_with_configured_workers(tmp_path, monkeypatch, category, workers):
     root = tmp_path / "rem"
     prepare(root)
     rows = [{"path": f"orgs/o{n}.md", "recent": False, "last_investigated": None}
@@ -19,12 +20,15 @@ def test_category_runs_every_pending_page_with_ten_workers(tmp_path, monkeypatch
     monkeypatch.setattr("connectonion.rem.queue.order", lambda root, category: rows)
     monkeypatch.setattr("connectonion.rem.queue.order_all", lambda root: rows)
     monkeypatch.setattr("connectonion.rem.quota.read", lambda config: {"unknown": "no meter"})
-    started = threading.Barrier(10, timeout=5)
+    if workers is not None:
+        set_config(root, ["limits.workers", str(workers)])
+    count = workers or 16
+    started = threading.Barrier(count, timeout=5)
     seen = []
 
     def investigate(root, notebook, record, **kwargs):
         seen.append(record)
-        if len(seen) <= 10:
+        if len(seen) <= count:
             started.wait()
         return {"record": record}
 
@@ -36,6 +40,7 @@ def test_category_runs_every_pending_page_with_ten_workers(tmp_path, monkeypatch
     assert data["left"] == 0
     assert all(row["outcome"] == "accepted" for row in data["pages"])
     assert "[51/51]" in result.output
+    assert f"with up to {count} workers." in result.output
 
 
 def test_explicit_limit_and_worker_count_bound_a_trial(tmp_path, monkeypatch):
@@ -93,7 +98,7 @@ def test_category_reports_refusal_as_it_finishes_and_continues(tmp_path, monkeyp
     assert "Read accepted: " in summary and "show orgs/o1.md" in summary and "Pages:" not in summary
 
 
-def test_people_command_runs_the_whole_queue_concurrently(tmp_path, monkeypatch):
+def test_people_command_runs_the_whole_queue_with_configured_workers(tmp_path, monkeypatch):
     root = tmp_path / "rem"
     prepare(root)
     rows = [{"record": f"people/p{n}.md", "mode": "full", "days": 30,
@@ -105,12 +110,13 @@ def test_people_command_runs_the_whole_queue_concurrently(tmp_path, monkeypatch)
     monkeypatch.setattr("connectonion.rem.service.subscriptions", lambda root: {})
     monkeypatch.setattr("connectonion.cli.commands.rem_commands._logged",
                         lambda root, record, phase, call: call(lambda *args: None))
-    together = threading.Barrier(10, timeout=5)
+    set_config(root, ["limits.workers", "3"])
+    together = threading.Barrier(3, timeout=5)
     seen = []
 
     def investigate(root, row, **kwargs):
         seen.append(row["record"])
-        if len(seen) <= 10:
+        if len(seen) <= 3:
             together.wait()
         return {"record": row["record"]}
 
@@ -120,6 +126,34 @@ def test_people_command_runs_the_whole_queue_concurrently(tmp_path, monkeypatch)
     data = json.loads(result.stdout)["data"]
     assert len(seen) == len(data["pages"]) == 11 and data["left"] == 0
     assert "[11/11]" in result.output
+
+
+@pytest.mark.parametrize("category", ["people", "projects"])
+@pytest.mark.parametrize("options, expected", [([], 3), (["--limit", "2"], 1),
+                                              (["--budget", "5"], 1), (["--workers", "2"], 2),
+                                              (["--limit", "2", "--workers", "2"], 2)])
+def test_category_worker_defaults_and_trial_overrides(tmp_path, monkeypatch, category, options, expected):
+    from concurrent.futures import ThreadPoolExecutor
+
+    root = tmp_path / "rem"
+    set_config(root, ["limits.workers", "3"])
+    monkeypatch.setattr("connectonion.rem.queue.order", lambda *args: [])
+    monkeypatch.setattr("connectonion.rem.quota.read", lambda config: {"unknown": "no meter"})
+    seen = []
+
+    def pool(*, max_workers):
+        seen.append(max_workers)
+        return ThreadPoolExecutor(max_workers=max_workers)
+
+    def people(ctx, root, *, workers, **kwargs):
+        seen.append(workers)
+        return {"pages": []}, ["list", "people"], False
+
+    monkeypatch.setattr("concurrent.futures.ThreadPoolExecutor", pool)
+    monkeypatch.setattr("connectonion.cli.commands.rem_people.run_people", people)
+    result = CliRunner().invoke(app, ["rem", "--root", str(root), "--json", "investigate", category, *options])
+    assert result.exit_code == 0, result.output
+    assert seen == [expected]
 
 
 def test_category_does_not_apply_the_scheduled_quota_as_an_implicit_cap(tmp_path, monkeypatch):
@@ -149,7 +183,7 @@ def test_terminal_batch_summary_stays_short_and_empty_queue_is_clear(tmp_path, m
     runner = CliRunner()
     result = runner.invoke(app, ["rem", "--root", str(root), "investigate", "orgs"])
     assert result.exit_code == 0, result.output
-    assert "Investigating 55 of 55 pending orgs pages with up to 10 workers." in result.output
+    assert "Investigating 55 of 55 pending orgs pages with up to 16 workers." in result.output
     assert "Completed: 55 accepted." in result.output and "Left: 0" in result.output
     assert "Pages:" not in result.output and "Next: " in result.output
     monkeypatch.setattr("connectonion.rem.queue.order", lambda root, category: [])
@@ -157,3 +191,33 @@ def test_terminal_batch_summary_stays_short_and_empty_queue_is_clear(tmp_path, m
     assert empty.exit_code == 0, empty.output
     assert "All pending pages in orgs are current." in empty.output
     assert "Pages: None" not in empty.output and empty.output.strip().endswith("list orgs")
+
+
+@pytest.mark.parametrize("category", ["people", "orgs"])
+def test_session_stores_are_scanned_once_before_any_page_starts(tmp_path, monkeypatch, category):
+    """2026-10-20: every worker's first gather waited behind the scan and counted it."""
+    root = tmp_path / "rem"
+    prepare(root)
+    events = []
+    monkeypatch.setattr("connectonion.rem.investigate.warm_session_windows",
+                        lambda root, subscriptions: events.append("warm"))
+    monkeypatch.setattr("connectonion.rem.quota.read", lambda config: {"unknown": "no meter"})
+    if category == "people":
+        rows = [{"record": f"people/p{n}.md", "mode": "full", "days": 30,
+                 "last_activity": "2026-09-30T00:00:00Z", "mails": 1, "recent": True,
+                 "sent": 1, "received": 1, "last_investigated": None} for n in range(3)]
+        monkeypatch.setattr("connectonion.rem.people_pages.queue", lambda root, **kw: rows)
+        monkeypatch.setattr("connectonion.cli.commands.rem_commands._mail_clients", lambda root: {})
+        monkeypatch.setattr("connectonion.rem.service.subscriptions", lambda root: {})
+        monkeypatch.setattr("connectonion.cli.commands.rem_commands._logged",
+                            lambda root, record, phase, call: call(lambda *args: None))
+        monkeypatch.setattr("connectonion.rem.people_pages.investigate_person",
+                            lambda root, row, **kw: events.append(row["record"]) or {"record": row["record"]})
+    else:
+        rows = [{"path": f"orgs/o{n}.md", "recent": False, "last_investigated": None} for n in range(3)]
+        monkeypatch.setattr("connectonion.rem.queue.order", lambda root, category: rows)
+        monkeypatch.setattr("connectonion.cli.commands.rem_commands._investigate_page",
+                            lambda root, notebook, record, **kw: events.append(record) or {"record": record})
+    result = CliRunner().invoke(app, ["rem", "--root", str(root), "--json", "investigate", category])
+    assert result.exit_code == 0, result.output
+    assert events[0] == "warm" and events.count("warm") == 1 and len(events) == 4

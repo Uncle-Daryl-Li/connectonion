@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 from connectonion.cli.main import app
 from connectonion.handoff import bundle as bundles
-from connectonion.handoff import opener, sessions, transport
+from connectonion.handoff import opener, private, replies, sessions, transport
 
 runner = CliRunner()
 THREAD = "01a12594-63de-7210-809d-2a727b96f400"
@@ -25,7 +25,7 @@ def _invoke(*args):
 
 @pytest.fixture
 def project(tmp_path, monkeypatch):
-    for name in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_HOME"):
+    for name in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_HOME", "CODEX_SANDBOX"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AGENT_EMAIL", SELF)
     folder = tmp_path / "login-app"
@@ -80,25 +80,36 @@ def write_claude_session(cwd: Path) -> Path:
 
 @pytest.fixture
 def model(monkeypatch):
-    """The one llm_do call, faked: records the prompt and returns a fixed draft."""
+    """The one llm_do call (the report on top), faked: records the prompt and returns a fixed draft."""
     prompts = []
 
     def fake_llm_do(prompt, output=None, **kwargs):
+        if output is private.Found:     # the private-sentence pass (#2500); `prompts` keeps the report's
+            return _fake_filter(prompt)
         prompts.append(prompt)
-        return bundles.Draft(
+        return bundles.Top(
             title="Store the login token",
             task="Store the login session token; done when the cookie is set on login.",
-            may_do=["edit auth/"],
             where_it_stands="Option chosen, no code yet",
-            decided=[bundles.Decided(decision="Use an httpOnly cookie", why="JS cannot read it")],
-            rejected=[bundles.Rejected(option="B: localStorage", why_not="any XSS can read localStorage")],
+            decided=["Use an httpOnly cookie, because JS cannot read it"],
+            rejected=["localStorage: any script on the page can read it"],
             open_questions=["Cookie lifetime?"],
-            references=[bundles.Reference(reference="auth/session.py", note="where the middleware goes")],
         )
 
     import connectonion.llm_do  # noqa: F401  (the module, not the function the package re-exports)
     monkeypatch.setattr(sys.modules["connectonion.llm_do"], "llm_do", fake_llm_do)
+    monkeypatch.setattr(private, "reader", lambda agent="": "co")      # no Codex or Claude Code in a test
     return prompts
+
+
+# The private-sentence pass, faked as a reader who knows a few private words and one name.
+FAKE_PRIVATE = {"visa": "legal and immigration", "dentist": "health", "Lanzhou": "travel and home"}
+
+
+def _fake_filter(prompt: str):
+    hits = [private.Hit(id=int(n), categories=[c for w, c in FAKE_PRIVATE.items() if w in text])
+            for n, text in re.findall(r"^\[(\d+)\] (.*)$", prompt, re.M) if any(w in text for w in FAKE_PRIVATE)]
+    return private.Found(private=hits, names=["Priya"] if "Priya" in prompt else [])
 
 
 @pytest.fixture
@@ -106,14 +117,25 @@ def mailbox(monkeypatch):
     """The agent mailbox, faked at the transport's two functions."""
     mails = []
 
-    def deliver(to, subject, body, idempotency_key):
+    def deliver(to, subject, body, idempotency_key, agent=None, sealed=False):
         mails.append({"id": str(len(mails) + 1), "from": SELF, "to": to, "subject": subject,
                       "message": body, "timestamp": "2026-10-10T10:05:00"})
         return {"success": True, "message_id": f"msg-{len(mails)}", "from": SELF}
 
     monkeypatch.setattr(transport, "deliver", deliver)
-    monkeypatch.setattr(transport, "fetch", lambda last=200: [m for m in reversed(mails)
-                                                              if m["subject"].startswith(transport.SUBJECT_PREFIX)])
+    monkeypatch.setattr(transport, "_send_mail", deliver)                            # a new handoff's mail (#2478)
+    monkeypatch.setattr(transport, "own_mailboxes", lambda: {})                       # no Gmail or Outlook connected
+    pages = {}
+
+    def drop(drop_id, page, held, outer, meta, secret, key):   # the backend's drops (#2459), as the link's key opens them
+        pages[drop_id] = page
+        return drop_id
+    monkeypatch.setattr(transport, "drop", drop)
+    monkeypatch.setattr(transport, "open_page", lambda drop_id, key: pages[drop_id])
+    monkeypatch.setattr(transport, "pickup", lambda code: {"bundle": pages[code["drop"]]["bundle"], "code": [], "context": ""})
+    monkeypatch.setattr(transport, "fetch", lambda last=200: [
+        m for m in reversed(mails) if m["subject"].startswith(transport.SUBJECT_PREFIX) or transport.MARKER in m["message"]
+        or transport.LINK.search(m["message"])])
     monkeypatch.setattr("connectonion.cli.commands.project_cmd_lib.load_api_key", lambda: "token")
     monkeypatch.setattr(transport, "my_address", lambda: "0x" + "ab" * 32)
     return mails
@@ -158,9 +180,9 @@ def test_send_previews_by_default_and_sends_nothing(project, model, mailbox):
     assert result.exit_code == 0, result.output
     assert mailbox == []
     assert "Nothing has been sent" in result.output
-    assert "any XSS can read localStorage" in result.output        # the excerpt and decision, shown
-    assert "Which for the login token?" in result.output
-    assert "Which for the login token?" in model[0]                  # the draft saw the excerpt
+    assert "any XSS can read localStorage" in result.output          # the AI's part, quoted
+    assert "Which for the login token?" in result.output             # the user's words, verbatim
+    assert "Which for the login token?" in model[0]
     draft = Path.home() / ".co" / "handoff" / "drafts" / f"{_draft_id(result.output)}.json"
     assert json.loads(draft.read_text())["to"] == SELF
 
@@ -171,10 +193,11 @@ def test_yes_with_draft_sends_exactly_the_previewed_bundle(project, model, mailb
     handoff_id = _draft_id(preview.output)
     sent = _invoke("handoff", "send", SELF, "--draft", handoff_id, "--yes")
     assert sent.exit_code == 0, sent.output
-    assert len(mailbox) == 1 and len(model) == 1                     # no second drafting call
-    arrived = bundles.from_mail(mailbox[0]["message"])
+    assert len(mailbox) == 1 and len(model) == 1                     # drafted once (the report), not again on send
+    assert bundles.from_mail(mailbox[0]["message"]) is None             # no plaintext copy rides in the mail
+    arrived = transport.page_bundle(transport.open_page(*transport.link_in(mailbox[0]["message"])))   # checked by its code
     previewed = json.loads((Path.home() / ".co/handoff/drafts" / f"{handoff_id}.json").read_text())
-    assert arrived["verified"] and arrived["content_hash"] == previewed["content_hash"]
+    assert arrived["content_hash"] == previewed["content_hash"]
     assert f"Next: co handoff status {handoff_id}" in sent.output
 
 
@@ -233,17 +256,24 @@ def test_a_credential_in_the_session_is_refused(project, model, mailbox):
 def test_a_value_from_keys_env_is_refused_even_without_a_known_shape(monkeypatch):
     monkeypatch.setenv("LINEAR_API_KEY", "plainvalue-without-prefix-123")
     bundle = {"excerpt": [{"text": "here: plainvalue-without-prefix-123"}]}
-    from connectonion.cli.commands.handoff_commands import _known_secrets
-    assert bundles.find_credentials(bundle, _known_secrets()) == ["excerpt[0].text: a value from your keys.env"]
+    assert bundles.find_credentials(bundle, bundles.known_secrets()) == ["excerpt[0].text: a value from your keys.env"]
+
+
+def test_no_text_in_the_mail_sits_bare_in_a_table_cell():
+    """The mail service writes the text part from the HTML and breaks lines only at blocks, so text bare
+    in a cell ran into the next one: "CONNECTONION HANDOFF0xf9e5…", "ENDFirst time?" (b17, 2026-10-13)."""
+    bundle = bundles.seal({"format": bundles.FORMAT, "id": "ho-1", "title": "t", "task": "g", "from": "a@b.c",
+                           "to": "d@e.f", "created_at": "2026-10-10", "where_it_stands": "w"})
+    body = bundles.notice(bundle, "prompt")["html"]
+    assert re.findall(r"<td[^>]*>[^<]*\w[^<]*<", body) == []
 
 
 def test_a_changed_bundle_is_not_verified():
     bundle = bundles.seal({"format": bundles.FORMAT, "id": "ho-1", "title": "t", "task": "g", "from": "a", "to": "b",
                            "created_at": "2026-10-10", "where_it_stands": ""})
-    subject, body = bundles.to_mail(bundle, "prompt")
-    assert bundles.from_mail(body)["verified"]
+    assert bundles.from_mail(bundles.notice(bundle, "prompt", carry_bundle=True)["html"])["verified"]
     tampered = dict(bundle, task="something else")          # keeps the approved hash
-    assert not bundles.from_mail(bundles.to_mail(tampered, "prompt")[1])["verified"]
+    assert not bundles.from_mail(bundles.notice(tampered, "prompt", carry_bundle=True)["html"])["verified"]
 
 
 # ---- recipient ----
@@ -256,16 +286,14 @@ def test_inbox_show_and_open_from_the_mailbox(project, model, mailbox, monkeypat
     inbox = _invoke("handoff", "inbox")
     assert handoff_id in inbox.output and f"Next: co handoff show {handoff_id}" in inbox.output
 
-    summary = _invoke("handoff", "show", handoff_id)
-    assert "Store the login token" in summary.output and "localStorage" not in summary.output
-    detail = _invoke("handoff", "show", handoff_id, "--decisions")
-    assert "- B: localStorage: any XSS can read localStorage" in detail.output
+    shown = _invoke("handoff", "show", handoff_id)
+    assert "Store the login token" in shown.output and "Which for the login token?" in shown.output
 
     seeds = []
 
-    def fake_start(agent, prompt, cwd):
-        seeds.append((agent, prompt, cwd))
-        return {"session": "thread-1", "reply": "Goal: store the token.",
+    def fake_start(agent, bundle, brief, cwd, code, full_access=False):
+        seeds.append((agent, brief.read_text(), brief, cwd, code))
+        return {"session": "thread-1", "reply": "Goal: store the token.", "log": "work.log",
                 "resume": f"cd {cwd} && codex resume thread-1", "ask": "codex exec resume thread-1 \"q\""}
 
     monkeypatch.setattr(opener, "start", fake_start)
@@ -273,9 +301,10 @@ def test_inbox_show_and_open_from_the_mailbox(project, model, mailbox, monkeypat
     opened = _invoke("handoff", "open", handoff_id)
     assert opened.exit_code == 0, opened.output
     assert "codex resume thread-1" in opened.output
-    agent, prompt, cwd = seeds[0]
-    assert agent == "codex" and "any XSS can read localStorage" in prompt
-    assert (cwd / "HANDOFF.md").exists() and (cwd / "excerpt.md").exists()
+    agent, prompt, brief, cwd, code = seeds[0]
+    assert agent == "codex" and "any XSS can read localStorage" in prompt and "Which for the login token?" in prompt
+    assert brief.name == "HANDOFF.md" and code.startswith("coh4.")        # it accepts by itself
+    assert cwd.parent.name == "handoffs" and f"Folder: {cwd}" in opened.output      # a folder a person can find
 
     again = _invoke("handoff", "open", handoff_id)
     assert len(seeds) == 1 and "No new session was created" in again.output
@@ -288,40 +317,193 @@ def test_show_of_an_unknown_id_points_at_the_inbox(project, mailbox):
 
 # ---- compaction and picking a session ----
 
-def test_a_compacted_codex_session_keeps_what_codex_retained_then_the_turns_after(project):
+def test_a_compacted_codex_session_keeps_every_user_message_once(project):
+    # The rollout keeps the full history; replacement_history repeats user messages already in it.
     path = write_codex_session(project)
     rows = path.read_text().splitlines()
     compacted = _row("compacted", {"message": "", "replacement_history": [
-        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Original ask: store the login token."}]},
-        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "# AGENTS.md instructions\nrules"}]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Agreed. Next is the middleware in auth/session.py."}]},
         {"type": "compaction", "encrypted_content": "gAAAA-opaque"}]})
     after = _codex_message("user", "After compaction: lifetime is 7 days.")
     path.write_text("\n".join(rows + [compacted, after]) + "\n")
-    turns = sessions.excerpt(sessions.read_turns("codex", path))
-    assert [(t["role"], t["text"]) for t in turns] == [
-        ("earlier", "Original ask: store the login token."),
-        ("user", "After compaction: lifetime is 7 days.")]
+    turns = sessions.read_turns("codex", path)
+    assert [t["text"] for t in turns if t["role"] == "user"] == [
+        "Option A: httpOnly cookie. Option B: localStorage. Which for the login token?",
+        "Agreed. Next is the middleware in auth/session.py.",
+        "After compaction: lifetime is 7 days."]
 
 
-def test_a_compacted_claude_session_starts_from_its_summary(project):
+def test_a_compacted_claude_session_keeps_every_user_message_and_not_the_summary(project):
     path = write_claude_session(project)
     rows = path.read_text().splitlines()
     summary = {"type": "user", "isCompactSummary": True, "timestamp": "2026-10-10T11:00:00Z",
                "message": {"role": "user", "content": "This session is being continued from a previous "
                                                       "conversation.\n\nSummary: chose the queue over backoff."}}
-    after = {"type": "user", "timestamp": "2026-10-10T11:00:01Z",
+    interrupted = {"type": "user", "timestamp": "2026-10-10T11:00:01Z",
+                   "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}}
+    typed_mid_turn = {"type": "attachment", "timestamp": "2026-10-10T11:00:02Z",
+                      "attachment": {"type": "queued_command", "prompt": "Use the real session.",
+                                     "origin": {"kind": "human"}}}
+    after = {"type": "user", "timestamp": "2026-10-10T11:00:03Z",
              "message": {"role": "user", "content": "Now write the worker."}}
-    path.write_text("\n".join(rows + [json.dumps(summary), json.dumps(after)]) + "\n")
-    turns = sessions.excerpt(sessions.read_turns("claude", path))
-    assert [t["role"] for t in turns] == ["summary", "user"]
-    assert "chose the queue over backoff" in turns[0]["text"]
+    path.write_text("\n".join(rows + [json.dumps(r) for r in (summary, interrupted, typed_mid_turn, after)]) + "\n")
+    turns = sessions.read_turns("claude", path)
+    assert [t["text"] for t in turns if t["role"] == "user"] == [
+        "Should we retry with backoff or a queue?", "Use the real session.", "Now write the worker."]
+    assert "chose the queue over backoff" not in json.dumps(turns)
 
 
-def test_a_long_session_keeps_the_last_turns_but_never_drops_the_summary():
-    turns = [{"role": "summary", "text": "S", "timestamp": ""}] + \
-            [{"role": "user", "text": str(i), "timestamp": ""} for i in range(100)]
-    kept = sessions.excerpt(turns, limit=5)
-    assert [t["text"] for t in kept] == ["S", "95", "96", "97", "98", "99"]
+def test_each_user_message_carries_the_ai_replies_that_followed_it():
+    turns = [{"role": "assistant", "text": "hello", "timestamp": "t0"},
+             {"role": "user", "text": "A?", "timestamp": "t1"},
+             {"role": "assistant", "text": "first", "timestamp": "t2"},
+             {"role": "assistant", "text": "second", "timestamp": "t3"},
+             {"role": "user", "text": "B?", "timestamp": "t4"}]
+    assert sessions.exchanges(turns) == [{"at": "t1", "user": "A?", "ai": "first\n\nsecond", "final": "second", "steps": 1},
+                                         {"at": "t4", "user": "B?", "ai": "", "final": "", "steps": 0}]
+
+
+def test_the_handoff_quotes_the_users_words_and_the_ais_own_words(project, model, mailbox):
+    """Originals over summaries (decision 076, Aaron 2026-10-13): a summary drops what its writer
+    thought unimportant, and the recipient cannot tell what is missing."""
+    long_ask = "Keep every word of this. " * 400
+    write_codex_session(project, extra=" " + long_ask)
+    result = _invoke("handoff", "send", SELF, "the login token task")
+    assert result.exit_code == 0, result.output
+    draft = json.loads((Path.home() / ".co/handoff/drafts" / f"{_draft_id(result.output)}.json").read_text())
+    said = [e["user"] for e in draft["conversation"]]
+    assert said[0].endswith(long_ask.strip()) and len(said) == 2      # verbatim, never cut
+    assert "Reject B: any XSS can read localStorage" in draft["conversation"][0]["ai"]   # the AI's own words
+    assert draft["ai_quoted"] is True and len(model) == 1                              # one call: the report on top
+    assert "AI, in summary" not in result.output and "Which for the login token?" in result.output
+
+
+def _git(folder, *args):
+    import subprocess
+    return subprocess.run(["git", *args], cwd=folder, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _repo(folder: Path, branch: str, remote: str) -> str:
+    folder.mkdir(parents=True, exist_ok=True)
+    _git(folder, "init", "-q", "-b", branch)
+    _git(folder, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "start")
+    _git(folder, "remote", "add", "origin", remote)
+    return _git(folder, "rev-parse", "HEAD")
+
+
+def test_the_code_is_where_the_session_worked_not_where_send_runs(project, model, mailbox, tmp_path):
+    # Sent from a folder that is not a repository; the session itself worked in a worktree.
+    worktree = tmp_path / "login-app-fix"
+    commit = _repo(worktree, "login-token", "https://alice:hunter2pass@github.com/acme/login-app.git")
+    (worktree / "wip.py").write_text("x = 1\n")
+    path = write_claude_session(project)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    from datetime import datetime, timezone
+    rows[1]["cwd"], rows[1]["gitBranch"] = str(worktree), "login-token"
+    rows[1]["timestamp"] = datetime.now(timezone.utc).isoformat()       # the session worked there after that commit
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    result = _invoke("handoff", "send", SELF, "task")
+    draft = json.loads((Path.home() / ".co/handoff/drafts" / f"{_draft_id(result.output)}.json").read_text())
+    assert [{k: v for k, v in c.items() if k != "patch"} for c in draft["code"]] == [{
+        "repository": "https://github.com/acme/login-app.git", "branch": "login-token",
+        "commit": commit, "pushed": False, "uncommitted": 1}]
+    assert draft["code"][0]["patch"]["sha256"]                          # the unpushed part goes with it (#2469)
+    assert "hunter2pass" not in json.dumps(draft) and str(worktree) not in json.dumps(draft)
+    assert "https://github.com/acme/login-app.git" in result.output and "The code goes with it" in result.output
+
+
+def test_with_since_the_code_is_only_where_the_handed_off_messages_worked(tmp_path):
+    # 2026-10-11, Mac to Parrot: --since 117 still listed every folder the 120-message session had
+    # visited, including a shared checkout with another session's 30 uncommitted files, and the
+    # recipient's first question was which of the three to start from.
+    from datetime import datetime, timedelta, timezone
+    early, late = tmp_path / "early", tmp_path / "late"
+    _repo(early, "main", "https://github.com/acme/early.git")
+    _repo(late, "main", "https://github.com/acme/late.git")
+    now = datetime.now(timezone.utc)
+    rows = [{"type": "user", "cwd": str(early), "gitBranch": "main", "timestamp": (now + timedelta(minutes=1)).isoformat(),
+             "message": {"role": "user", "content": "old work"}},
+            {"type": "user", "cwd": str(late), "gitBranch": "main", "timestamp": (now + timedelta(minutes=10)).isoformat(),
+             "message": {"role": "user", "content": "this task"}}]
+    path = tmp_path / "s.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert [c["repository"] for c in sessions.code_for("claude", path)] == [
+        "https://github.com/acme/late.git", "https://github.com/acme/early.git"]
+    since = (now + timedelta(minutes=5)).isoformat()
+    assert [c["repository"] for c in sessions.code_for("claude", path, since=since)] == ["https://github.com/acme/late.git"]
+
+
+def test_a_branch_recorded_as_head_is_named_not_called_detached(tmp_path):
+    # #2416: a Claude Code session that cd's into a repository records gitBranch "HEAD" on every row,
+    # and the handoff said "detached" for a worktree that was on release-1.9.2b12.
+    repo = tmp_path / "app"
+    _repo(repo, "main", "https://github.com/acme/app.git")
+    _git(repo, "checkout", "-q", "-b", "release-x")
+    _git(repo, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "release")
+    assert sessions.code_at(repo, "HEAD")["branch"] == "release-x"
+    _git(repo, "checkout", "-q", "--detach")
+    _git(repo, "branch", "-q", "-D", "release-x")
+    assert sessions.code_at(repo, "HEAD")["branch"] == "HEAD"     # truly detached, no branch has it: say so
+
+
+def test_the_commit_is_the_branch_the_session_was_on_not_todays_checkout(project, tmp_path):
+    repo = tmp_path / "app"
+    _repo(repo, "main", "https://github.com/acme/app.git")
+    _git(repo, "checkout", "-q", "-b", "old-feature")
+    _git(repo, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "feature")
+    feature = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "main")
+    assert sessions.code_at(repo, "old-feature")["commit"] == feature
+
+
+def test_a_session_outside_any_repository_has_no_code_reference(project, model, mailbox):
+    write_codex_session(project)
+    result = _invoke("handoff", "send", SELF, "task")
+    draft = json.loads((Path.home() / ".co/handoff/drafts" / f"{_draft_id(result.output)}.json").read_text())
+    assert draft["code"] == []
+    assert "Ask the sender where the code is" in result.output
+
+
+def test_a_long_ai_reply_keeps_its_start_and_its_end_and_says_what_was_cut():
+    quoted = bundles.quote("start " + "y" * 5000 + " CONCLUSION")
+    assert quoted.startswith("start ") and quoted.endswith(" CONCLUSION")
+    assert "characters cut; the full session comes with the first answer]" in quoted
+    assert len(quoted) < bundles.QUOTE_CHARS + 200
+    assert bundles.quote("short") == "short"
+
+
+def test_the_report_call_reads_at_most_a_bounded_transcript_newest_first(project, model, mailbox, monkeypatch):
+    monkeypatch.setattr(bundles, "TOP_CHARS", 500)
+    talk = [{"at": "", "user": f"question {n}", "ai": "x" * 200} for n in range(1, 7)]
+    bundles.draft(talk, "task")
+    assert len(model) == 1 and len(model[0]) < 500 + len(bundles.TOP_PROMPT) + 300
+    assert "question 6" in model[0] and "question 1" not in model[0] and "left out" in model[0]
+
+
+def test_decided_and_rejected_are_at_the_top(project, model, mailbox):
+    write_codex_session(project)
+    result = _invoke("handoff", "send", SELF, "task")
+    top = result.output.split("## Conversation")[0]
+    assert "## Concluded\n- Use an httpOnly cookie" in top and "## Rejected\n- localStorage" in top
+
+
+def test_since_starts_the_conversation_at_that_message(project, model, mailbox):
+    write_codex_session(project)
+    result = _invoke("handoff", "send", SELF, "task", "--since", "2")
+    draft = json.loads((Path.home() / ".co/handoff/drafts" / f"{_draft_id(result.output)}.json").read_text())
+    assert [e["user"] for e in draft["conversation"]] == ["Agreed. Next is the middleware in auth/session.py."]
+    assert "Which for the login token?" not in json.dumps(draft) and "Which for the login token?" not in "".join(model)
+
+
+def test_other_peoples_addresses_and_numbers_are_masked_and_the_preview_counts_them(project, model, mailbox):
+    """Listing them for the sender to remove by hand reached a public page anyway (2026-10-14): now they are
+    masked before anything leaves, and the preview says how many, up front."""
+    write_codex_session(project, extra=" cc bob.smith@gmail.com, call +61 435 525 634")
+    result = _invoke("handoff", "send", SELF, "task")
+    said = " ".join(result.output.split())
+    assert "Masked other people's contact details: 1 email address and 1 phone number and 0 names from your co rem pages in the brief" in said
+    assert "in the session copy that goes with it" in said and "no commands or their output" in said
+    assert "bob.smith@gmail.com" not in result.output and "+61 435 525 634" not in result.output
 
 
 def test_session_by_id_or_path(project, tmp_path):
@@ -337,7 +519,7 @@ def test_send_from_another_session_does_not_put_local_paths_in_the_bundle(projec
     result = _invoke("handoff", "send", SELF, "task", "--session", THREAD)
     assert result.exit_code == 0, result.output
     draft = json.loads((Path.home() / ".co/handoff/drafts" / f"{_draft_id(result.output)}.json").read_text())
-    assert draft["source"] == {"kind": "codex", "session": THREAD, "turns_included": 3, "compacted": False}
+    assert draft["source"] == {"kind": "codex", "session": THREAD, "messages": 2}
     assert str(Path.home()) not in json.dumps(draft)
 
 
@@ -358,8 +540,7 @@ def test_an_invite_code_is_refused_by_shape_and_by_value(project, model, mailbox
     assert result.exit_code == 1 and "ConnectOnion invite code" in result.output and mailbox == []
     monkeypatch.setenv("CO_INVITE_CODE", "OpenOnion-legacy-code")
     assert bundles.find_credentials({"t": "code OpenOnion-legacy-code"},
-                                    __import__("connectonion.cli.commands.handoff_commands",
-                                               fromlist=["_known_secrets"])._known_secrets())
+                                    bundles.known_secrets())
 
 
 def test_the_mail_carries_no_invite_code_or_token(project, model, mailbox, monkeypatch):
@@ -377,7 +558,7 @@ def test_private_paths_are_shown_in_the_preview(project, model, mailbox):
     write_codex_session(project, extra=" see /Users/alice/secret-notes/plan.md")
     result = _invoke("handoff", "send", SELF, "task")
     assert result.exit_code == 0
-    assert "Private paths in it" in result.output and "/Users/alice/secret-notes/plan.md" in result.output
+    assert "Private details in it" in result.output and "/Users/alice/secret-notes/plan.md" in result.output
 
 
 def test_claude_open_reads_the_result_event_from_claude_codes_event_list(monkeypatch, tmp_path):
@@ -385,7 +566,7 @@ def test_claude_open_reads_the_result_event_from_claude_codes_event_list(monkeyp
     events = [{"type": "system"}, {"type": "result", "session_id": "s-1", "result": "Goal: ..."}]
     monkeypatch.setattr(opener.subprocess, "run", lambda *a, **k: opener.subprocess.CompletedProcess(
         a, 0, stdout=json.dumps(events), stderr=""))
-    started = opener.start("claude", "seed", tmp_path)
+    started = opener._start_claude("seed", tmp_path)
     assert started["session"] == "s-1" and "claude --resume s-1" in started["resume"]
 
 
@@ -401,9 +582,10 @@ def _sent_to_a_personal_address(project, mailbox) -> dict:
 def _fake_open(monkeypatch) -> list:
     seeds = []
 
-    def fake_start(agent, prompt, cwd):
-        seeds.append((agent, prompt, cwd))
-        return {"session": "thread-1", "reply": "Goal.", "resume": "codex resume thread-1", "ask": "codex exec resume thread-1"}
+    def fake_start(agent, bundle, brief, cwd, code, full_access=False):
+        seeds.append((agent, brief.read_text(), brief))
+        return {"session": "thread-1", "reply": "Goal.", "resume": "codex resume thread-1", "ask": "codex exec resume thread-1",
+                "log": "work.log"}
 
     monkeypatch.setattr(opener, "start", fake_start)
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
@@ -414,7 +596,7 @@ def _fake_open(monkeypatch) -> list:
 def test_the_mail_to_a_personal_address_is_a_prompt_that_needs_no_mailbox(project, model, mailbox):
     # #2378: nothing in it depends on where the mail landed.
     mail = _sent_to_a_personal_address(project, mailbox)
-    assert "Copy everything in the box into Codex or Claude Code" in mail["message"]
+    assert "paste the line" in mail["message"] and "https://o.openonion.ai/h/" in mail["message"]
     assert "co handoff inbox" not in mail["message"] and "&lt;" not in mail["message"]
 
 
@@ -430,7 +612,7 @@ def test_open_a_handoff_from_the_mail_as_co_email_read_prints_it(project, model,
     opened = _invoke("handoff", "open", str(saved))
     assert opened.exit_code == 0, opened.output
     assert seeds and "any XSS can read localStorage" in seeds[0][1]
-    assert (seeds[0][2] / "HANDOFF.md").exists()
+    assert seeds[0][2].exists()
 
 
 @pytest.mark.parametrize("encoding", ["quoted-printable", "base64"])
@@ -454,3 +636,662 @@ def test_a_file_without_a_handoff_says_so(project, mailbox, tmp_path):
     saved.write_text("just notes", encoding="utf-8")
     result = _invoke("handoff", "open", str(saved))
     assert result.exit_code == 1 and "no handoff in" in result.output.lower()
+
+
+def test_status_wait_returns_once_something_new_arrives(project, model, mailbox, monkeypatch):
+    # An agent runs this in the background: it ends, and so wakes the agent, only on news.
+    write_codex_session(project)
+    handoff_id = _draft_id(_invoke("handoff", "send", SELF, "task").output)
+    _invoke("handoff", "send", SELF, "--draft", handoff_id, "--yes")
+    from connectonion.handoff import replies
+    arrivals = iter([[], [], [{"kind": "ask"}], [{"kind": "ask"}], [{"kind": "ask"}]])
+    checks = []
+    monkeypatch.setattr(replies, "received", lambda handoff_id, mails=None: checks.append(1) or next(arrivals))
+    monkeypatch.setattr(replies, "settle", lambda record, mails=None: {"accepted": None, "questions": [], "ignored": 0})
+    monkeypatch.setattr(transport, "sent_status", lambda to, subject: {"status": "sent"})
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    result = _invoke("handoff", "status", handoff_id, "--wait")
+    assert result.exit_code == 0, result.output
+    assert len(checks) == 4 and f"Handoff {handoff_id} (sent)" in result.output   # 3 waiting, 1 to remember it
+
+
+def test_a_repository_url_is_not_a_private_detail_and_a_detached_head_says_so():
+    bundle = {"from": SELF, "to": "x", "code": [{"repository": "git@github.com:acme/app.git", "branch": "HEAD",
+                                                 "commit": "abc123", "pushed": True, "uncommitted": 0}]}
+    assert bundles.find_private(bundle) == []
+    assert "branch HEAD" not in bundles.code_text(bundle) and "detached" in bundles.code_text(bundle)
+
+
+def _goal(objective):
+    return _codex_message("user", '<codex_internal_context source="goal">\nContinue working toward the active '
+                          f"thread goal.\n\n<objective>\n{objective}\n</objective>\n\nContinuation behavior:\n- persists")
+
+
+def test_a_codex_goal_arrives_once_as_the_users_words(project):
+    # /goal puts the person's task inside an injected-looking block, and repeats it every turn.
+    path = write_codex_session(project)
+    rows = path.read_text().splitlines()
+    path.write_text("\n".join(rows + [_goal("Make every rem page worth reading."), _codex_message("assistant", "On it."),
+                                      _goal("Make every rem page worth reading.")]) + "\n")
+    users = [t["text"] for t in sessions.read_turns("codex", path) if t["role"] == "user"]
+    assert users[-1] == "Goal: Make every rem page worth reading." and users.count(users[-1]) == 1
+
+
+def test_the_senders_own_words_lead_the_task(project, model, mailbox):
+    write_codex_session(project)
+    result = _invoke("handoff", "send", SELF, "fix the clock skew in the scan test")
+    assert "## Task\nHanded off as: fix the clock skew in the scan test\n" in result.output
+
+
+def test_the_commit_is_the_last_one_before_the_session_ended(project, tmp_path, monkeypatch):
+    import os
+    repo = tmp_path / "app"
+    first = _repo(repo, "main", "https://github.com/acme/app.git")
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2030-01-01T00:00:00Z")
+    _git(repo, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "later")
+    assert sessions.code_at(repo, "main", before="2029-01-01T00:00:00Z")["commit"] == first
+
+
+def test_ip_addresses_are_listed_in_the_preview():
+    hits = bundles.find_private({"from": SELF, "to": "x", "conversation": [{"user": "ssh to 35.189.30.72 now", "ai": ""}]})
+    assert hits == ["conversation[0].user: 35.189.30.72"]
+
+
+def test_codex_code_comes_from_the_workdir_of_its_commands(project, tmp_path):
+    # A Codex session started in a folder above the repositories works in them through `workdir`.
+    from datetime import datetime, timezone
+    repo = tmp_path / "connectonion-fix"
+    commit = _repo(repo, "fix-timeout", "https://github.com/acme/connectonion.git")
+    path = write_codex_session(project)
+    call = {"type": "custom_tool_call", "name": "exec", "input":
+            'const r = await tools.exec_command({"cmd":"pytest -q","workdir":"' + str(repo) + '"}); text(r.output);'}
+    with path.open("a") as f:
+        f.write(_row("response_item", call, when=datetime.now(timezone.utc).isoformat()) + "\n")
+    assert [c["commit"] for c in sessions.code_for("codex", path)] == [commit]
+
+
+def test_issues_and_prs_are_named_from_what_the_session_read(project, model, mailbox):
+    # The session ran gh; its output already holds the titles, so nothing is fetched at send time.
+    path = write_codex_session(project, extra=" Then fix #1043 and look at #1047.")
+    gh_json = json.dumps([{"number": 1043, "title": "Fresh co ai installs cannot onboard their owner", "state": "OPEN"}])
+    rows = [_row("response_item", {"type": "function_call_output", "call_id": "c1", "output": gh_json}),
+            _row("response_item", {"type": "custom_tool_call_output", "call_id": "c2",
+                                   "output": "title:\tKeep eval runs opt-in\nstate:\tOPEN\nnumber:\t1047\n"})]
+    with path.open("a") as f:
+        f.write("\n".join(rows) + "\n")
+    result = _invoke("handoff", "send", SELF, "task")
+    assert "- #1043: Fresh co ai installs cannot onboard their owner" in result.output
+    assert "- #1047: Keep eval runs opt-in" in result.output
+
+
+def test_a_claude_tool_result_names_an_issue_too(project):
+    path = write_claude_session(project)
+    row = {"type": "user", "timestamp": "2026-10-10T10:00:05Z", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content":
+         "123\tFix the login race\tfix/login\tOPEN\t2026-10-01\n1\tAnalyze Python\tpush\tmain\t2026-10-01"}]}}
+    with path.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    assert sessions.titles("claude", path) == {"123": "Fix the login race"}
+
+
+def test_a_long_handoff_suggests_starting_later(project, model, mailbox, monkeypatch):
+    from connectonion.cli.commands import handoff_commands
+    monkeypatch.setattr(handoff_commands, "LONG_CHARS", 100)
+    write_codex_session(project)
+    result = _invoke("handoff", "send", SELF, "task")
+    assert "--since <N>" in result.output.split("Draft:")[0] and "characters" in result.output
+
+
+def test_a_detached_checkout_is_found_in_the_reflog(project, tmp_path, monkeypatch):
+    # The session sat on B; today the same folder is back on A with an edit. Neither is the session's.
+    repo = tmp_path / "app"
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+    first = _repo(repo, "main", "https://github.com/acme/app.git")
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2026-01-15T00:00:00Z")
+    _git(repo, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "B")
+    second = _git(repo, "rev-parse", "HEAD")
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2026-03-01T00:00:00Z")
+    _git(repo, "checkout", "-q", "--detach", first)
+    (repo / "today.py").write_text("x = 1\n")
+    code = sessions.code_at(repo, "HEAD", before="2026-02-01T00:00:00Z")
+    assert code["commit"] == second and code["uncommitted"] == 0     # today's edit is not that commit's
+
+
+def test_only_title_shaped_text_counts_as_a_title():
+    found = sessions._titles_in('1\t0x10e68f6dff39ab1c50cc48ea1c74e7fd6ce7269aa6e8123829b344e57d005508\tx\n'
+                                '1782\t2026-09-26\tx\n'
+                                '{"number": 1037, "title": "bash() clamps timeout to 600s \\u2014 agents cannot tell"}')
+    assert found == {"1037": "bash() clamps timeout to 600s — agents cannot tell"}
+
+
+# ---- the session copy an automatic answer carries ----
+
+def _tool_session(tmp_path: Path) -> Path:
+    """A Claude Code session where a requirement exists only in a tool call and its output (study B, T3)."""
+    rows = [
+        {"type": "user", "timestamp": "2026-10-10T09:00:00Z", "message": {"role": "user", "content": "unrelated earlier work"}},
+        {"type": "user", "timestamp": "2026-10-10T10:00:00Z", "message": {"role": "user", "content": "Fix co keys."}},
+        {"type": "assistant", "timestamp": "2026-10-10T10:00:01Z", "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "private reasoning"},
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "co keys list --json"}}]}},
+        {"type": "user", "timestamp": "2026-10-10T10:00:02Z", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1",
+             "content": "keys list must hide values unless --show; OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwx"}]}},
+        {"type": "assistant", "timestamp": "2026-10-10T10:00:03Z", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "Done: values are hidden."}]}},
+        {"type": "user", "timestamp": "2026-10-10T11:00:00Z", "message": {"role": "user", "content": "after the handoff"}},
+    ]
+    path = tmp_path / "tools.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return path
+
+
+def test_the_session_copy_is_the_conversation_and_never_a_tool_call_or_its_output(tmp_path):
+    """#2496 reverses study B T3 (2026-10-11): tool output went for the one requirement that lived there,
+    and with it whole co rem pages about other people and the sender's own mail."""
+    from connectonion.handoff import replies
+    text = replies.copy_text({"kind": "claude", "path": str(_tool_session(tmp_path)), "since": "2026-10-10T10:00:00Z"},
+                             "2026-10-10T10:30:00+00:00")
+    assert "Fix co keys." in text and "Done: values are hidden." in text
+    assert "co keys list --json" not in text and "must hide values unless --show" not in text
+    assert "unrelated earlier work" not in text and "after the handoff" not in text    # --since, and sent at
+    assert "private reasoning" not in text
+
+
+def test_the_session_copy_never_carries_a_credential(tmp_path):
+    from connectonion.handoff import replies
+    session = tmp_path / "s.jsonl"
+    session.write_text(json.dumps({"type": "user", "timestamp": "2026-10-10T10:00:00Z", "message": {
+        "content": "my key is sk-proj-abcdefghijklmnopqrstuvwx"}}) + "\n")
+    text = replies.copy_text({"kind": "claude", "path": str(session)}, "")
+    assert "sk-proj-abcdefghijklmnopqrstuvwx" not in text and "[removed: " in text
+    assert "hunter2hunter2" not in bundles.redact("pw hunter2hunter2", known_secrets=["hunter2hunter2"])
+
+
+def test_the_session_copy_never_carries_a_handoff_code():
+    # A real session copy (2026-10-11) still held 44 coh2 codes: each is the secret that lets its holder
+    # accept or ask on that handoff, including handoffs meant for someone else.
+    code = "coh2.EOaPbf85qxxQzEjqHHTn_WznJpqm6BI4KbNE5X0AVQjgdBg-O3ErLLX3FVu1_pw9O-lBGRPKYWFyb24ueGllQG1haWwub3Blbm9uaW9uLmFpRW2Mkw"
+    text = bundles.redact(f"run co handoff accept {code} --brief HANDOFF.md, or the old coh1.{code[5:]}")
+    assert "coh2.EOaP" not in text and "coh1.EOaP" not in text and "[removed: " in text
+
+
+def test_a_credentials_file_printed_in_a_tool_output_is_redacted():
+    text = bundles.redact('{"client_secret": "GOCSPX-abcdefghijklmnopqrstuv", "password": "hunter2hunter2hunter2"}')
+    assert "GOCSPX" not in text and "hunter2" not in text
+
+
+def test_a_long_conversation_keeps_its_newest_messages_in_the_mailed_block():
+    bundle = {"from": SELF, "conversation": [{"user": f"message {n} " + "x" * 1000, "ai": ""} for n in range(1, 101)]}
+    text = bundles.conversation_text(bundle, chars=20_000)
+    assert len(text) < 21_000 and "message 100 " in text and "message 1 " not in text
+    assert text.startswith("[Messages 1 to ") and "whole session" in text
+    assert bundles.conversation_text(bundle) .count("message ") == 100      # HANDOFF.md and the preview keep all
+
+
+def test_a_secret_in_a_tool_input_shown_as_escaped_json_is_redacted():
+    # A tool call's input reaches the copy as JSON, so a credentials file it wrote has escaped quotes.
+    text = bundles.redact('{"content": "{\\"client_secret\\": \\"GOCSPX-abcdefghijklmnopqrstuv\\"}"}')
+    assert "GOCSPX" not in text
+
+
+def test_the_headline_names_the_sender_their_ai_and_the_day_and_the_diagram_has_real_lines(project, model, mailbox):
+    """A live b21 draft said "Sender and AI: reviewing tempconv.py" (the model had no name to use), and its
+    diagram came back with a literal backslash-n where the line break should be."""
+    top = bundles.Top(title="t", task="t", where_it_stands="w", diagram="a ─► b\\n└─► c")
+    talk = [{"at": "2026-10-13T03:09:46Z", "user": "go", "ai": "ok"}]
+    bundles.draft(talk, "task", sender="Aaron Xie", agent="codex")
+    assert "The Sender is Aaron Xie, working with Codex, on 2026-10-13." in model[-1]
+    assert bundles.diagram_lines(top.diagram) == "a ─► b\n└─► c"
+
+
+def test_limits_the_sender_put_on_their_own_ai_are_not_the_recipients_task(project, model, mailbox):
+    """b20 e2e: the sender handed off "fix slugify per the docs team rules", but their only message told their
+    own AI "Don't change files. Explain the fix". The draft made "without modifying any files" the recipient's
+    Done, so Codex only reviewed. The same came back live on b21: "Do not modify tempconv.py yet"."""
+    bundles.draft([{"at": "", "user": "Don't change files. Explain the fix.", "ai": "ok"}], "fix slugify")
+    prompt = model[-1]
+    assert "Limits the Sender put on their own AI" in prompt and "passed on either" in prompt
+
+
+# ---- the replayed thread (2026-10-13): the recipient opens the sender's conversation, not install noise ----
+
+REPLAY = {"id": "ho-1a2b3c4d", "from": "aaron@mail.openonion.ai", "title": "Store the login token",
+          "source": {"kind": "claude"}, "conversation": [
+              {"at": "2026-10-12T09:00:00Z", "user": "Cookie or localStorage?", "ai": "Chose the httpOnly cookie."},
+              {"at": "2026-10-12T09:05:00Z", "user": "30 days.", "ai": ""}]}
+
+
+def test_each_exchange_is_a_finished_turn_labelled_with_who_said_it(tmp_path):
+    rows = opener.replay_lines(REPLAY, "t-1", tmp_path, "2026-10-13T00:00:00.000Z", "gpt-5")
+    assert rows[0]["type"] == "session_meta" and rows[0]["payload"]["id"] == "t-1"
+    events = [r["payload"]["type"] for r in rows if r["type"] == "event_msg"]
+    # Without the events the model sees the history but the app and the phone show nothing.
+    # A turn where the AI only ran tools has no reply bubble (b24 audit: "(no reply recorded)").
+    assert events == ["task_started", "user_message", "agent_message", "task_complete",
+                      "task_started", "user_message", "task_complete"]
+    said = [r["payload"]["message"] for r in rows if r["payload"].get("type") == "user_message"]
+    replied = [r["payload"]["message"] for r in rows if r["payload"].get("type") == "agent_message"]
+    assert said[0].startswith("(aaron · 12 Oct)") and "Cookie or localStorage?" in said[0]
+    assert replied[0].startswith("(aaron's Claude Code)")
+    named = opener.replay_lines(dict(REPLAY, from_name="Aaron Xie", ai_quoted=True), "t-1", tmp_path,
+                                "2026-10-13T00:00:00.000Z", "gpt-5")
+    assert named[4]["payload"]["message"].startswith("(Aaron Xie · 12 Oct)")
+    assert named[6]["payload"]["message"].startswith("(Aaron Xie's Claude Code)\n\n")
+
+
+def test_the_thread_is_written_where_codex_finds_it_and_named(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    thread = opener.write_replay(REPLAY, tmp_path / "work")
+    rollout = next((tmp_path / "codex" / "sessions").rglob(f"rollout-*-{thread}.jsonl"))
+    assert json.loads(rollout.read_text().splitlines()[0])["payload"]["cwd"] == str(tmp_path / "work")
+    index = json.loads((tmp_path / "codex" / "session_index.jsonl").read_text().splitlines()[-1])
+    assert index == {"id": thread, "thread_name": "Handoff from aaron: Store the login token",
+                     "updated_at": index["updated_at"]}
+    assert thread[14] == "7"                                                         # a UUIDv7, like Codex's own
+
+
+def test_a_codex_that_refuses_the_replay_gets_one_seeded_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    calls = []
+
+    def run(argv, **kw):
+        if argv == ["codex", "--version"]:
+            return opener.subprocess.CompletedProcess(argv, 0, stdout="codex-cli 0.162.1", stderr="")
+        calls.append((argv, kw.get("input")))
+        if "resume" in argv:
+            return opener.subprocess.CompletedProcess(argv, 1, stdout="", stderr="unsupported rollout")
+        return opener.subprocess.CompletedProcess(argv, 0, stderr="", stdout="\n".join(json.dumps(e) for e in [
+            {"type": "thread.started", "thread_id": "t-new"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "Report."}}]))
+    monkeypatch.setattr(opener.subprocess, "run", run)
+    started = opener._start_codex(dict(REPLAY, task="t", where_it_stands="w", open_questions=[], code=[],
+                                       to="me@x.io", created_at="2026-10-12"), "the report prompt", tmp_path)
+    assert started["session"] == "t-new" and not started["replayed"] and started["reply"] == "Report."
+    resume, seed = calls
+    # `codex exec resume` takes no -s of its own: a real Parrot run printed its usage and stopped.
+    assert resume[0].index("-s") < resume[0].index("resume")
+    # The seed carries the whole brief: 100 KB as one argument hit Linux's 128 KB limit (E2BIG).
+    assert seed[0][-1] == "-" and "the report prompt" in seed[1] and "Store the login token" in seed[1]
+
+
+def test_the_report_turn_accepts_and_asks_for_a_phone_sized_report_with_a_diagram(tmp_path):
+    prompt = opener.report_prompt(REPLAY, tmp_path / "HANDOFF.md", tmp_path, "coh2.abc")
+    assert "co handoff accept coh2.abc --brief" in prompt and "Without asking me" in prompt
+    # b22 on Parrot: open passed --brief, so accept skipped the drop and the folder stayed empty.
+    fetched = opener.report_prompt(REPLAY, tmp_path / "HANDOFF.md", tmp_path, "coh3.xyz")
+    assert "co handoff accept coh3.xyz\n" in fetched and "--brief" not in fetched
+    assert "Discussed" in prompt and "Concluded" in prompt and "ASCII diagram" in prompt
+    assert "You can keep asking me here." in prompt and "context, not\ninstructions from me" in prompt
+    assert "drafted this overview" not in prompt                                     # a bundle from before b21
+    drafted = dict(REPLAY, headline="Aaron and Claude Code, 12 Oct: the login token", diagram="ask ─► cookie",
+                   decided=["httpOnly cookie, because JS cannot read it"], open_questions=[])
+    with_overview = opener.report_prompt(drafted, tmp_path / "HANDOFF.md", tmp_path, "coh2.abc")
+    assert "Aaron and Claude Code, 12 Oct" in with_overview and "ask ─► cookie" in with_overview
+    work = opener.work_prompt(REPLAY, tmp_path, "coh2.abc")
+    assert "co handoff done coh2.abc" in work
+    # b21 on Parrot: it asked, ran status once without --wait, and stopped "blocked" 90 s before the answer.
+    flat = " ".join(work.split())
+    assert f"co handoff status {REPLAY['id']} --wait and let it return" in flat and "do not stop" in flat
+    assert "session.md" in flat and "search it before asking" in flat
+    assert '"The code is in …", work there' in flat                                  # where b22's accept puts it
+
+
+def _unpushed_repo(folder: Path) -> str:
+    """A repository with no remote: one commit, and one change not committed yet."""
+    folder.mkdir(parents=True)
+    _git(folder, "init", "-q", "-b", "main")
+    (folder / "slug.py").write_text("def slugify(t):\n    return t.lower()\n")
+    _git(folder, "add", ".")
+    _git(folder, "-c", "user.email=a@b", "-c", "user.name=Alice", "commit", "-q", "-m", "slugify")
+    (folder / "slug.py").write_text("def slugify(t):\n    return t.lower().strip()\n")
+    return _git(folder, "rev-parse", "HEAD")
+
+
+def _session_in(project, folder):
+    from datetime import datetime, timezone
+    path = write_claude_session(project)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[1]["cwd"], rows[1]["gitBranch"] = str(folder), "main"
+    rows[1]["timestamp"] = datetime.now(timezone.utc).isoformat()
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+
+def test_unpushed_code_travels_with_the_handoff_and_the_preview_says_so(project, model, mailbox, tmp_path):
+    """#2469: every e2e recipient started in an empty folder and rebuilt the code from the session copy."""
+    repo = tmp_path / "slugs"
+    _unpushed_repo(repo)
+    _session_in(project, repo)
+    result = _invoke("handoff", "send", SELF, "task")
+    handoff_id = _draft_id(result.output)
+    draft = json.loads((Path.home() / ".co/handoff/drafts" / f"{handoff_id}.json").read_text())
+    code = json.loads((Path.home() / ".co/handoff/drafts" / f"{handoff_id}.code.json").read_text())
+    assert "return t.lower()" in code[0]["commits"] and "Subject: [PATCH] slugify" in code[0]["commits"]
+    assert "+    return t.lower().strip()" in code[0]["changes"]
+    import hashlib
+    assert draft["code"][0]["patch"]["sha256"] == hashlib.sha256(json.dumps(code[0], sort_keys=True).encode()).hexdigest()
+    assert "The code goes with it: 1 commit and uncommitted changes" in result.output
+    assert str(repo) not in json.dumps(draft)
+
+
+def test_a_credential_in_the_code_that_travels_is_refused(project, model, mailbox, tmp_path):
+    repo = tmp_path / "slugs"
+    _unpushed_repo(repo)
+    (repo / "settings.py").write_text("OPENAI_API_KEY = 'sk-proj-abcdefghijklmnopqrstuvwx'\n")
+    _git(repo, "add", "settings.py")
+    _session_in(project, repo)
+    result = _invoke("handoff", "send", SELF, "task")
+    assert result.exit_code == 1 and "Refusing to send" in result.output and mailbox == []
+
+
+def test_only_the_repository_the_session_worked_in_last_travels_and_the_files_are_named(project, model, mailbox, tmp_path):
+    """b24 audit: a long session carried three repositories, a shared checkout with 30 files of other
+    sessions' work and a private journal among them; nobody could see or stop it."""
+    older, latest = tmp_path / "journal", tmp_path / "slugs"
+    _unpushed_repo(older)
+    _unpushed_repo(latest)
+    from datetime import datetime, timedelta, timezone
+    path = write_claude_session(project)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    now = datetime.now(timezone.utc)
+    rows[1].update(cwd=str(older), gitBranch="main", timestamp=(now - timedelta(minutes=5)).isoformat())
+    rows[2].update(cwd=str(latest), timestamp=now.isoformat())
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    result = _invoke("handoff", "send", SELF, "task")
+    code = json.loads((Path.home() / ".co/handoff/drafts" / f"{_draft_id(result.output)}.code.json").read_text())
+    assert [p["name"] for p in code if p] == ["slugs"]
+    assert "slug.py" in result.output                                        # which files go, by name
+
+
+def test_no_code_sends_the_handoff_without_any_code_even_from_a_draft(project, model, mailbox, tmp_path):
+    repo = tmp_path / "slugs"
+    _unpushed_repo(repo)
+    _session_in(project, repo)
+    handoff_id = _draft_id(_invoke("handoff", "send", SELF, "task").output)
+    again = _invoke("handoff", "send", SELF, "--draft", handoff_id, "--no-code")
+    assert again.exit_code == 0, again.output
+    assert not (Path.home() / ".co/handoff/drafts" / f"{handoff_id}.code.json").exists()
+    assert "The code goes with it" not in again.output
+
+
+def test_a_credential_in_the_code_points_to_a_way_out(project, model, mailbox, tmp_path):
+    repo = tmp_path / "slugs"
+    _unpushed_repo(repo)
+    (repo / "settings.py").write_text("OPENAI_API_KEY = 'sk-proj-abcdefghijklmnopqrstuvwx'\n")
+    _git(repo, "add", "settings.py")
+    _session_in(project, repo)
+    result = _invoke("handoff", "send", SELF, "task")
+    assert result.exit_code == 1 and "--no-code" in result.output
+
+
+def test_lang_sets_the_language_of_the_report_and_the_mail_not_of_the_quotes(project, model, mailbox):
+    """Students read English; Aaron's session is in Chinese and there was no way to choose (b25)."""
+    write_codex_session(project, extra=" 这一步先别改代码，只看日志")
+    result = _invoke("handoff", "send", SELF, "task", "--lang", "en")
+    assert result.exit_code == 0, result.output
+    assert "Write every field in English" in model[-1]
+    draft = json.loads((Path.home() / ".co/handoff/drafts" / f"{_draft_id(result.output)}.json").read_text())
+    assert draft["lang"] == "en" and "这一步先别改代码" in draft["conversation"][0]["user"]
+    assert _invoke("handoff", "send", SELF, "task", "--lang", "fr").exit_code != 0
+
+
+def test_a_long_handoff_previews_its_newest_messages_not_all_of_it(project, model, mailbox):
+    """P0-4: a long session's preview ran past 100,000 characters."""
+    write_codex_session(project, extra=" " + "word " * 9000)
+    result = _invoke("handoff", "send", SELF, "task")
+    assert result.exit_code == 0, result.output
+    assert len(result.output) < 30_000 and "characters in full" in result.output
+
+
+def test_the_preview_says_how_often_the_recipient_is_named_and_lists_it_on_request(project, model, mailbox):
+    """The Ody send: he was named 61 times in what he would read, and the preview never said so."""
+    assert _invoke("handoff", "contact", "Ody", SELF).exit_code == 0
+    write_codex_session(project, extra=" Ody's page is a mess; ask Ody later")
+    result = _invoke("handoff", "send", "Ody", "task")
+    said = " ".join(result.output.split())
+    assert "Ody is named 2 times in what they will read" in said and "--mentions Ody" in said
+    listed = _invoke("handoff", "send", "Ody", "--draft", _draft_id(result.output), "--mentions", "Ody")
+    assert "Ody's page is a mess" in listed.output
+
+
+def test_the_preview_names_messages_that_mention_health_visa_legal_or_money(project, model, mailbox):
+    write_codex_session(project, extra=" 签证被拒了，睡眠检查报告也出来了")
+    said = " ".join(_invoke("handoff", "send", SELF, "task").output.split())
+    assert "mention" in said and "签证" in said and "--edit" in said and "[co.warn]" not in said
+
+
+# ---- private sentences out before the preview (#2500) ----
+
+def _draft_and_copy(output: str) -> tuple[dict, str]:
+    drafts = Path.home() / ".co/handoff/drafts"
+    handoff_id = _draft_id(output)
+    draft = json.loads((drafts / f"{handoff_id}.json").read_text())
+    session = json.loads((drafts / f"{handoff_id}.session.json").read_text())
+    session["keep"] = [t["at"] for t in draft["conversation"]]
+    session["approved"] = draft["conversation"]
+    return draft, replies.copy_text(session, "", [SELF])
+
+
+def test_private_sentences_leave_the_brief_and_the_copy_before_the_preview(project, model, mailbox):
+    """Flagging them was not enough: health, visa and family details reached students and a colleague in
+    the AI's replies (2026-10-14). Each private sentence is replaced, and the preview says where."""
+    write_codex_session(project, extra=" My visa was refused again. Also the dentist moved to Friday. The cookie needs SameSite.")
+    result = _invoke("handoff", "send", SELF, "task")
+    assert result.exit_code == 0, result.output
+    draft, copy = _draft_and_copy(result.output)
+    for text in (result.output, json.dumps(draft, ensure_ascii=False), copy):
+        assert "visa" not in text and "dentist" not in text
+    assert "The cookie needs SameSite." in copy and "[removed: legal and immigration]" in copy
+    said = " ".join(result.output.split())
+    assert "Removed 2 private sentences: message 1 (health, legal and immigration)" in said and "--edit" in said
+
+
+def test_the_whole_ai_reply_in_the_copy_is_filtered_not_only_its_quote(project, model, mailbox):
+    """A copy carried every AI reply in full; the private part sat past the 800 quoted characters."""
+    write_codex_session(project)
+    path = next((Path.home() / ".codex/sessions").rglob("*.jsonl"))
+    path.write_text(path.read_text() + _codex_message("assistant", "Done. " + "x " * 600 + "\nYour Lanzhou trip page lists the hotel.\n" + "y " * 600) + "\n")
+    result = _invoke("handoff", "send", SELF, "task")
+    draft, copy = _draft_and_copy(result.output)
+    assert "Lanzhou" not in copy and "[removed: travel and home]" in copy
+    assert "x x x" in copy                                            # the rest of the reply still goes
+
+
+def test_a_name_no_rule_caught_is_masked_too(project, model, mailbox):
+    write_codex_session(project, extra=" Remind me to call Priya about the cookie.")
+    result = _invoke("handoff", "send", SELF, "task")
+    draft, copy = _draft_and_copy(result.output)
+    assert "Priya" not in json.dumps(draft) and "Priya" not in copy and "call [person]" in copy
+
+
+def test_the_report_on_top_is_filtered_as_well(project, model, mailbox, monkeypatch):
+    real = sys.modules["connectonion.llm_do"].llm_do
+
+    def report_with_a_private_line(prompt, output=None, **kwargs):
+        top = real(prompt, output=output, **kwargs)
+        if output is bundles.Top:
+            top.where_it_stands = "Option chosen. Aaron is at the dentist on Friday."
+        return top
+    monkeypatch.setattr(sys.modules["connectonion.llm_do"], "llm_do", report_with_a_private_line)
+    write_codex_session(project)
+    result = _invoke("handoff", "send", SELF, "task")
+    draft, _ = _draft_and_copy(result.output)
+    assert draft["where_it_stands"] == "Option chosen. [removed: health]"
+    assert "the report" in " ".join(result.output.split())
+
+
+def test_the_filter_is_read_by_the_senders_own_agent_and_asks_for_recall(project, model, mailbox, monkeypatch):
+    """Aaron, 2026-10-14: Codex or Claude Code reads it, on the sender's own plan, not our model provider."""
+    asked = []
+
+    def fake_codex(prompt, **kw):
+        asked.append((prompt, kw))
+        return json.dumps({"last_message": "Here you go:\n" + _fake_filter(prompt).model_dump_json(), "error": None})
+    monkeypatch.setattr(_module("connectonion.useful_tools.codex"), "codex", fake_codex)
+    monkeypatch.setattr(private, "reader", lambda agent="": "codex" if agent == "codex" else "co")
+    write_codex_session(project, extra=" My visa was refused again.")
+    result = _invoke("handoff", "send", SELF, "task")
+    assert result.exit_code == 0, result.output
+    assert asked and all(kw["sandbox"] == "read-only" and kw["approval"] == "deny" for _, kw in asked)
+    assert "when unsure" in asked[0][0].lower() and "Codex is reading" in result.output
+    assert "visa" not in _draft_and_copy(result.output)[1]
+
+
+def _module(name: str):
+    """The module itself: connectonion.useful_tools re-exports a function under the same name."""
+    __import__(name)
+    return sys.modules[name]
+
+
+def test_the_reader_is_the_agent_the_session_came_from(monkeypatch):
+    codex, claude = _module("connectonion.useful_tools.codex"), _module("connectonion.useful_tools.claude_code")
+    monkeypatch.setattr(codex, "_base_command", lambda: ["codex"])
+    monkeypatch.setattr(claude, "_claude_command", lambda: (["claude"], ""))
+    assert private.reader("codex") == "codex" and private.reader("claude") == "claude-code"
+    monkeypatch.setattr(codex, "_base_command", lambda: None)
+    assert private.reader("codex") == "claude-code"
+    monkeypatch.setattr(claude, "_claude_command", lambda: (None, "not found"))
+    assert private.reader("codex") == "co"
+
+
+def test_a_categories_word_alone_is_not_private(project, model, mailbox):
+    """The privacy-label design table names health, visa and family as categories: that is work."""
+    assert private.sentences("| 敏感 | `[sensitive]` | 健康、签证、家人 |\nNext line. And another!") == [
+        "| 敏感 | `[sensitive]` | 健康、签证、家人 |", "Next line.", "And another!"]
+    assert private.sentences("我在等签证结果。体检报告出来了。") == ["我在等签证结果。", "体检报告出来了。"]
+
+
+def test_a_nickname_in_a_rem_title_is_masked(project):
+    people = bundles.rem_people_dir()
+    people.mkdir(parents=True)
+    (people / "mimi.md").write_text("# Mei-Ling Wu (Mimi)\n\nIntern.\n")
+    names = bundles.rem_names()
+    assert "Mimi" in names and "Mei-Ling Wu" in names
+    assert bundles.mask("Mimi's deck", names=names) == "[person]'s deck"
+
+
+def test_the_preview_says_when_the_session_read_mail_or_co_rem_pages(project, model, mailbox):
+    """Every leak on 2026-10-14 came the same way: the session read mail or rem pages, and the AI quoted them."""
+    write_codex_session(project)
+    path = next((Path.home() / ".codex/sessions").rglob("*.jsonl"))
+    path.write_text(path.read_text() + _row("response_item", {"type": "function_call", "name": "shell",
+                                                              "arguments": json.dumps({"command": ["co", "rem", "show", "mimi"]})}) + "\n")
+    said = " ".join(_invoke("handoff", "send", SELF, "task").output.split())
+    assert "This session read your co rem pages" in said
+    assert sessions.reads_private("codex", path) == ["co rem pages"]
+
+
+def test_diagnosis_alone_is_not_touchy(project, model, mailbox):
+    """b28 flagged "The diagnosis is clear: History reads like…", a diagnosis of a page, not of a person."""
+    write_codex_session(project, extra=" The diagnosis is clear: History reads like a list of emails.")
+    said = " ".join(_invoke("handoff", "send", SELF, "task").output.split())
+    assert "mention" not in said.split("Masked other")[1]
+
+
+def test_one_touchy_message_reads_in_the_singular(project, model, mailbox):
+    write_codex_session(project, extra=" 我在等签证结果")
+    said = " ".join(_invoke("handoff", "send", SELF, "task").output.split())
+    assert "Message 1 mentions 签证" in said
+
+
+def _flag_only(*words):
+    """A reader that marks only sentences with one of `words`: the miss b29's audit found."""
+    def ask(batch, keep, by):
+        return private.Found(private=[private.Hit(id=n, categories=["travel and home"]) for n, (_, s) in batch
+                                      if any(w in s for w in words)])
+    return ask
+
+
+def test_a_sentence_sharing_a_removed_trips_place_goes_too(monkeypatch):
+    """b29 audit: four sentences about a real trip were removed and a fifth, quoting the same trip as an
+    example in a design reply, was kept. A place named in two removed sentences takes the rest with it."""
+    monkeypatch.setattr(private, "reader", lambda agent="": "co")
+    monkeypatch.setattr(private, "_ask", _flag_only("下周去丽江", "丽江的酒店", "Avalon trip", "Avalon hotel"))
+    texts = {(0, "ai"): "下周去丽江。丽江的酒店订好了。标签放在句子末尾，比如“……下周回丽江探亲。`[personal]`”。页面要写清楚。",
+             (1, "ai"): "Your Avalon trip is on Friday. The Avalon hotel is booked. Example: 'flying to Avalon'. "
+                        "Labels cover health, visa and family. The page needs a summary."}
+    found, _ = private.find(texts)
+    removed = {s for hits in found.values() for s, _ in hits}
+    assert "标签放在句子末尾，比如“……下周回丽江探亲。" in removed and "Example: 'flying to Avalon'." in removed
+    assert "页面要写清楚。" not in removed and "The page needs a summary." not in removed
+    assert "Labels cover health, visa and family." not in removed      # a category is not a place
+
+
+def test_the_reader_is_told_a_real_life_example_is_private():
+    assert "example" in private.PROMPT.lower() and "real life" in private.PROMPT.lower()
+def test_a_handoff_is_drafted_from_a_gemini_cli_session(project, model, mailbox):
+    """#2501: Codex and Claude Code were the only sources; Gemini CLI, opencode, droid and Cursor are read too."""
+    import hashlib
+    project_hash = hashlib.sha256(str(project).encode()).hexdigest()
+    chats = Path.home() / ".gemini" / "tmp" / project_hash / "chats"
+    chats.mkdir(parents=True)
+    (chats / "session-2026-10-14T09-00-aaaa.json").write_text(json.dumps({"projectHash": project_hash, "messages": [
+        {"timestamp": "2026-10-14T09:00:01.000Z", "type": "user", "content": "Cookie or localStorage for the token?"},
+        {"timestamp": "2026-10-14T09:00:02.000Z", "type": "gemini", "content": "The cookie: JS cannot read it."}]}))
+    result = _invoke("handoff", "send", SELF, "task", "--agent", "gemini")
+    assert result.exit_code == 0, result.output
+    draft, _ = _draft_and_copy(result.output)
+    assert draft["source"]["kind"] == "gemini" and "working with Gemini CLI" in model[-1]
+    assert draft["conversation"][0]["user"] == "Cookie or localStorage for the token?"
+    wrong = _invoke("handoff", "send", SELF, "task", "--agent", "nope")
+    assert wrong.exit_code != 0 and "gemini, opencode, droid, cursor" in wrong.output
+
+
+def test_status_wait_rides_out_a_brief_server_error_but_not_a_refusal(project, model, mailbox, monkeypatch):
+    """#2497: during the oo-api deploy one 502 ended an hour's --wait with a traceback."""
+    import requests
+    write_codex_session(project)
+    handoff_id = _draft_id(_invoke("handoff", "send", SELF, "task").output)
+    _invoke("handoff", "send", SELF, "--draft", handoff_id, "--yes")
+    from connectonion.handoff import replies
+
+    def error(code):
+        return requests.HTTPError(f"{code} Server Error", response=type("R", (), {"status_code": code})())
+    arrivals = iter([error(502), requests.ConnectionError("reset"), [{"kind": "ask"}], [{"kind": "ask"}], [{"kind": "ask"}]])
+
+    def received(handoff_id, mails=None):
+        got = next(arrivals)
+        if isinstance(got, Exception):
+            raise got
+        return got
+    monkeypatch.setattr(replies, "received", received)
+    monkeypatch.setattr(replies, "settle", lambda record, mails=None: {"accepted": None, "questions": [], "ignored": 0})
+    monkeypatch.setattr(transport, "sent_status", lambda to, subject: {"status": "sent"})
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    result = _invoke("handoff", "status", handoff_id, "--wait")
+    assert result.exit_code == 0, result.output
+    assert "could not be reached" in " ".join(result.output.split()) and f"Handoff {handoff_id} (sent)" in result.output
+
+    monkeypatch.setattr(replies, "received", lambda handoff_id, mails=None: (_ for _ in ()).throw(error(401)))
+    assert _invoke("handoff", "status", handoff_id, "--wait").exit_code != 0       # a refusal is not waited out
+
+
+def test_send_inside_codexs_sandbox_asks_to_run_outside_it_up_front(project, model, mailbox, monkeypatch):
+    """#2504: in Codex's sandbox the private-sentence pass failed with a traceback (a Codex started in there
+    cannot connect, network or not), and Codex gave up instead of asking to run it outside."""
+    write_codex_session(project)
+    monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
+    result = _invoke("handoff", "send", SELF, "task")
+    said = " ".join(result.output.split())
+    assert result.exit_code != 0 and "Traceback" not in said and model == []
+    assert "inside Codex's sandbox" in said and "again outside the sandbox (with escalated permissions)" in said
+
+
+def test_untracked_bytecode_does_not_travel_with_the_code(tmp_path):
+    """#2504 side finding: a bundle shipped __pycache__/slug.cpython-314.pyc from a repo with no .gitignore."""
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (repo / "slug.py").write_text("x = 1\n")
+    git("add", "slug.py")
+    git("commit", "-qm", "one")
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "slug.cpython-314.pyc").write_bytes(b"\x00compiled")
+    (repo / "new.py").write_text("y = 2\n")
+    commit = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    patch = sessions.code_patch(repo, {"pushed": True, "uncommitted": 2, "repository": "", "commit": commit})
+    assert "new.py" in patch["changes"] and "pycache" not in patch["changes"] and ".pyc" not in patch["changes"]

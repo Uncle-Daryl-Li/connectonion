@@ -118,6 +118,7 @@ NEXT = {
     "co onenote source sync": "co onenote source pages --help",
     # -- top level --
     "co ai": HANDLER,                 # the answer is the output
+    "co approvals": "co approvals --who <address> shows one requester",
     "co announce": "Give subscribers the address they follow:  co keys",
     "co auth": HANDLER,               # every path ends "Next: co status" / "co outlook inbox"
     "co browser": HANDLER,            # rotating tip on stderr; `import` names its own go_to check; exits by raise
@@ -128,6 +129,7 @@ NEXT = {
     "co copy": HANDLER,               # "co copy --list" after a copy; --list ends with usage
     "co create": HANDLER,             # "co deploy" after the resources block
     "co deploy": HANDLER,             # cloud: "co status"; --to: the journalctl line
+    "co host": HANDLER,               # runs until stopped; agent.py's banner is the output, or exits by raise
     "co doctor": HANDLER,             # "run 'co auth'" only when not authenticated
     "co benchmark list": HANDLER,     # empty: the schema and "check"; else "check <first invalid>"
     "co benchmark check": HANDLER,    # valid: "co eval run <name> ..."; invalid: "check <name>" again
@@ -234,9 +236,13 @@ NEXT = {
     "co handoff inbox": HANDLER,
     "co handoff show": HANDLER,
     "co handoff open": HANDLER,
+    "co handoff thread": HANDLER,      # ends with how to open the thread it wrote
+    "co handoff follow": "co handoff status <id>",
     "co handoff accept": HANDLER,
     "co handoff ask": HANDLER,
     "co handoff answer": HANDLER,
+    "co handoff withdraw": "co handoff status <id>",
+    "co handoff done": HANDLER,
     "co env *": HANDLER,  # path/get intentionally remain bare values
     "co schedule list": "co schedule run <name>",
     "co schedule check": "co schedule list",

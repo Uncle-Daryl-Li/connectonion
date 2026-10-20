@@ -42,7 +42,11 @@ def default_config() -> dict:
     # tokens on the user's Claude plan. Codex wrote 312 of 312 pages on the same
     # mailbox. A machine without a working Codex gets Claude Code (first_runner).
     # Saved configs keep their runner.
-    return {"version": 1, "runner": "codex", "model": "gpt-6-luna",
+    # language: what a page's prose is written in, a BCP 47 tag (en, zh, zh-TW, ja).
+    # Headings, Facts labels and markers stay English: code reads them.
+    # languages: the languages the owner reads, first in the reader's "Read in"
+    # menu; empty means the ones detected from the owner's own words (languages.py).
+    return {"version": 1, "runner": "codex", "model": "gpt-6-luna", "speed": "fast", "language": "en", "languages": [],
             "schedule": {"times": ["03:00", "04:00", "06:00", "17:00", "18:00", "19:00"],
                          "timezone": local_timezone()},
             # input_chars_per_batch bounds the source messages plus every notebook page
@@ -67,16 +71,33 @@ def default_config() -> dict:
             # chunk is read through the same 600-second turn, and at 300k a Codex
             # turn reading it piece by piece timed out on 2026-09-23 (Dora, 39
             # mails with attachments) while every 200k investigate turn finished.
-            "limits": {"runner_calls_per_day": 50, "items_per_batch": 20,
+            "limits": {"runner_calls_per_day": 50, "translations_per_day": 10, "items_per_batch": 20,
                        "input_chars_per_batch": 200000, "timeout_seconds": 1200,
                        "extract_items_per_batch": 40, "extract_chars_per_batch": 150000,
+                       # Pages at once for init's first run and investigate CATEGORY;
+                       # --workers overrides one run. Measured 2026-10-20 (Codex, fast):
+                       # 4/8/12/16 workers wrote ~30/38/61/63 pages an hour with no
+                       # failures and no 429s; a model round slowed only 430s -> 530s.
+                       # 48 (2026-10-09) slowed each turn 2.5x for no more pages than 16.
+                       "workers": 16,
                        # Points of the Codex weekly window (#1843): investigation's
                        # budget, and the level past which it starts nothing so the
                        # owner's own coding keeps the rest of the week.
                        "investigation_quota_points": 35, "quota_floor_percent": 90,
+                       # Deepening's share of the Codex week, separate from investigation's
+                       # 35; the owner agreed 30% on #2533.
+                       "depth_quota_points": 30,
+                       # Pages one scheduled slot deepens; a round is about 25 minutes.
+                       "depth_pages_per_slot": 2,
+                       # 2026-10-20: rounds take about 25 minutes; stop starting pages
+                       # after an hour so a slow slot does not run into the next.
+                       "depth_slot_minutes": 60,
                        # A page whose evidence is more than one turn can hold is read in
                        # rounds, each part whole, then one synthesis turn (#2314).
                        "investigation_rounds": 8}}
+
+
+LANGUAGE = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*")
 
 
 def validate(config: dict) -> dict:
@@ -85,6 +106,13 @@ def validate(config: dict) -> dict:
         raise RemError("Invalid co rem config keys or version")
     if config["runner"] not in RUNNERS or not isinstance(config["model"], str) or not config["model"].strip():
         raise RemError(f"runner must be one of {', '.join(RUNNERS)}, with a model name or default")
+    if config["speed"] not in ("fast", "standard"):
+        raise RemError("speed must be fast or standard")
+    if not isinstance(config["language"], str) or not LANGUAGE.fullmatch(config["language"]):
+        raise RemError("language must be a language tag such as en, zh, zh-TW or ja")
+    if (not isinstance(config["languages"], list)
+            or any(not isinstance(tag, str) or not LANGUAGE.fullmatch(tag) for tag in config["languages"])):
+        raise RemError("languages must be language tags separated by commas, such as zh,en")
     schedule, limits = config["schedule"], config["limits"]
     if not isinstance(schedule, dict) or set(schedule) != {"times", "timezone"}:
         raise RemError("Schedule requires times and timezone")
@@ -100,8 +128,10 @@ def validate(config: dict) -> dict:
         raise RemError("Invalid limit keys")
     if any(type(value) is not int or value < 1 for value in limits.values()):
         raise RemError("Limits must be positive integers")
-    if limits["quota_floor_percent"] > 100 or limits["investigation_quota_points"] > 100:
-        raise RemError("quota_floor_percent and investigation_quota_points are percents: 1 to 100")
+    if limits["workers"] > 32:
+        raise RemError("workers must be 1 to 32")
+    if any(limits[key] > 100 for key in ("quota_floor_percent", "investigation_quota_points", "depth_quota_points")):
+        raise RemError("quota_floor_percent, investigation_quota_points and depth_quota_points are percents: 1 to 100")
     return config
 
 
@@ -144,6 +174,9 @@ def read_config(root: Path, *, validated: bool = True) -> dict:
     # not rewritten until the user changes something.
     if isinstance(config.get("limits"), dict):
         config["limits"] = {**default_config()["limits"], **config["limits"]}
+    config.setdefault("language", "en")
+    config.setdefault("languages", [])
+    config.setdefault("speed", "fast")
     _drop_superseded(root, config)
     # Older coai notebooks retained the Codex default even though it was never
     # forwarded. Preserve their effective behavior when all stages start using COAI.
@@ -203,12 +236,14 @@ def set_config(root: Path, pairs: list[str]) -> dict:
                 target = config.get(parts[0])
                 if not isinstance(target, dict):
                     raise RemError("Invalid nested configuration; preserve config.yaml for diagnosis")
-            elif len(parts) != 1 or key not in ("model", "runner"):
-                raise RemError(f"{key}: " "not a setting; the keys are model, runner, schedule.times, schedule.timezone, limits.<name> and route.<stage> (see `co rem config`)")
+            elif len(parts) != 1 or key not in ("model", "runner", "speed", "language", "languages"):
+                raise RemError(f"{key}: " "not a setting; the keys are model, runner, speed, language, languages, schedule.times, schedule.timezone, limits.<name> and route.<stage> (see `co rem config`)")
             if parts[-1] not in target:
-                raise RemError(f"{key}: " "not a setting; the keys are model, runner, schedule.times, schedule.timezone, limits.<name> and route.<stage> (see `co rem config`)")
+                raise RemError(f"{key}: " "not a setting; the keys are model, runner, speed, language, languages, schedule.times, schedule.timezone, limits.<name> and route.<stage> (see `co rem config`)")
             if key == "schedule.times":
                 value = sorted(raw.split(","))
+            elif key == "languages":
+                value = [tag.strip() for tag in raw.split(",") if tag.strip()]
             elif parts[0] == "limits":
                 try:
                     value = int(raw)

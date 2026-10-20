@@ -116,8 +116,9 @@ def test_mapped_stubs_keep_explicit_links_without_inventing_prose_relationships(
     assert {link["path"] for link in relationships(records)["people/mara.md"]} == {"orgs/fernhill.md"}
 
 
-def test_relationship_basis_keeps_privacy_after_its_text_is_clipped():
-    text = 'Mara Ostrowski discussed confidential background ' + 'detail ' * 40 + '[sensitive] [1].'
+@pytest.mark.parametrize("label", ["[sensitive]", "［sensitive］", "[personal]", "［personal］"])
+def test_relationship_basis_keeps_privacy_after_its_text_is_clipped(label):
+    text = 'Mara Ostrowski discussed confidential background ' + 'detail ' * 40 + label + ' [1].'
     records = [
         {"path": "people/mara.md", "category": "people", "title": "Mara Ostrowski", "text": "# Mara"},
         {"path": "projects/harbour.md", "category": "projects", "title": "Harbour", "text": text},
@@ -125,7 +126,7 @@ def test_relationship_basis_keeps_privacy_after_its_text_is_clipped():
     links = relationships(records)
     forward = links['projects/harbour.md'][0]
     reverse = links['people/mara.md'][0]
-    assert '[sensitive]' not in forward['basis']
+    assert label not in forward['basis']
     assert forward['private'] and reverse['private']
     records[1]['text'] = 'Mara Ostrowski discussed the public pilot [1].'
     assert not relationships(records)['projects/harbour.md'][0]['private']
@@ -231,6 +232,74 @@ def test_project_source_dialog_carries_the_mapped_session_folder(tmp_path, monke
     assert context['mapped_session_folder'] == '/work/gtm'
 
 
+def test_cited_github_original_is_openable_without_rem_db(tmp_path):
+    import hashlib
+    from connectonion.rem.files import read_json, state_path
+    from connectonion.rem.investigate import retain_cited_github
+    from connectonion.rem.reader_model import cited_context
+
+    source, created_at = 'github:openonion/connectonion#2346', '2026-10-12T00:00:00Z'
+    page = '# Jiexuan\n\nIssue body [1].\n\n## Sources\n- [1] ' + source + ' — 2026-10-12\n'
+    item = {'role': 'github', 'source': source, 'text': ' Issue body ', 'timestamp': created_at}
+    ignored = [
+        {**item, 'source': 'github:openonion/connectonion#1886'},
+        {**item, 'source': 'outlook:123456789abc'},
+        {**item, 'source': source + '/invalid'},
+        {**item, 'source': 'github:openonion/connectonion#2145', 'role': 'other'},
+        {**item, 'source': 'github:openonion/connectonion#2146', 'text': None},
+    ]
+    cited = {source, *(row['source'] for row in ignored[1:])}
+    retain_cited_github(tmp_path, [item, *ignored], cited)
+    path = state_path(tmp_path, 'github-sources/' + hashlib.sha256(source.encode()).hexdigest() + '.json')
+    assert list(path.parent.iterdir()) == [path]
+    assert read_json(path, {}) == {key: item[key] for key in ('source', 'text', 'timestamp')}
+    assert not state_path(tmp_path, 'rem.db').exists()
+    assert cited_context(tmp_path, [{'text': page}])[source] == {
+        'excerpt': 'Issue body', 'truncated': False, 'time': created_at,
+        'sender': '', 'thread': '', 'source': 'github', 'input_scope': ''}
+
+    retain_cited_github(tmp_path, [{**item, 'text': 'Updated issue body\n' + 'x' * 40_000}], {source})
+    context = cited_context(tmp_path, [{'text': page}])[source]
+    assert context['excerpt'].startswith('Updated issue body')
+    assert len(context['excerpt']) == 40_000 and context['truncated'] is True
+    assert context['time'] == created_at
+
+
+@pytest.mark.parametrize('saved', [{'source': 'github:other/repo#1', 'text': 'Wrong issue'},
+                                  {'source': 'github:openonion/connectonion#2346', 'text': None}])
+def test_github_context_rejects_mismatched_or_nontext_originals(tmp_path, saved):
+    import hashlib
+    from connectonion.rem.files import state_path, write_json
+    from connectonion.rem.investigate import github_context
+
+    source = 'github:openonion/connectonion#2346'
+    path = state_path(tmp_path, 'github-sources/' + hashlib.sha256(source.encode()).hexdigest() + '.json')
+    write_json(path, saved)
+    assert github_context(tmp_path, source) is None
+    assert github_context(tmp_path, source + '/invalid') is None
+
+
+@pytest.mark.parametrize('save_path', ['accepted_page', 'claim_audit'])
+def test_github_original_is_retained_by_page_save_and_claim_audit(tmp_path, save_path):
+    from connectonion.rem.config import prepare
+    from connectonion.rem.files import Notebook
+    from connectonion.rem.project_claim_review import retain_cited_originals
+    from connectonion.rem.reader_model import cited_context
+    from connectonion.rem.runner import _write_page
+
+    prepare(tmp_path)
+    notebook = Notebook(tmp_path)
+    source = 'github:openonion/connectonion#2346'
+    page = '# Jiexuan\n\nIssue body [1].\n\n## Sources\n- [1] ' + source + ' — 2026-10-12\n'
+    items = [{'role': 'github', 'source': source, 'text': 'Issue body', 'timestamp': '2026-10-12T00:00:00Z'}]
+    if save_path == 'accepted_page':
+        _write_page(notebook, 'people/jiexuan.md', page, items)
+        page = notebook.read('people/jiexuan.md')
+    else:
+        retain_cited_originals(notebook, page, items)
+    assert cited_context(tmp_path, [{'text': page}])[source]['excerpt'] == 'Issue body'
+
+
 def test_hashed_mail_citations_resolve_native_provider_ids_without_migrating_them(tmp_path):
     import hashlib
     from connectonion.rem.config import prepare
@@ -332,3 +401,21 @@ def test_mail_citation_rejects_mismatched_snapshot_identity(tmp_path, saved_prov
     refresh(tmp_path)
     source = 'outlook:' + hashlib.sha256(b'native').hexdigest()[:12]
     assert cited_context(tmp_path, [{'text': '## Sources\n- [1] ' + source}]) == {}
+
+
+def test_claim_rewordings_set_aside_source_qualifications_and_added_words():
+    from connectonion.rem.claim_changes import _same
+    unchanged = [
+        ("ConnectOnion Python project", "ConnectOnion Python project (README and manifest)"),
+        ("2026-10-14", "2026-10-14 (user input and release commit)"),
+        ("Stable 1.9.2 in the supplied README and manifest", "Stable 1.9.2 (README and manifest)"),
+        ("Stable 1.9.2 per the manifest", "Stable 1.9.2"),
+        ("Stable 1.9.2 according to README", "Stable 1.9.2"),
+        ("ConnectOnion project", "The ConnectOnion Python project"),
+        ("Partnerships Lead", "partnerships-lead"),
+    ]
+    for old, new in unchanged:
+        assert _same(old, new), (old, new)
+    for old, new in [("Stable 1.9.1", "Stable 1.9.2"), ("waiting on Weiwei", "waiting on you"),
+                     ("Python project", "project Python"), ("waiting waiting", "waiting")]:
+        assert not _same(old, new), (old, new)

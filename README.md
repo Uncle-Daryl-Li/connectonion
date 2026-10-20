@@ -113,12 +113,23 @@ through your work.
 <a href="https://docs.connectonion.com/rem/demo">
   <picture>
     <source media="(max-width: 600px)" srcset="docs/assets/rem-readme/reader-phone.png">
-    <img src="docs/assets/rem-readme/reader-desktop.png" alt="co rem morning overview: a changed role, its supporting source, and notebook navigation" width="960">
+    <img src="docs/assets/rem-readme/reader-desktop.png" alt="co rem morning brief: one verified change overnight, one thing due soon, and the three most important open threads" width="960">
   </picture>
 </a>
 
-*The 1.9.0a20 reader with invented example data. The linked sample is a frozen
+*The reader's morning brief with invented example data. The linked sample is a frozen
 notebook you can explore without connecting an account.*
+
+<details>
+<summary>More of the reader: English and 中文, desktop and phone, light and dark</summary>
+
+| | |
+|---|---|
+| <img src="docs/assets/rem-readme/tour-en-person-dark-desktop.png" alt="A person's page in dark mode: what is owed in each direction and the facts with their sources" width="480"> | <img src="docs/assets/rem-readme/tour-zh-home-desktop.png" alt="The morning brief with the Chinese interface and cached Chinese page text" width="480"> |
+| <img src="docs/assets/rem-readme/tour-en-people-desktop.png" alt="The People table: one line per person with what is open, company and last contact" width="480"> | <img src="docs/assets/rem-readme/tour-en-open-phone-dark.png" alt="Open threads on a phone in dark mode, each with Copy prompt and Mark done" width="240"> <img src="docs/assets/rem-readme/tour-zh-person-phone.png" alt="A person's page on a phone in Chinese" width="240"> |
+
+Captured with `python scripts/capture_rem_reader.py --readme docs/assets/rem-readme`.
+</details>
 
 - **Connect scattered context.** Bring mail and coding sessions into linked
   pages about the people, projects and skills involved.
@@ -127,14 +138,14 @@ notebook you can explore without connecting an account.*
 - **Keep context in your hands.** Local Markdown pages can be read by you and
   your agents. An approved schedule keeps them current.
 
-### Try co rem · 1.9.1
+### Try co rem · 1.9.2
 
 Start with [the setup guide](https://docs.connectonion.com/rem#start)
 for account setup, source choices and model costs. Daily scheduling currently
 requires **macOS**. Then run:
 
 ```bash
-pip install --upgrade 'connectonion==1.9.1'
+pip install --upgrade 'connectonion==1.9.2'
 # build your map and first pages; approve nightly upkeep when prompted
 co rem init
 # read the local notebook
@@ -312,9 +323,18 @@ Codex ([`co skills`](docs/cli/skills.md)).
 ConnectOnion is also a Python framework for building your own agents on the
 same harness; see the [documentation](https://docs.connectonion.com).
 
+### Hand a session to someone · 1.9.2
+
+Say "hand this to Bob" in Codex or Claude Code. You see exactly what would
+leave your machine, with private sentences already taken out by your own agent;
+Bob pastes one line into his agent, which picks up where yours stopped and sends
+the result back as a patch. Neither side gets more than the handoff. See
+[openonion/handoff](https://github.com/openonion/handoff) and
+[the guide](docs/cli/handoff.md).
+
 ## Project
 
-**Stable 1.9.1** is what `pip install connectonion` installs; previews
+**Stable 1.9.2** is what `pip install connectonion` installs; previews
 remain opt-in ([release channels](docs/releases.md),
 [release notes](https://github.com/openonion/connectonion/releases)).
 Questions go to [Discussions](https://github.com/openonion/connectonion/discussions)

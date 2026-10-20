@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -18,6 +19,7 @@ from .facts import FIELDS
 # Person-page labels the roster reads back. Contact lines are skipped when
 # looking for the opening line: "Phone: Unknown" is not who somebody is.
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+DOMAIN_HANDLE = re.compile(r"^@?([a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,})$")
 ALIAS_LABELS = ("also known as:", "aka:", "别名:", "别名：")
 CITATION = re.compile(r"\s*\[W?\d+\]")
 
@@ -44,7 +46,7 @@ CONTACT_LABELS = ALIAS_LABELS + EMAIL_LABELS + (
     "电话:", "电话：", "公司:", "公司：")
 
 CATEGORIES = ("people", "orgs", "projects", "skills", "knowledge", "opportunities",
-              "decisions", "principles", "works", "agenda", "notes", "logs")
+              "decisions", "principles", "works", "agenda", "sessions", "notes", "logs")
 MAX_NOTE_BYTES = 1_000_000
 # The map's default window. 90 days left out people the owner works with every
 # season but had not written to this quarter; the owner chose 180 (2026-10-08).
@@ -178,19 +180,43 @@ def maintenance_lock(root: Path, wait: float = 0):
         _THREADS.release()
 
 
+def _try_lock(fd: int) -> None:
+    """Take the cross-process lock, raising BlockingIOError while it is held.
+
+    POSIX uses ``fcntl.flock``, Windows ``msvcrt.locking``. msvcrt reports a
+    busy lock as a plain ``OSError`` (EACCES/EDEADLK) rather than
+    ``BlockingIOError``, so translate those for the retry loop below.
+    """
+    if os.name == "nt":
+        import msvcrt
+        # msvcrt.locking needs at least one byte to lock, and the lock file is
+        # otherwise never written to. seek(0) keeps lock and unlock on the same
+        # byte (same shape as network/host/schedule.py).
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EDEADLK):
+                raise BlockingIOError(*error.args) from error
+            raise
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
 @contextmanager
 def _file_lock(root: Path, wait: float):
     """The lock other processes see: a scheduled tick, a second terminal."""
-    import fcntl
-
     path = state_path(root, "maintenance.lock")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     deadline = time.monotonic() + wait
     try:
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _try_lock(fd)
                 break
             except BlockingIOError as error:
                 if time.monotonic() >= deadline:
@@ -221,6 +247,25 @@ def _warn_skipped(record: str, why: str) -> None:
 def _today() -> str:
     from datetime import date
     return date.today().isoformat()
+
+
+def _latest_passes(parts: list[str]) -> str:
+    """Compact only dated pass segments; leave unfamiliar footer metadata intact."""
+    kept, slots, dates = [], {}, {}
+    for part in parts:
+        if not part or part in ("not investigated yet", "Requested investigation window") or part.startswith("Requested investigation window:"):
+            continue
+        match = re.fullmatch(r"(mapped|written|investigated|enriched) (\d{4}-\d{2}-\d{2})(?: \(.*\))?", part)
+        if not match:
+            kept.append(part)
+            continue
+        verb, day = match.groups()
+        if verb not in slots:
+            slots[verb] = len(kept)
+            kept.append(part)
+        if day >= dates.get(verb, ""):
+            kept[slots[verb]], dates[verb] = part, day
+    return " · ".join(kept)
 
 
 class Notebook:
@@ -352,10 +397,12 @@ class Notebook:
                   f"Investigation: mapped {_today()} · not investigated yet", ""]
         return self.write(record, "\n".join(lines))
 
+    # The first screen answers what, why, where it stands and what is next;
+    # reference detail follows (the owner, 2026-10-15: "like an ordinary memory").
     PROJECT_SECTIONS = (
-        "What it is", "Overview", "Try it", "Where it stands", "Latest issues",
-        "People and ownership", "Getting started", "Why it exists", "Key decisions",
-        "How it is built", "Architecture map", "Paths", "Open threads", "Uncertainties",
+        "What it is", "Why it exists", "Where it stands", "Open threads", "Latest issues",
+        "Key decisions", "Overview", "Try it", "People and ownership", "Getting started",
+        "How it is built", "Architecture map", "Paths", "Uncertainties",
     )
 
     def stub_project(self, record: str, name: str, paths=(), **known) -> bool:
@@ -401,11 +448,10 @@ class Notebook:
         return self.write(record, "\n".join(lines))
 
     def unfinished(self, category: str = "") -> list[dict]:
-        """Pages still carrying an Unknown section, least-investigated first.
+        """Pages carrying Unknowns, uninvestigated first, then most Unknowns.
 
-        The page is its own work list: nothing else has to remember what is
-        left to find out. Ordered so the next daily run picks the page that has
-        had the least attention, not the one that happens to sort first.
+        The footer is a status summary. Its investigated_passes value counts
+        visible stamps, not lifetime runs; the queue uses the latest pass date.
         """
         found = []
         for record in self.list(category):
@@ -420,23 +466,22 @@ class Notebook:
         return sorted(found, key=lambda entry: (entry["investigated_passes"], -entry["unknown"], entry["path"]))
 
     def note_pass(self, record: str, verb: str, what: str) -> None:
-        """Append one pass to the page's own status line: `<verb> <date> (<what>)`.
+        """Keep the latest dated pass of each kind in the runner-owned footer.
 
-        Investigation and enrichment are separate passes with separate verbs --
-        `investigated 2026-09-13 (outlook, gmail, codex)` then `enriched
-        2026-09-13 (web)` -- so the line reads as the page's history and the
-        daily run can see which stage a page has not had yet.
+        This is a status summary, not a lifetime pass count or run history.
+        Full run records remain separate from the page's sourced content.
         """
         text = self.read(record)
         lines = text.splitlines()
         stamp = f"{verb} {_today()} ({what})"
         for i, line in enumerate(lines):
             if line.startswith("Investigation:"):
-                lines[i] = line.replace(" · not investigated yet", "") + f" · {stamp}"
+                parts = line.removeprefix("Investigation:").strip().split(" · ")
+                lines[i] = "Investigation: " + _latest_passes([*parts, stamp])
                 break
         else:
             lines += ["", f"Investigation: {stamp}"]
-        self.write(record, "\n".join(lines) + ("\n" if not text.endswith("\n") else ""))
+        self.write(record, "\n".join(lines) + "\n")
 
     def note_investigation(self, record: str, what: str) -> None:
         self.note_pass(record, "investigated", what)

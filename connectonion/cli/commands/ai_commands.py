@@ -18,7 +18,6 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
-from rich.markup import escape
 
 from ...core.usage import DEFAULT_MODEL
 from ..co_ai import harness as _harness
@@ -39,10 +38,12 @@ def handle_ai(
     invite_code: str = None,
     invite_code_file: Path = None,
     listen: list | None = None,
+    launch: bool = True,
     harness: str = _harness.OURS,
     sandbox: str = _harness.DEFAULT_SANDBOX,
     permission_mode: str = "default",
     timeout: int = 600,
+    speed: str | None = None,
 ):
     """Start AI coding agent or run one-shot prompt.
 
@@ -63,6 +64,7 @@ def handle_ai(
         sandbox: What a delegated Codex run may write: read-only,
             workspace-write (cwd + TMPDIR), or danger-full-access
         permission_mode: Claude Code's headless permission mode; default is manual
+        speed: Codex tier: fast selects priority; standard leaves the user's default
 
     Examples:
         co ai                                    # Start web server
@@ -86,8 +88,16 @@ def handle_ai(
 
     if harness != _harness.OURS or harness not in _harness.HARNESSES:
         _handle_delegated(harness, prompt, model, json_output, sandbox, timeout,
-                          permission_mode)
+                          permission_mode, speed, resume)
         return
+
+    problem = _harness.validate_speed(harness, speed)
+    if problem:
+        if json_output:
+            _print_envelope(None, None, "error", problem)
+        else:
+            console.print(f"[red]{problem}[/red]")
+        raise typer.Exit(2)
 
     if permission_mode != "default":
         console.print("[red]--permission-mode applies only to --harness claude-code.[/red]")
@@ -139,7 +149,6 @@ def handle_ai(
     if prompt:
         _handle_plain_one_shot(agent, prompt)
     else:
-        _start_listening(channels, agent_factory, model, max_iterations, full_access_turns)
         from ..co_ai.main import start_server
         start_server(
             agent,
@@ -150,6 +159,8 @@ def handle_ai(
             full_access_turns=full_access_turns,
             agent_factory=agent_factory,
             invite_code=runtime_invite_code,
+            launch=launch,
+            listen=channels,   # the Host answers them, as it does for python agent.py (#2439)
         )
 
 
@@ -171,14 +182,15 @@ def _this_co_first() -> None:
 
 
 def _handle_delegated(harness, prompt, model, json_output, sandbox, timeout=600,
-                      permission_mode="default") -> None:
+                      permission_mode="default", speed=None, resume=None) -> None:
     """Hand the whole task to a native coding agent, spending none of our tokens.
 
     This is the point of the flag: reaching Codex used to cost a full turn of
     our own model first, purely to have it decide to call the codex tool.
     """
     problem = (_harness.validate(harness, model) or _harness.validate_sandbox(harness, sandbox)
-               or _harness.validate_permission(harness, permission_mode))
+               or _harness.validate_permission(harness, permission_mode)
+               or _harness.validate_speed(harness, speed))
     if not problem and not prompt:
         # There is no web server to hand over: a delegate answers one task and exits.
         problem = f"--harness {harness} needs a one-shot prompt."
@@ -193,7 +205,7 @@ def _handle_delegated(harness, prompt, model, json_output, sandbox, timeout=600,
         # An unset --model means "your default", not ours, which names nothing
         # in the delegate's catalogue.
         answer = _harness.run(harness, prompt, model or "", sandbox=sandbox, timeout=timeout,
-                              permission_mode=permission_mode)
+                              permission_mode=permission_mode, speed=speed or "standard", session_id=resume or "")
     except ValueError as exc:  # skill missing, or its requirements are not met
         if json_output:
             _print_envelope(None, None, "error", str(exc))
@@ -229,32 +241,6 @@ def _channels(override):
         # them, right up until somebody wonders why the bot is ignoring them.
         console.print(f"[red]{error}[/red]")
         raise typer.Exit(2)
-
-
-def _start_listening(channels, agent_factory, model, max_iterations, full_access_turns) -> None:
-    """Answer those channels in the background.
-
-    Chat gets an agent of its own rather than the web server's: a message from
-    a group and a question typed in the browser are two conversations, and one
-    Agent object holds one history.
-    """
-    import threading
-
-    if not channels:
-        return
-
-    from ..co_ai.listen import listen as consume
-
-    def build():
-        return agent_factory(model, max_iterations, False, full_access_turns)
-
-    def say(line: str) -> None:
-        # Not markup: a listener's reason can contain [brackets].
-        console.print(f"[yellow]{escape(line)}[/yellow]", soft_wrap=True, highlight=False)
-
-    threading.Thread(target=consume, args=(channels, build), kwargs={"say": say},
-                     daemon=True, name="co-ai-listen").start()
-    console.print(f"[dim]answering {', '.join(c.provider for c in channels)}[/dim]")
 
 
 def _read_runtime_invite_code(invite_code, invite_code_file) -> str | None:

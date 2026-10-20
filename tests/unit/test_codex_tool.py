@@ -62,7 +62,9 @@ class FakeServer:
         model="",
         approval_policy="on-request",
         timeout=60,
+        speed="standard",
     ):
+        self.speed = speed
         self.calls.append(("start_thread", sandbox, model, approval_policy))
         return "thread-1"
 
@@ -73,7 +75,9 @@ class FakeServer:
         model="",
         approval_policy="on-request",
         timeout=60,
+        speed="standard",
     ):
+        self.speed = speed
         self.calls.append(
             ("resume_thread", thread_id, sandbox, model, approval_policy)
         )
@@ -137,6 +141,23 @@ def _run(**kwargs):
 
 
 class TestCodexRun:
+    @pytest.mark.parametrize("speed", ["fast", "standard"])
+    @pytest.mark.parametrize("session_id", ["", "existing-thread"])
+    def test_speed_reaches_new_and_resumed_threads(self, speed, session_id):
+        result = _run(prompt="inspect", speed=speed, session_id=session_id, approval="auto")
+        assert result["exit_code"] == 0
+        assert FakeServer.last.speed == speed
+
+    def test_speed_change_reopens_an_open_only_thread(self):
+        opened = _run(prompt="", speed="standard", approval="auto")
+        previous = FakeServer.last
+        result = _run(prompt="inspect", session_id=opened["session_id"], speed="fast", approval="auto")
+        assert result["exit_code"] == 0
+        assert FakeServer.last is not previous
+        assert previous.calls[-1] == "close"
+        assert FakeServer.last.speed == "fast"
+        assert ("resume_thread", opened["session_id"], "workspace-write", "", "never") in FakeServer.last.calls
+
     def test_open_without_prompt_creates_thread_without_starting_a_turn(self):
         result = _run(prompt="", cwd=".", approval="auto", agent=_Agent(_IO()))
 
@@ -909,6 +930,22 @@ class TestResumeProtocol:
         assert popen.call_args.kwargs[group_option]
         assert thread.call_count == 2
 
+    @pytest.mark.parametrize("speed", ["fast", "standard"])
+    @pytest.mark.parametrize("resume", [False, True])
+    def test_thread_request_applies_speed(self, speed, resume):
+        client = codex_module.CodexAppServer(["codex", "app-server"], cwd="/repo")
+        with patch.object(client, "request", return_value={"thread": {"id": "thread-1"}}) as request:
+            if resume:
+                assert client.resume_thread("thread-1", speed=speed) == "thread-1"
+            else:
+                assert client.start_thread(speed=speed) == "thread-1"
+        assert request.call_args.args[0] == ("thread/resume" if resume else "thread/start")
+        params = request.call_args.args[1]
+        if speed == "fast":
+            assert params["serviceTier"] == "priority"
+        else:
+            assert "serviceTier" not in params
+
     def test_resume_request_reapplies_execution_policy(self):
         client = codex_module.CodexAppServer(["codex", "app-server"], cwd="/repo")
         with patch.object(
@@ -1193,3 +1230,42 @@ class TestTokenUsage:
         with patch.object(client, "request", return_value={}):
             client.run_turn("thread-1", "continue", timeout=10)
         assert client._token_usage == {}
+
+
+class TestActiveThreadNotifications:
+    @pytest.mark.parametrize("thread_id", ["sub", "main", None])
+    @pytest.mark.parametrize("method", ["turn/completed", "turn/failed", "item/started", "item/completed",
+                                       "thread/tokenUsage/updated"])
+    def test_only_active_or_unscoped_notifications_affect_the_turn(self, thread_id, method):
+        events = []
+        client = codex_module.CodexAppServer(["codex", "app-server"], on_event=events.append)
+        client._active_thread_id = "main"
+        client._active_turn_id = "turn-1"
+        client._token_usage = {"input_tokens": 10}
+        params = {"turn": {"status": "completed"},
+                  "item": {"type": "agentMessage", "text": "Verdict"},
+                  "tokenUsage": {"total": {"inputTokens": 25}}}
+        if thread_id is not None:
+            params["threadId"] = thread_id
+        client._handle_notification(method, params)
+
+        accepted = thread_id != "sub"
+        assert client._turn_done.is_set() == (accepted and method in ("turn/completed", "turn/failed"))
+        assert events == ([{"kind": "agent_message", "id": "", "text": "Verdict"}]
+                          if accepted and method.startswith("item/") else [])
+        assert client._token_usage == {"input_tokens": 25 if accepted and method == "thread/tokenUsage/updated" else 10}
+        if not accepted:
+            assert client._turn_result == {} and client._active_turn_id == "turn-1"
+
+    def test_thread_is_active_before_the_turn_start_response(self):
+        client = codex_module.CodexAppServer(["codex", "app-server"])
+
+        def start(*args, **kwargs):
+            assert client._active_thread_id == "main"
+            client._handle_notification("turn/completed", {"threadId": "sub", "turn": {"status": "interrupted"}})
+            assert not client._turn_done.is_set()
+            client._handle_notification("turn/completed", {"threadId": "main", "turn": {"status": "completed"}})
+            return {}
+
+        with patch.object(client, "request", side_effect=start):
+            assert client.run_turn("main", "Review", timeout=1) == {"status": "completed"}

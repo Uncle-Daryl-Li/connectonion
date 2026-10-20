@@ -454,3 +454,82 @@ def test_rems_own_claude_code_task_sessions_are_not_the_users_material(tmp_path)
                              ("user", "Alice prefers email.", {})])
     sub = {**subscription(tmp_path), "kind": "claude-code"}
     assert [i["text"] for i in collect(sub, {}, 10, 10000).items] == ["Alice prefers email."]
+
+
+def test_a_prompt_a_scheduler_sent_is_not_the_users_request(tmp_path):
+    """A launchd job's `claude -p` prompt became the user's request on
+    projects/layeredvisions (2026-10-14). The user types into `entrypoint: cli`."""
+    file = tmp_path / "-Users-me-LayeredVisions" / "abc.jsonl"
+    claude_transcript(file, [
+        ("user", "The user explicitly authorized a campaign of weekly LinkedIn articles. Schedule exactly one.",
+         {"entrypoint": "sdk-cli", "promptSource": "sdk"}),
+        ("user", "Schedule the ASML piece for January.", {"entrypoint": "cli", "promptSource": "typed"}),
+    ])
+    batch = collect({**subscription(tmp_path), "kind": "claude-code"}, {}, 10, 100000)
+    assert [i["text"] for i in batch.items] == ["Schedule the ASML piece for January."]
+    assert batch.skipped == 1 and batch.unrecognised == 0
+
+
+WINDOWS_TASKS = [
+    r"C:\Users\demo\.co\rem\.state\tasks\model-access",
+    r"C:\Users\demo\.co\rem\.state\tasks",
+    r"C:/Users/demo/.co/rem/.state\tasks/investigate-one",
+    r"C:\Users\demo\.co\rem\.STATE\TASKS\repair",
+    r"\\server\notebooks\rem\.state\tasks\repair",
+]
+
+
+@pytest.mark.parametrize("cwd", WINDOWS_TASKS)
+def test_windows_internal_codex_tasks_do_not_become_memory(tmp_path, cwd):
+    rollout(tmp_path / "rollout-internal.jsonl", [("user", "Reply READY only")],
+            originator="connectonion", project=cwd)
+    rollout(tmp_path / "rollout-user.jsonl", [("user", "Ship the login fix")],
+            originator="connectonion", project=r"C:\work\demo")
+    assert [item["text"] for item in collect(subscription(tmp_path), {}, 20, 10000).items] == ["Ship the login fix"]
+
+
+@pytest.mark.parametrize("cwd", WINDOWS_TASKS)
+def test_windows_internal_claude_rows_do_not_become_memory(tmp_path, cwd):
+    claude_transcript(tmp_path / "project" / "session.jsonl", [
+        ("user", "Repair this candidate page", {"cwd": cwd}),
+        ("user", "Keep the user request", {"cwd": r"C:\work\demo"}),
+    ])
+    batch = collect({**subscription(tmp_path), "kind": "claude-code"}, {}, 20, 10000)
+    assert [item["text"] for item in batch.items] == ["Keep the user request"]
+
+
+@pytest.mark.parametrize("cwd", [r"C:\work\.state\taskshop", r"C:\work\tasks", "/work/.STATE/TASKS"])
+def test_similar_user_directories_are_not_rem_tasks(cwd):
+    from connectonion.rem.source import rem_task
+    assert not rem_task(cwd)
+
+
+def test_a_skipped_session_is_recorded_and_never_reopened(tmp_path, monkeypatch):
+    """2026-10-20: 11,473 of REM's own Codex turns were reopened on every scan."""
+    from connectonion.rem import source
+    rem_turn = tmp_path / "2026/09/07/rollout-rem.jsonl"
+    rollout(rem_turn, [("user", "a REM turn")], project="/work/.state/tasks/investigate-x")
+    rollout(tmp_path / "2026/09/07/rollout-mine.jsonl", [("user", "Use SQL")])
+    first = collect(subscription(tmp_path), {}, 20, 10000)
+    assert [i["text"] for i in first.items] == ["Use SQL"]
+    assert first.progress["2026/09/07/rollout-rem.jsonl"]["skipped"] is True
+    opened = []
+    real = source._read_rollout
+    monkeypatch.setattr(source, "_read_rollout", lambda path, *a: opened.append(path.name) or real(path, *a))
+    rollout(rem_turn, [("user", "a REM turn"), ("user", "still REM")], project="/work/.state/tasks/investigate-x")
+    again = collect(subscription(tmp_path), first.progress, 20, 10000)
+    assert opened == [] and not again.items
+    assert again.progress == first.progress   # a growing REM turn is not new progress
+
+
+def test_source_files_still_refuses_hidden_and_linked_rollouts(tmp_path):
+    from connectonion.rem.source import source_files
+    rollout(tmp_path / "2026/09/07/rollout-a.jsonl", [("user", "x")])
+    assert [p.name for p in source_files(subscription(tmp_path))] == ["rollout-a.jsonl"]
+    (tmp_path / "2026/09/07/rollout-link.jsonl").symlink_to(tmp_path / "2026/09/07/rollout-a.jsonl")
+    with pytest.raises(RemError, match="Symlinks"):
+        source_files(subscription(tmp_path))
+    (tmp_path / "2026/09/07/rollout-link.jsonl").unlink()
+    rollout(tmp_path / ".hidden/rollout-b.jsonl", [("user", "x")])
+    with pytest.raises(RemError, match="Hidden"):
+        source_files(subscription(tmp_path))

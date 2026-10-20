@@ -14,8 +14,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from google.auth.exceptions import GoogleAuthError
+from googleapiclient.errors import HttpError
+from httplib2 import HttpLib2Error
+from httpx import RequestError
+
+from ..provider_credentials import ProviderCredentialError
+
 from .config import prepare, read_config, validate
-from .files import Notebook, RemError, maintenance_lock, read_json, state_path, write_json
+from .files import WRITE_WAIT_SECONDS, Notebook, RemError, maintenance_lock, read_json, state_path, write_json
 from .mail import collect_mail
 from .mail_archive import archive_state, resume_stalled
 from .chat import CHAT_KINDS, chat_home, collect_chat
@@ -112,7 +119,7 @@ def subscribe_read_mail(root: Path, kinds) -> list[str]:
     mailbox the user unsubscribed stays unsubscribed.
     """
     changed = []
-    with maintenance_lock(root):
+    with maintenance_lock(root, wait=WRITE_WAIT_SECONDS):
         sources = subscriptions(root)
         for kind in kinds:
             source = sources.get(kind)
@@ -126,8 +133,8 @@ def subscribe_read_mail(root: Path, kinds) -> list[str]:
 
 
 def approve_sources(root: Path) -> None:
-    """Internal consent handoff for tests/future start; never called by inspection."""
-    with maintenance_lock(root):
+    """Record approved sources and the source/schedule summary; never called by inspection."""
+    with maintenance_lock(root, wait=WRITE_WAIT_SECONDS):
         prepare(root)
         validate(read_config(root))
         sources = subscriptions(root)
@@ -516,7 +523,8 @@ def _quota_status(config: dict, logs: list[dict]) -> dict:
     spent = quota.points_spent(logs, meter)
     limits = config["limits"]
     if "unknown" in meter:
-        week = f"unknown ({meter['unknown']}); the daily call cap is the only bound"
+        # Short: status lines stay within 80 columns, and the page's one Next names the root.
+        week = "unknown; pages still run, within the daily call cap"
     else:
         zone = ZoneInfo(config["schedule"]["timezone"]) if config["schedule"]["timezone"] else timezone.utc
         resets = datetime.fromtimestamp(meter["resets_at"], zone).strftime("%a %d %b %H:%M")
@@ -587,17 +595,8 @@ def consent_summary(root: Path) -> dict:
                           "asleep runs once on wake); co rem stop removes it"}
 
 
-def start(root: Path, *, confirm, scheduler, runner=None, run_first_batch: bool = True) -> dict:
-    """Prepare what is missing, confirm access once, install the clock, run the first batch.
-
-    `confirm` receives the summary and returns True to proceed. Declining leaves
-    every source body unread and installs nothing. A repeated start re-applies
-    the schedule but does not ask again and does not repeat the initial batch.
-    """
-    root = root.resolve()
-    with maintenance_lock(root):
-        prepare(root)
-        validate(read_config(root))
+def ensure_consent(root: Path, *, confirm) -> bool:
+    """The same source and schedule approval before init's map and start's batch."""
     first = not state_path(root, "consent.json").is_file()
     # A source subscribed after the first start -- a mailbox, a WhatsApp chat --
     # has not been agreed to. Asking only the first time meant it could never be
@@ -615,9 +614,26 @@ def start(root: Path, *, confirm, scheduler, runner=None, run_first_batch: bool 
                              or agreed.get("summary") != summary_fingerprint(root))
     if first or waiting or changed:
         if not confirm(consent_summary(root)):
-            return {"started": False, "consented": False, "first_batch": None}
+            return False
         subscribe_read_mail(root, offered)
         approve_sources(root)
+    return True
+
+
+def start(root: Path, *, confirm, scheduler, runner=None, run_first_batch: bool = True) -> dict:
+    """Prepare what is missing, confirm access once, install the clock, run the first batch.
+
+    `confirm` receives the summary and returns True to proceed. Declining leaves
+    every source body unread and installs nothing. A repeated start re-applies
+    the schedule but does not ask again and does not repeat the initial batch.
+    """
+    root = root.resolve()
+    with maintenance_lock(root, wait=WRITE_WAIT_SECONDS):
+        prepare(root)
+        validate(read_config(root))
+    first = not state_path(root, "consent.json").is_file()
+    if not ensure_consent(root, confirm=confirm):
+        return {"started": False, "consented": False, "first_batch": None}
     # The first batch runs before the clock is installed: loading a launchd job
     # fires its run-at-load batch immediately, and two batches would race for the
     # notebook lock, with the one the user is watching likely to lose.
@@ -667,6 +683,27 @@ def _selected_sources(root: Path, selector: str) -> dict:
 PAGES_PER_BATCH = 5
 
 
+def _hold_for_refused(root: Path, result: dict, items: list[dict]) -> None:
+    from .refusals import forget_refusal, material_sources, remember_refusal
+    sources = material_sources(items)
+    for row in result.get("refusals", []):
+        remember_refusal(root, row["record"], sources, "; ".join(row["errors"]), stage="maintain", material=items)
+    for page in result.get("changed", []):
+        forget_refusal(root, page, sources)
+
+
+def _rotated(selected: dict, last: str) -> dict:
+    """The sources in order, starting after the one the last batch read.
+
+    A batch reads one source, the first with anything new, and Codex always
+    had 40 items: in 26 syncs claude-code, gmail and outlook were never read
+    and had no cursor, while Codex worked through a two-month backlog
+    (2026-10-10..15)."""
+    names = list(selected)
+    start = names.index(last) + 1 if last in names else 0
+    return {name: selected[name] for name in names[start:] + names[:start]}
+
+
 def _maintain_pages(root: Path, items: list[dict], config: dict, kind: str, leads: list[str],
                     say=None) -> dict:
     """Update each page the material concerns in its own turn, and keep going when one fails.
@@ -675,33 +712,45 @@ def _maintain_pages(root: Path, items: list[dict], config: dict, kind: str, lead
     minutes deciding and rewriting, and timed out with nothing saved -- twice,
     on the same real batch. A page per turn is small enough to finish, and a
     refusal costs that page, not the batch.
+
+    Caller holds the maintenance lock.
     """
+    from .daily import outcome_line
+    from .leads import remember_no_change
+    from .page_review import shrinkage
     from .runner import RunFailed, run_stage
     notebook = Notebook(root)
     usage, changed, refusals, reviews, sizes, growth = {}, [], [], [], [], {}
     say = say or (lambda text: None)
+    material = [item for item in items if item.get("role") != "page"]
     for record in leads:
+        before = notebook.read(record)
         page_items = [{"role": "page", "record": record, "source": "investigation:page", "one_page": True,
                        "timestamp": now().isoformat(),
                        "text": f"The page as it stands, at {record}. Add what the material says about its "
-                               f"subject; keep what is right:\n\n{notebook.read(record)}"}, *items]
+                               f"subject; keep what is right. Cite only source ids that are on this page or in "
+                               f"the material; never make one up:\n\n{before}"}, *material]
         try:
             result = run_stage(notebook, page_items, config, kind=kind, stage="maintain", maintenance_lock_held=True)
+        except RunFailed as error:
+            result = {"usage": error.usage, "refused": str(error)}
+        shrunk = shrinkage(before, notebook.read(record)) if record in result.get("changed", []) else ""
+        if shrunk:
+            notebook.write(record, before)
+            result = {"usage": result.get("usage"), "refused": f"Candidate rejected: {shrunk}"}
+        if result.get("refused"):
+            refusals.append({"record": record, "errors": [result["refused"][:400]]})
+        else:
             changed += result.get("changed", [])
             reviews += result.get("review_candidates", [])
             sizes += [result["instructions_chars"]] if result.get("instructions_chars") else []
             if result.get("page_chars"):
                 growth[record] = result["page_chars"]
-            part = result.get("usage")
-        except RunFailed as error:
-            refusals.append({"record": record, "errors": [str(error)[:400]]})
-            part = getattr(error, "usage", None)
+            remember_no_change(root, record, record not in changed)
         # Each page's outcome as it finishes; it was only in the dump at the end (#2044).
-        from .daily import outcome_line
-        say(outcome_line({"page": record, "outcome": "refused", "why": refusals[-1]["errors"][0]}
-                         if refusals and refusals[-1]["record"] == record else
-                         {"page": record, "outcome": "accepted" if record in changed else "nothing_new"}))
-        for key, value in (part or {}).items():
+        say(outcome_line({"page": record, "outcome": "refused", "why": result["refused"]} if result.get("refused")
+                         else {"page": record, "outcome": "accepted" if record in changed else "nothing_new"}))
+        for key, value in (result.get("usage") or {}).items():
             usage[key] = usage.get(key, 0) + value
     return {"usage": usage or None, "changed": sorted(set(changed)), "refused": len(refusals),
             "refusals": refusals, "report": f"{len(leads)} pages worked one at a time",
@@ -797,7 +846,11 @@ def run_sync(root: Path, *, source: str = "", with_person: str = "", dry_run: bo
         return record
     if not state_path(root, "consent.json").is_file():
         raise RemError("Source access is not authorized yet; run `co rem start` to review and confirm it")
+    from .sessions import import_sessions
+    # Inside the sync's own lock: waiting for it here made a second sync sit for
+    # the write wait and then run, instead of saying at once that co rem is busy.
     with maintenance_lock(root), _terminate_as_interrupt():
+        sessions = import_sessions(root, consented_only=True, lock_held=True)
         config = validate(read_config(root))
         abandon_stale_runs(root)
         # An upgraded notebook is tidied by its first sync, before anything reads it (#1999).
@@ -809,7 +862,9 @@ def run_sync(root: Path, *, source: str = "", with_person: str = "", dry_run: bo
             raise RemError("Invalid source progress; preserve it for diagnosis")
         record = _sync_locked(root, selected, progress, config, runner, extractor,
                               with_person=with_person, include_local=not source, say=say)
-        archive = _resume_archive(root, say) if isinstance(record, dict) else None
+        record = {**record, "sessions": sessions}
+        archive = (_resume_archive(root, say) if isinstance(record, dict)
+                   and not record.get("failed_source") else None)
         record = {**record, "mail_archive": archive} if archive else record
         if isinstance(record, dict):
             # The index the table and thread views read (#2067): after everything this
@@ -863,6 +918,23 @@ def _terminate_as_interrupt():
         signal.signal(signal.SIGTERM, previous)
 
 
+
+def _collection_failure(root: Path, config: dict, name: str, started: datetime, error: Exception) -> dict:
+    """A source that cannot be read is a failed pass, even before a model starts."""
+    finished = now()
+    record = {"id": "run_" + uuid.uuid4().hex, "started_at": started.isoformat(),
+              "finished_at": finished.isoformat(), "seconds": round((finished - started).total_seconds(), 2),
+              "harness": config["runner"], "model": config["model"], "speed": config["speed"],
+              "phase": "sync", "stage": "gathering sources",
+              "sources": [name], "failed_source": name, "items": 0, "runner_attempts": 0,
+              "outcome": "failed", "usage": None, "changed": [], "progress_advanced": False,
+              "error": str(error) if isinstance(error, (RemError, ProviderCredentialError)) else
+                       f"Source collection failed ({type(error).__name__}); source progress preserved; inspect the source and retry",
+              "warning": "", "usage_by_stage": {}, "items_by_source": {}}
+    write_json(state_path(root, f"runs/{record['id']}.json"), record)
+    return record
+
+
 def _sync_locked(root, selected, progress, config, runner, extractor=None, *,
                  with_person="", include_local=True, say=None):
     from .extract import NOTHING, extraction_instructions, extraction_item, run_extract
@@ -901,20 +973,32 @@ def _sync_locked(root, selected, progress, config, runner, extractor=None, *,
         if items:
             counts["local_material"] = len(items)
             updated["rem_local_material"] = sorted(set(processed) | seen)
-    for name, subscription in selected.items():
+    for name, subscription in _rotated(selected, progress.get("rem_last_source", "")).items():
         if items:
             break
         if len(items) >= max_items or remaining <= 0:
             break
-        if subscription.get("kind") in MAIL_KINDS:
-            batch = collect_mail(subscription, progress.get(name, {}), max_items - len(items),
-                                 remaining, mail_client(subscription["kind"]), only=with_person)
-        elif with_person:
-            continue  # a person is a mail concept; a coding session has no correspondent
-        elif subscription.get("kind") in CHAT_KINDS:
-            batch = collect_chat(subscription, progress.get(name, {}), max_items - len(items), remaining)
-        else:
-            batch = collect(subscription, progress.get(name, {}), max_items - len(items), remaining)
+        gathering_started = now()
+        try:
+            if subscription.get("kind") in MAIL_KINDS:
+                try:
+                    client = mail_client(subscription["kind"])
+                except ProviderCredentialError:
+                    raise  # Already sanitized, with the provider's recovery command.
+                except ValueError as error:
+                    provider = "google" if subscription["kind"] == "gmail" else "microsoft"
+                    raise RemError(f"Mailbox configuration could not be loaded; run `co auth {provider}`") from error
+                batch = collect_mail(subscription, progress.get(name, {}), max_items - len(items),
+                                     remaining, client, only=with_person)
+            elif with_person:
+                continue  # a person is a mail concept; a coding session has no correspondent
+            elif subscription.get("kind") in CHAT_KINDS:
+                batch = collect_chat(subscription, progress.get(name, {}), max_items - len(items), remaining)
+            else:
+                batch = collect(subscription, progress.get(name, {}), max_items - len(items), remaining)
+        except (RemError, OSError, UnicodeError, ProviderCredentialError, RequestError,
+                HttpError, GoogleAuthError, HttpLib2Error) as error:
+            return _collection_failure(root, config, name, gathering_started, error)
         source_skips.extend({"source": name, "file": path, "reason": "processed prefix changed"}
                             for path in batch.changed_files)
         if getattr(batch, "unreadable", False):
@@ -933,11 +1017,13 @@ def _sync_locked(root, selected, progress, config, runner, extractor=None, *,
         # next source; nothing is skipped, only separated.
         if items:
             kind = subscription.get("kind", name)
+            updated["rem_last_source"] = name
             break
     if seen:
         updated["rem_seen_source_ids"] = sorted(set(progress.get("rem_seen_source_ids", [])) | seen)
     record = {"id": "run_" + uuid.uuid4().hex, "started_at": now().isoformat(),
-              "model": config["model"], "sources": list(selected), "items": len(items),
+              "harness": config["runner"], "model": config["model"], "speed": config["speed"],
+              "sources": list(selected), "items": len(items),
               "runner_attempts": 0, "outcome": "no_change", "usage": None, "changed": [], "refused": 0,
               "extracted": len(items) > limits["items_per_batch"],
               # Where the tokens went, kept raw so the cost of a stage, a source or a
@@ -968,16 +1054,20 @@ def _sync_locked(root, selected, progress, config, runner, extractor=None, *,
     # the model updates one at a time. A fake runner in tests keeps the single
     # whole-notebook call. A page that has already read what points at it gets
     # no call at all (#1846).
-    leads, current = [], []
+    leads, current, passed = [], [], []
     if runner is None or runner is run_stage:
-        from .leads import nothing_new, page_leads
+        from .leads import cooling, nothing_new, page_leads, project_writer_pages
         found = page_leads(Notebook(root), items)
-        current = [lead for lead in found if nothing_new(Notebook(root), lead, items)]
-        leads = [lead for lead in found if lead not in current][:PAGES_PER_BATCH]
+        writer, resting = project_writer_pages(Notebook(root), found), cooling(root, found)
+        passed = writer + resting
+        current = [lead for lead in found if lead not in passed and nothing_new(Notebook(root), lead, items)]
+        leads = [lead for lead in found if lead not in current + passed][:PAGES_PER_BATCH]
+        record.update(**({"for_project_writer": writer} if writer else {}), **({"cooling": resting} if resting else {}))
     if current:
         record["up_to_date"] = current
-    if current and not leads:
-        record.update(outcome="completed", report="Every page this material concerns has already read it")
+    if (current or passed) and not leads:
+        record.update(outcome="completed", report="Every page this material concerns has already read it, "
+                                                  "is written by the project writer, or changed nothing a day ago")
         write_json(state_path(root, "progress.json"), updated)
         forget_digest(root)
         write_json(path, record)
@@ -1038,7 +1128,8 @@ def _sync_locked(root, selected, progress, config, runner, extractor=None, *,
             from .leads import note_leads
             named, unrouted = note_leads(Notebook(root), items[0].get("text", ""))
             spare = max(0, room - len(leads))
-            extra = [page for page in named if page not in leads and page not in current][:spare]
+            extra = [page for page in named if page not in leads + current + passed
+                     and not project_writer_pages(Notebook(root), [page])][:spare]
             if extra:
                 leads += extra
                 record["runner_attempts"] = record["runner_attempts"] + len(extra)
@@ -1069,8 +1160,12 @@ def _sync_locked(root, selected, progress, config, runner, extractor=None, *,
                       report=result.get("report", "") + (
                           f"; notes about {', '.join(record['unrouted_projects'])} matched no project page "
                           "(kept in the extract notes)" if record.get("unrouted_projects") else ""))
-        # A refused page no longer holds back the batch, but the user's own
-        # correction to that page is not marked done: it waits for the next pass.
+        # A refused page no longer holds back the batch, but its material is held
+        # for it, from every source: the cursor moves on, and browser, handoff and
+        # startup never saw theirs again (2026-10-11, 10-14). The daily round
+        # retries the page from the ledger.
+        _hold_for_refused(root, result, items)
+        # The user's own correction to that page is not marked done either: it waits for the next pass.
         refused_pages = {row["record"] for row in result.get("refusals", [])}
         waiting = {item["source"] for item in local if item.get("record") in refused_pages}
         for key in ("rem_local_material", "rem_seen_source_ids"):

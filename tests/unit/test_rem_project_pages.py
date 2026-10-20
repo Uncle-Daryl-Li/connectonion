@@ -17,7 +17,7 @@ import pytest
 import yaml
 
 from connectonion.rem import project_material, project_pages
-from connectonion.rem.config import prepare
+from connectonion.rem.config import default_config, prepare
 from connectonion.rem.files import Notebook, RemError
 from connectonion.rem.project_material import extract, mark_written, page_state, stored
 from connectonion.rem.project_pages import PROMPT_CHARS, queue, write_page, write_pages
@@ -286,7 +286,7 @@ def _fake_runner(page_from):
 
     def run(workdir, prompt, config, stage):
         calls.append(prompt)
-        candidate = Path(re.search(r"NEW file (\S+candidate\.md)", prompt)[1])
+        candidate = Path(re.search(r"(?:NEW file|existing page at) (\S+candidate\.md)", prompt)[1])
         candidate.write_text(page_from(prompt))
         return {"outcome": "natural", "result": "read 1 message", "usage": {"input_tokens": 100}}
     run.calls = calls
@@ -349,10 +349,12 @@ def test_a_page_is_written_once_from_the_material_and_the_status_line_says_so(wo
     extract(world.root, world.subs)
     source = stored(world.root, "projects/tide.md")[0]["source"]
     run = _fake_runner(lambda prompt: _page_citing(source))
-    out = write_page(world.root, "projects/tide.md", config={"runner": "codex", "model": "default"}, run=run)
+    out = write_page(world.root, "projects/tide.md", config={**default_config(), "model": "default"}, run=run)
     page = world.notebook.read("projects/tide.md")
     assert "A swell warning tool for surfers. [1]" in page
     assert re.search(r"^Investigation: .*written \d{4}-\d\d-\d\d \(own messages: codex\)$", page, re.M)
+    metrics = json.loads(next((world.root / ".state/tasks").glob("projects-*/result.json")).read_text())
+    assert (metrics["harness"], metrics["model"], metrics["speed"]) == ("codex", "default", "fast")
     assert page_state(world.root, "projects/tide.md")["written_through"] == out["through"]
     assert page_state(world.root, "projects/tide.md")["last_page_coverage"] == {
         "inputs_read": 1, "inputs_available": 1, "scope": "queued"}
@@ -370,15 +372,255 @@ def test_a_page_is_written_once_from_the_material_and_the_status_line_says_so(wo
     assert INJECTED_BLOCK.match(prompt) and not prompt.startswith("/")
 
 
+@pytest.fixture
+def atlas(tmp_path, monkeypatch):
+    root, record = tmp_path / "rem", "projects/atlas.md"
+    prepare(root)
+    notebook = Notebook(root)
+    notebook.stub_project(record, "Atlas", ["/work/atlas"])
+    sentences = ["Atlas 让团队更快找到资料。", "Keep Atlas search local.", "Please add Atlas export.",
+                 "Show the source beside each result.", "Use example.com for the demo.",
+                 "Keep the first screen simple.", "Search titles before bodies.",
+                 "Let readers open the original.", "Keep the original language.",
+                 "Save the document date.", "Group results by project.", "Keep Atlas offline."]
+    codex_root = tmp_path / "codex"
+    codex(codex_root / "rollout-atlas.jsonl", "/work/atlas",
+          [("user", text, 1 - n / 100) for n, text in enumerate(sentences)])
+    extract(root, {"codex": {"kind": "codex", "root": str(codex_root), "enabled": True}})
+    packet = project_pages.repository_snapshots([
+        {"role": "readme", "source": "file:/work/atlas/README.md", "text": "# Atlas repository packet",
+         "timestamp": NOW.isoformat()}])
+    monkeypatch.setattr(project_pages, "_repository_evidence", lambda *a, **kw: packet)
+    return types.SimpleNamespace(root=root, record=record, notebook=notebook,
+                                 messages=stored(root, record), config={**default_config(), "model": "default"})
+
+
+def _atlas_page(messages, count=3):
+    lines = ["# Atlas", "", "## What it is", "A local document search tool. [1]"]
+    for section in Notebook.PROJECT_SECTIONS:
+        if section == "What it is":
+            continue
+        lines += ["", f"## {section}"]
+        index = {"Why it exists": 0, "Key decisions": 1, "Open threads": 2}.get(section)
+        if index is not None:
+            prefix = "- 2026-10-19 — " if section == "Key decisions" else "- "
+            lines.append(f'{prefix}“{messages[index]["text"]}” [{index + 1}]')
+        elif section == "Where it stands":
+            lines += [f'- Requested: “{messages[n]["text"]}” [{n + 1}]' for n in range(3, count)]
+            if count == 3:
+                lines.append("- Unknown")
+        elif section == "Paths":
+            lines.append("- /work/atlas")
+        else:
+            lines.append("- Unknown")
+    lines += ["", "## Sources"]
+    lines += [f'- [{n + 1}] {message["source"]} — {message["timestamp"][:10]}'
+              for n, message in enumerate(messages[:count])]
+    return "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize("messages,quotes,unquoted,expected", [
+    (10, 3, False, None), (11, 3, False, (3, 0)), (12, 8, False, None),
+    (12, 9, True, (8, 1)),
+])
+def test_project_quote_floor(atlas, messages, quotes, unquoted, expected):
+    page = _atlas_page(atlas.messages, quotes)
+    if unquoted:
+        page = page.replace(f'“{atlas.messages[1]["text"]}”', atlas.messages[1]["text"])
+    assert project_pages.project_falls_short(page, messages) == expected
+
+
+def test_project_quote_floor_ignores_sources_and_fenced_examples(atlas):
+    page = _atlas_page(atlas.messages)
+    page = page.replace("## Where it stands\n", "## Where it stands\n```\n" + '“Example quote”\n' * 8 + "```\n")
+    page += '- [12] codex:atlas:12 — 2026-10-19, “Quoted source title”\n'
+    assert project_pages.project_falls_short(page, 12) == (3, 0)
+
+
+def test_project_quote_round_carries_saved_page_note_and_whole_first_write_material(atlas):
+    turns, directories, saved = [], [], []
+
+    def page_from(prompt):
+        candidate = Path(re.search(r"NEW file (\S+candidate\.md)", prompt)[1])
+        directory = candidate.parent
+        directories.append(directory)
+        turns.append(json.loads((directory / "material.json").read_text()))
+        if len(turns) == 2:
+            saved.append(atlas.notebook.read(atlas.record))
+            assert candidate.read_text() == saved[0]
+        return _atlas_page(atlas.messages, 3 if len(turns) == 1 else 9)
+
+    run = _fake_runner(page_from)
+    out = write_page(atlas.root, atlas.record, config=atlas.config, run=run)
+
+    assert len(run.calls) == 2 and directories[0] != directories[1]
+    assert any(item["role"] == "readme" for item in turns[0])
+    assert turns[1][0] == {**turns[0][0], "text": f"The page as it stands, at {atlas.record}:\n\n{saved[0]}"}
+    assert turns[1][1]["role"] == "round"
+    assert turns[1][1]["text"] == project_pages.PROJECT_QUOTE_NOTE.format(quotes=3, decisions=0)
+    assert turns[1][2:] == turns[0][1:]
+    assert turns[1][2]["role"] == "coverage"
+    assert any(item["role"] == "readme" for item in turns[1][2:])
+    assert len([item for item in turns[1] if item["role"] == "user"]) == 12
+    assert "Atlas repository packet" in run.calls[1]
+    assert "# A project's page" in run.calls[1]
+    assert project_pages._project_quote_counts(atlas.notebook.read(atlas.record)) == (9, 0)
+    assert out["quote_round"] == {"quotes": [3, 9], "unquoted_decisions": [0, 0]}
+    assert out["usage"]["input_tokens"] == 200
+    metrics = json.loads((directories[0] / "result.json").read_text())
+    assert metrics["quote_round"] == out["quote_round"]
+    assert page_state(atlas.root, atlas.record)["written_through"] == out["through"]
+    assert not list((atlas.root / ".state/tasks").glob("projects-*/material.*"))
+
+
+def test_project_page_with_enough_quotes_needs_no_quote_round(atlas):
+    run = _fake_runner(lambda prompt: _atlas_page(atlas.messages, 9))
+    out = write_page(atlas.root, atlas.record, config=atlas.config, run=run)
+    assert len(run.calls) == 1
+    assert out["quote_round"] is None
+    metrics = json.loads(next((atlas.root / ".state/tasks").glob("projects-*/result.json")).read_text())
+    assert metrics["quote_round"] is None
+
+
+def test_project_quote_round_can_repair_a_rejected_edit_once(atlas):
+    calls = []
+
+    def run(workdir, prompt, config, stage):
+        calls.append(prompt)
+        candidate = Path(re.search(r"(?:NEW file|existing page at) (\S+candidate\.md)", prompt)[1])
+        page = _atlas_page(atlas.messages, 3 if len(calls) == 1 else 9)
+        if len(calls) == 2:
+            page = page.replace(atlas.messages[0]["text"], "Invented Atlas purpose.")
+        candidate.write_text(page)
+        return {"usage": {"input_tokens": 7}}
+
+    out = write_page(atlas.root, atlas.record, config=atlas.config, run=run)
+
+    assert len(calls) == 3
+    assert "Review refused the page" in calls[2]
+    assert project_pages._project_quote_counts(atlas.notebook.read(atlas.record)) == (9, 0)
+    assert out["quote_round"] == {"quotes": [3, 9], "unquoted_decisions": [0, 0]}
+    assert out["usage"]["input_tokens"] == 21
+
+
+def test_project_quote_round_restores_dropped_quote_and_keeps_new_quotes(atlas):
+    saved = []
+
+    def page_from(prompt):
+        if not saved:
+            saved.append(_atlas_page(atlas.messages))
+            return saved[0]
+        saved.append(atlas.notebook.read(atlas.record))
+        return _atlas_page(atlas.messages, 9).replace(f'“{atlas.messages[2]["text"]}”', atlas.messages[2]["text"])
+
+    run = _fake_runner(page_from)
+    out = write_page(atlas.root, atlas.record, config=atlas.config, run=run)
+    assert len(run.calls) == 2
+    edited = atlas.notebook.read(atlas.record)
+    assert all(f'“{message["text"]}”' in edited for message in atlas.messages[:9])
+    assert out["quote_round"] == {"quotes": [3, 9], "unquoted_decisions": [0, 0]}
+    assert page_state(atlas.root, atlas.record)["written_through"] == out["through"]
+
+
+@pytest.mark.parametrize("failure,expected_calls,expected_tokens", [
+    ("run", 2, 107), ("run_without_usage", 2, 100), ("os", 2, 100),
+    ("promotion", 3, 114), ("repair", 3, 114),
+    ("cleanup", 2, 107), ("metrics", 2, 107),
+])
+def test_project_quote_round_failure_keeps_first_write_accepted(atlas, monkeypatch, failure,
+                                                               expected_calls, expected_tokens):
+    from connectonion.rem import runner
+    from connectonion.rem.runner import RunFailed
+    calls, saved = [], []
+    first = _fake_runner(lambda prompt: _atlas_page(atlas.messages))
+    if failure == "cleanup":
+        scrub = runner.scrub_task
+
+        def failing_scrub(directory):
+            scrub(directory)
+            if directory.name.startswith("projects-quotes-"):
+                raise OSError("Atlas cleanup failed")
+
+        monkeypatch.setattr(runner, "scrub_task", failing_scrub)
+    if failure == "metrics":
+        write_json = project_pages.write_json
+
+        def failing_metrics(path, value):
+            if path.parent.name.startswith("projects-quotes-"):
+                raise OSError("Atlas metrics failed")
+            write_json(path, value)
+
+        monkeypatch.setattr(project_pages, "write_json", failing_metrics)
+
+    def run(workdir, prompt, config, stage):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return first(workdir, prompt, config, stage)
+        if len(calls) == 2:
+            saved.append(atlas.notebook.read(atlas.record))
+        if failure == "os":
+            raise OSError("Atlas runner unavailable")
+        if failure == "run":
+            raise RunFailed("Atlas quote edit failed", {"input_tokens": 7})
+        if failure == "run_without_usage":
+            raise RunFailed("Atlas quote edit failed")
+        if failure == "none" or (failure == "repair_none" and len(calls) == 3):
+            return None
+        if failure == "repair" and len(calls) == 3:
+            raise RunFailed("Atlas quote repair failed", {"input_tokens": 7})
+        candidate = Path(re.search(r"(?:NEW file|existing page at) (\S+candidate\.md)", prompt)[1])
+        page = _atlas_page(atlas.messages, 9)
+        if failure == "promotion":
+            # A misquote is salvageable; a missing title actually refuses promotion.
+            page = page.removeprefix("# Atlas\n")
+        if failure in ("repair", "repair_none"):
+            page = page.replace(atlas.messages[0]["text"], "Invented Atlas purpose.")
+        candidate.write_text(page)
+        return {"usage": {"input_tokens": 7}}
+
+    out = write_page(atlas.root, atlas.record, config=atlas.config, run=run)
+    assert len(calls) == expected_calls
+    if failure == "promotion":
+        review = json.loads(next((atlas.root / ".state/tasks").glob("projects-quotes-*/review.json")).read_text())
+        assert not review["accepted"]
+        assert "Expected exactly one page title" in review["errors"]
+    assert atlas.notebook.read(atlas.record).split("\nInvestigation:")[0].rstrip() == saved[0].split("\nInvestigation:")[0].rstrip()
+    assert out["changed"] == [atlas.record]
+    assert out["quote_round"] == {"quotes": [3, 3], "unquoted_decisions": [0, 0]}
+    assert out["usage"]["input_tokens"] == expected_tokens
+    assert page_state(atlas.root, atlas.record)["written_through"] == out["through"]
+
+
+def test_project_quote_round_that_shrinks_the_page_restores_the_first_page(atlas):
+    saved = []
+    detail = (atlas.messages[0]["text"] + " ") * 80 + "[1]\n"
+
+    def page_from(prompt):
+        if not saved:
+            saved.append(_atlas_page(atlas.messages).replace("## Why it exists\n", "## Why it exists\n" + detail))
+            return saved[0]
+        saved.append(atlas.notebook.read(atlas.record))
+        return _atlas_page(atlas.messages, 9)
+
+    run = _fake_runner(page_from)
+    out = write_page(atlas.root, atlas.record, config=atlas.config, run=run)
+    assert len(run.calls) == 2
+    assert atlas.notebook.read(atlas.record).split("\nInvestigation:")[0].rstrip() == saved[1].split("\nInvestigation:")[0].rstrip()
+    assert out["quote_round"] == {"quotes": [3, 3], "unquoted_decisions": [0, 0]}
+
+
 def test_a_refused_page_leaves_its_messages_pending(world):
     codex(world.codex / "2026/09/20/rollout-a.jsonl", "/work/tide", [("user", "Tide warns surfers.", 1)])
     extract(world.root, world.subs)
     before = world.notebook.read("projects/tide.md")
     run = _fake_runner(lambda prompt: _page_citing("codex:made-up:1"))
     with pytest.raises(RemError, match="rejected"):
-        write_page(world.root, "projects/tide.md", config={"runner": "codex", "model": "default"}, run=run)
+        write_page(world.root, "projects/tide.md", config={**default_config(), "model": "default"}, run=run)
     assert world.notebook.read("projects/tide.md") == before
     assert page_state(world.root, "projects/tide.md")["written_through"] == ""
+    # In the one refusal ledger too, which nothing else wrote for the project writer (2026-10-15 audit).
+    from connectonion.rem.refusals import refused_for
+    assert refused_for(world.root, "projects/tide.md")["stage"] == "projects"
     # #2026: refused for this material, it waits for newer messages instead of
     # being retried with the same ones on every sync (~260k tokens, 0 changes).
     assert "projects/tide.md" not in [r["record"] for r in queue(world.root)]
@@ -533,11 +775,11 @@ def test_only_an_accepted_project_keeps_its_cited_repository_packet(world, monke
     source = project_pages.repository_snapshots([item])[0]["source"]
     run = _fake_runner(lambda prompt: _page_citing(source if accepted else "codex:made-up:1"))
     if accepted:
-        write_page(world.root, "projects/tide.md", config={"runner": "codex", "model": "default"}, run=run)
+        write_page(world.root, "projects/tide.md", config={**default_config(), "model": "default"}, run=run)
         assert project_pages.repository_context(world.root, source)["excerpt"] == item["text"]
     else:
         with pytest.raises(RemError, match="rejected"):
-            write_page(world.root, "projects/tide.md", config={"runner": "codex", "model": "default"}, run=run)
+            write_page(world.root, "projects/tide.md", config={**default_config(), "model": "default"}, run=run)
         assert not list((world.root / ".state/project-sources").glob("*.json"))
 
 
@@ -692,7 +934,7 @@ def test_a_project_turn_that_writes_no_candidate_gets_one_more_turn(world):
             return {"outcome": "natural", "result": "cannot write there", "usage": {"input_tokens": 100}}
         return writes(workdir, prompt, config, stage)
 
-    write_page(world.root, "projects/tide.md", config={"runner": "codex", "model": "default"}, run=run)
+    write_page(world.root, "projects/tide.md", config={**default_config(), "model": "default"}, run=run)
     assert len(calls) == 2 and "writable" in calls[1]
     assert "A swell warning tool for surfers. [1]" in world.notebook.read("projects/tide.md")
 
@@ -705,8 +947,12 @@ def test_full_file_retention_does_not_expand_packet_bound_or_ignore_private_tail
          'text': 'a' * 12000 + '\nA private plan [personal]'},
     ])
     with maintenance_lock(tmp_path):
-        assert project_pages.retain_repository_context(tmp_path, items, {i['source'] for i in items}) == 0
-    assert not list((tmp_path / '.state/project-sources').glob('*.json'))
+        assert project_pages.retain_repository_context(tmp_path, items, {i['source'] for i in items}) == 1
+    # The labelled file is kept locally, and shown only to the owner's own reader.
+    private = items[1]['source']
+    assert project_pages.repository_context(tmp_path, private) is None
+    assert 'A private plan' in project_pages.repository_context(tmp_path, private, private=True)['excerpt']
+    assert project_pages.repository_context(tmp_path, items[0]['source']) is None    # over the packet bound
 
 
 def test_a_written_page_with_one_untraceable_citation_keeps_the_rest(world):
@@ -718,7 +964,7 @@ def test_a_written_page_with_one_untraceable_citation_keeps_the_rest(world):
     page = _page_citing(source).replace("A swell warning tool for surfers. [1]",
                                         "A swell warning tool for surfers. [1]\n\nIt pages the lifeguards. [2]")
     page = page.replace(f"- [1] {source} — 2026-09-28", f"- [1] {source} — 2026-09-28\n- [2] codex:made-up:9 — 2026-09-28")
-    write_page(world.root, "projects/tide.md", config={"runner": "codex", "model": "default"},
+    write_page(world.root, "projects/tide.md", config={**default_config(), "model": "default"},
                run=_fake_runner(lambda prompt: page))
     saved = world.notebook.read("projects/tide.md")
     assert "A swell warning tool for surfers. [1]" in saved
@@ -734,7 +980,7 @@ def test_a_written_page_citing_a_number_it_never_listed_keeps_the_rest(world):
     source = stored(world.root, "projects/tide.md")[0]["source"]
     page = _page_citing(source).replace("A swell warning tool for surfers. [1]",
                                         "A swell warning tool for surfers. [1][2]")
-    write_page(world.root, "projects/tide.md", config={"runner": "codex", "model": "default"},
+    write_page(world.root, "projects/tide.md", config={**default_config(), "model": "default"},
                run=_fake_runner(lambda prompt: page))
     saved = world.notebook.read("projects/tide.md")
     assert "A swell warning tool for surfers. [1]" in saved and "[2]" not in saved
@@ -749,8 +995,41 @@ def test_a_written_finding_resting_on_one_untraceable_citation_does_not_cost_the
     source = stored(world.root, "projects/tide.md")[0]["source"]
     page = _page_citing(source).replace("## Open threads\n- Unknown", "## Open threads\n- Lifeguards want an SMS alert. [2]")
     page = page.replace(f"- [1] {source} — 2026-09-28", f"- [1] {source} — 2026-09-28\n- [2] codex:made-up:9 — 2026-09-28")
-    write_page(world.root, "projects/tide.md", config={"runner": "codex", "model": "default"},
+    write_page(world.root, "projects/tide.md", config={**default_config(), "model": "default"},
                run=_fake_runner(lambda prompt: page))
     saved = world.notebook.read("projects/tide.md")
     assert "A swell warning tool for surfers. [1]" in saved
     assert "Lifeguards" not in saved and re.search(r"## Open threads\n+- Unknown", saved)
+
+
+def test_a_page_written_today_waits_for_tomorrow_unless_much_is_new(world):
+    """projects/connectonion was rewritten at 06:05, 07:10 and 08:05 on 2026-10-13,
+    for 1-3 messages each time, a full turn each."""
+    from connectonion.rem.project_pages import UPDATE_MESSAGES
+    codex(world.codex / "2026/09/20/rollout-a.jsonl", "/work/tide", [("user", "first", 0.5)])
+    extract(world.root, world.subs)
+    mark_written(world.root, "projects/tide.md", ago(0.5), now=NOW - timedelta(hours=2))
+    codex(world.codex / "2026/09/20/rollout-a.jsonl", "/work/tide", [("user", "one more", 0)])
+    extract(world.root, world.subs)
+    since = ago(1)
+    assert "projects/tide.md" not in [r["record"] for r in queue(world.root, since=since, now=NOW)]
+    assert "projects/tide.md" in [r["record"] for r in queue(world.root, since=since,
+                                                             now=NOW + timedelta(hours=19))]
+    codex(world.codex / "2026/09/20/rollout-a.jsonl", "/work/tide",
+          [("user", f"more {n}", 0) for n in range(UPDATE_MESSAGES)])
+    extract(world.root, world.subs)
+    assert "projects/tide.md" in [r["record"] for r in queue(world.root, since=since, now=NOW)]
+
+
+def test_a_cited_file_that_is_not_utf8_is_read_not_a_crash(tmp_path, monkeypatch):
+    """short-term-rental-agent (2026-10-15): a Windows-1252 file in the repository
+    ("\x93", a curly quote) raised UnicodeDecodeError and lost the page twice."""
+    import hashlib
+    from connectonion.rem.project_pages import live_file_snapshot
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    note = repo / "pitch.txt"
+    note.write_bytes(b"Fee: \x938% of net\x94 revenue\n")
+    monkeypatch.setattr("connectonion.rem.investigate.project_paths", lambda page: [str(repo)])
+    snapshot = live_file_snapshot("", f"file:{note}@{hashlib.sha256(note.read_bytes()).hexdigest()}")
+    assert "8% of net" in snapshot["text"]

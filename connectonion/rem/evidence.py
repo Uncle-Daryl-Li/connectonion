@@ -3,7 +3,7 @@ Purpose: Lay out one investigation's gathered material as files an agent searche
 LLM-Note:
   Dependencies: imports from [hashlib, json, pathlib, .chat.CHAT_KINDS] | imported by [rem/investigate.py] | tested by [tests/unit/test_rem_evidence.py]
   Data flow: write_evidence(directory, items) → one file per mailbox-month (split past 40k chars), per attachment, per session or chat → index.md, one line per file → {"index", "files", "sources", "chars"}
-  State/Effects: writes under the given directory only (0700); the caller deletes it after the run
+  State/Effects: writes under the given directory only (0700); the caller owns retention
 
 Why files (#1850, owner 2026-09-24/30). The script has already gathered and
 sorted the material; summarising all of it before writing a word cost the
@@ -59,7 +59,8 @@ def _file_name(group: str, first: str) -> str:
 
 def _entry(item: dict) -> str:
     who = item.get("speaker") or item.get("role") or ""
-    head = f"### {item.get('source', '')} · {item.get('timestamp', '')} · {who}"
+    local = f" · local {item['local_time']}" if item.get("local_time") else ""
+    head = f"### {item.get('source', '')} · {item.get('timestamp', '')}{local} · {who}"
     detail = [f"{label}: {item[key]}" for key, label in (("subject", "Subject"), ("correspondent", "With"),
                                                        ("thread", "Provider thread"),
                                                        ("project", "Project"), ("reference", "Reference"),
@@ -107,7 +108,8 @@ def write_evidence(directory: Path, items: list[dict]) -> dict:
         path.write_text(text, encoding="utf-8")
         total += len(text)
         sources += [str(item.get("source", "")) for item in entries if item.get("source")]
-        first, last = str(entries[0].get("timestamp", ""))[:10], str(entries[-1].get("timestamp", ""))[:10]
+        first, last = [(item.get("local_time") or str(item.get("timestamp", "")))[:10]
+                       for item in (entries[0], entries[-1])]
         who = next((str(i.get("speaker")) for i in entries if i.get("speaker")), "")
         subject = next((str(i.get("subject") or i.get("project")) for i in entries
                         if i.get("subject") or i.get("project")), "")
@@ -118,6 +120,7 @@ def write_evidence(directory: Path, items: list[dict]) -> dict:
     index.write_text(
         f"# Evidence index\n\n{len(items)} items in {len(groups)} files, {total:,} characters. "
         "One line per file: dates · group · who · subject · entries · file · size. Inside a file, "
-        "each entry starts with `### <source id> · <time> · <speaker>`; cite that source id.\n\n"
+        "each entry starts with `### <source id> · <timestamp> · local <local_time> · <speaker>` "
+        "(local time when available); cite that source id.\n\n"
         + "\n".join(lines) + "\n", encoding="utf-8")
     return {"index": index, "files": len(groups), "sources": sources, "chars": total}
