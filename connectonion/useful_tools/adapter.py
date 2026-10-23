@@ -4,7 +4,7 @@ LLM-Note:
   Dependencies: imports from [datetime, json, dataclasses, pathlib, useful_tools/jira_adf.adf_to_text] | imported by [tests/unit/test_jira.py, cli/commands/jira_commands.py] | no network calls
   Data flow: raw tool output (Jira issues / OneNote pages) → *_to_records() → make_record() envelope → validate_record() → AdapterResult (valid records + per-item errors) → ongoing: write_daily_jsonl() / append_daily_jsonl() under daily/YYYY/MM/DD.jsonl | one-off: write_export() under exports/<id>/{records.jsonl,manifest.json}
   State/Effects: write_daily_jsonl() / append_daily_jsonl() / write_export() create directories and write files (append_daily_jsonl also returns how many records were new); all other functions are pure
-  Integration: RECORD_FIELDS is the #1833 envelope every source writes; record_id() is the shared identity rule; make_record() / media_ref() build records; validate_record() is the one contract check for every source; AdapterResult is the shared result type; consume_records() is the in-memory consumer; consume_jsonl_records() reads from disk across multiple source directories; jira_issues_to_records() and onenote_pages_to_records() are the converter functions
+  Integration: RECORD_FIELDS is the #1833 envelope every source writes; record_id() is the shared identity rule; make_record() / media_ref() build records; validate_record() is the one contract check for every source; AdapterResult is the shared result type; consume_records() is the in-memory consumer; consume_jsonl_records() reads from disk across multiple source directories; jira_issues_to_records(), onenote_pages_to_records(), and granola_notes_to_records() are the converter functions
   Errors: write_daily_jsonl() raises ValueError if the existing JSONL file contains a malformed line (refuses to append to a corrupted file) | write_export() raises ValueError for an unsafe export id, an existing export or any invalid/duplicate record, before writing anything | consume_jsonl_records() never raises — malformed lines are recorded in AdapterResult.errors keyed by "file:lineno" | converters never raise on bad input — an invalid, malformed or duplicate item is left out of records and reported in AdapterResult.errors keyed by "<source>:<item>"
   F13FCAKE-16 contract status:
     Envelope, identity, extensions, media references and validation implemented for both sources; documented in docs/acceptance/record-contract.md
@@ -645,3 +645,86 @@ def _onenote_record(page: dict, account: str, fetched: str) -> dict:
 
 def _parent_name(parent) -> str:
     return str(parent.get("displayName") or "") if isinstance(parent, dict) else ""
+
+
+# ---------------------------------------------------------------------------
+# Granola adapter (Phase-1 record mapping — no network calls).
+# ---------------------------------------------------------------------------
+
+
+def granola_notes_to_records(notes: list[dict], profile: str, *, fetched: str | None = None) -> AdapterResult:
+    """Convert raw Granola note dicts to shared-contract records.
+
+    Envelope: id = "granola:<profile>:<note_id>", external_id = note id,
+    kind = "meeting_note", title, url (web_url), at = created_at,
+    updated = updated_at.  Summary is stored in ``text`` and marked
+    ``generated_summary`` in ``extensions.summary_kind``.
+
+    Privacy guarantees (frozen in Phase 1):
+    - ``private_notes_text`` and ``private_notes_markdown`` are NEVER included.
+    - Attendee data (emails and full names) is NOT stored (personal data excluded from MVP).
+    - Transcript bytes are not fetched, stored, or referenced (MVP exclusion).
+    - Audio and attachment bytes are not downloaded or referenced.
+
+    MVP scope (frozen in Phase 1):
+    - Only notes from a personal folder (folder_id present) are accepted.
+    - Space-only notes (folder_id absent) are rejected to AdapterResult.errors.
+
+    ``profile`` is the non-secret user-chosen label (e.g. ``"work"``), not the
+    API key.  It becomes the ``account`` component of the record ID.
+    Raises GranolaConfigError immediately if ``profile`` is invalid.
+
+    An item that is not a dict, is space-only, or fails validate_record() is
+    reported in AdapterResult.errors, never raised.
+    """
+    from connectonion.useful_tools.granola import validate_profile  # local import avoids top-level coupling
+    validate_profile(profile)
+    stamp = fetched or _now_utc()
+    return _collect(
+        notes, "granola",
+        _granola_shape_problems,
+        lambda note: _granola_record(note, profile, stamp),
+    )
+
+
+def _granola_shape_problems(note) -> list[str]:
+    if not isinstance(note, dict):
+        return ["item is not an object"]
+    if not note.get("folder_id"):
+        return ["space-only notes are not supported in MVP; folder_id is required"]
+    return []
+
+
+def _granola_record(note: dict, profile: str, fetched: str) -> dict:
+    """Map one raw Granola note dict to a shared record envelope.
+
+    Privacy: private_notes_* fields and all people/attendee data (including
+    full_name) are deliberately absent from the output — personal data is
+    excluded from the MVP client-approved field set.
+    """
+    summary = note.get("summary") or {}
+    # Prefer plain_text; fall back to markdown if plain_text is absent/empty.
+    text = str(summary.get("plain_text") or summary.get("markdown") or "")
+
+    calendar = note.get("calendar_event") or {}
+
+    raw_extensions = {
+        "folder_id":       str(note.get("folder_id") or ""),
+        "scheduled_start": str(calendar.get("scheduled_start") or ""),
+        "scheduled_end":   str(calendar.get("scheduled_end") or ""),
+        "summary_kind":    "generated_summary",
+    }
+    # Drop empty strings, but always keep summary_kind.
+    extensions = {k: v for k, v in raw_extensions.items() if v != ""}
+    extensions["summary_kind"] = "generated_summary"
+
+    return make_record(
+        "granola", profile, str(note.get("id") or ""), "meeting_note",
+        title=str(note.get("title") or ""),
+        text=text,
+        url=str(note.get("web_url") or ""),
+        at=str(note.get("created_at") or ""),
+        updated=str(note.get("updated_at") or ""),
+        extensions=extensions,
+        fetched=fetched,
+    )
