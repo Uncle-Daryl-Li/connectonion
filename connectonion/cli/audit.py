@@ -49,9 +49,10 @@ from pydantic import BaseModel, Field
 # A row naming a subcommand: `│ name   summary` (Rich), `  name   summary`
 # (click, uv, kubectl) or `  name:   summary` (gh).
 ROW = re.compile(r"^(?:│ |\s{2,})([a-z][a-z0-9_-]*):?\s{2,}\S", re.M)
-# A Rich panel's title: `╭─ Send ──…`. `co outlook` files commands under
+# A Rich panel's title: `╭─ Send ──…` (rounded corners, Unix/macOS) or
+# `┌─ Send ──…` (straight corners, Windows). `co outlook` files commands under
 # "Send" and "Scheduled sends"; only Options and Arguments hold other rows.
-PANEL = re.compile(r"╭─ ([^─]+?) ─")
+PANEL = re.compile(r"[╭┌]─ ([^─]+?) ─")
 # A plain-text section heading: `Commands:`, `CORE COMMANDS`, `Read`. A line
 # with an aligned column after it (`Keys:     model   …`) is a table row, not
 # a heading, so its rows are not commands.

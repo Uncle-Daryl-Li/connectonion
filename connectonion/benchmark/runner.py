@@ -73,8 +73,12 @@ def load_agent(path: str):
     file = Path(path)
     if not file.exists():
         raise RunnerError(f"--agent {path} does not exist. Next: co eval run <name> --agent agent.py", code=2)
+    # get_agent_from_file() receives the Agent directory as its cwd.  Passing
+    # the original relative path made a nested path resolve twice there, e.g.
+    # ``examples/x/examples/x/agent.py``.  Resolve once at the runner boundary.
+    file = file.resolve()
     try:
-        return get_agent_from_file(str(file), str(file.resolve().parent))
+        return get_agent_from_file(str(file), str(file.parent))
     except Exception as error:  # an import error in someone's agent.py is theirs to read, in one line
         raise RunnerError(f"could not load an Agent from {path}: {type(error).__name__}: {error}") from error
 

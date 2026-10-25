@@ -1,9 +1,9 @@
 """
 Purpose: Read-only, explicitly scoped Granola meeting-notes source for co rem.
 LLM-Note:
-  Dependencies: imports from [os, re, time, math, httpx] | imported by [cli/commands/granola_source_commands.py] | tested by [tests/unit/test_granola.py, tests/unit/test_granola_adapter.py]
-  Data flow: GranolaClient methods → Bearer-token httpx.Client GET requests to BASE_URL → raw Granola API v1 JSON → returned as plain dicts/lists to the CLI/import layer
-  State/Effects: GRANOLA_API_KEY is read ONLY from os.environ (user-managed personal key; never persisted, never logged) | no writes to Granola (read-only)
+  Dependencies: imports from [os, re, time, httpx, importlib.metadata, datetime, yaml, pathlib] | imported by [cli/commands/granola_commands.py] | tested by [tests/unit/test_granola.py, tests/unit/test_granola_adapter.py]
+  Data flow: GranolaClient methods → Bearer-token httpx.Client GET requests to BASE_URL → raw Granola API v1 JSON → returned as plain dicts/lists to the CLI/import layer; write_source_yaml() creates source.yaml under source_dir
+  State/Effects: GRANOLA_API_KEY is read ONLY from os.environ (user-managed personal key; never persisted, never logged) | no writes to Granola (read-only) | write_source_yaml() creates source.yaml under source_dir
   Errors: GranolaConfigError (missing/invalid key or profile) | GranolaAuthError (HTTP 401) | GranolaPermissionError (HTTP 403) | GranolaIncompleteRead (5xx retries exhausted, carries partial raw pages)
 
 Granola public-API client: verify key, list folders, list notes, get note.
@@ -426,3 +426,79 @@ class GranolaClient:
             ValueError:             on HTTP 404 (deleted, inaccessible, or still processing).
         """
         return self._request(f"/notes/{note_id}")
+
+    def hydrate_notes(self, notes: list[dict]) -> list[dict]:
+        """Fetch raw detail objects for lightweight list-note results."""
+        details: list[dict] = []
+        for note in notes:
+            note_id = str(note.get("id") or "") if isinstance(note, dict) else ""
+            if not note_id:
+                raise GranolaConfigError("Granola list response included a note without an id.")
+            try:
+                details.append(self.get_note(note_id))
+            except GranolaIncompleteRead as exc:
+                raise GranolaIncompleteRead(
+                    reason=f"Could not fetch detail for note {note_id}: {exc.reason}",
+                    partial_pages=[details],
+                ) from exc
+        return details
+
+    def write_source_yaml(
+        self,
+        source_dir,
+        folder_id: str,
+        profile: str,
+        *,
+        limit: int | None = None,
+        complete: bool = True,
+        note_id: str | None = None,
+    ) -> None:
+        """Write source_dir/source.yaml with scope, account, retention, and validated_with.
+
+        Args:
+            source_dir:  Directory under ~/.co/rem/docs/granola (or --output).
+            folder_id:   The personal folder ID selected for import.
+            profile:     Non-secret user label used as the record account component.
+            limit:       Effective note limit used; None means MAX_SELECTED was used.
+                         For precise imports (note_id given), this is always 1.
+            complete:    False when the read was interrupted (GranolaIncompleteRead);
+                         recorded in the file so downstream tools know the data is partial.
+            note_id:     When set, records this note ID in the scope for traceability.
+                         Precise imports always set limit=1 alongside note_id.
+
+        Token and API key never appear in the written file.
+        Raises ValueError if profile is invalid (via validate_profile).
+        """
+        import importlib.metadata
+        import datetime
+        import yaml
+
+        validate_profile(profile)
+
+        from pathlib import Path as _Path
+        source_dir = _Path(source_dir)
+        source_dir.mkdir(parents=True, exist_ok=True)
+        version = importlib.metadata.version("connectonion")
+        scope: dict = {
+            "folder_id": folder_id,
+            "limit": limit if limit is not None else MAX_SELECTED,
+        }
+        if note_id is not None:
+            scope["note_id"] = note_id
+        doc = {
+            "driver": "granola",
+            "account": profile,
+            "scope": scope,
+            "retention": "90d",
+            "media_policy": "metadata_only",
+            "complete": complete,
+            "validated_with": {
+                "connectonion_version": version,
+                "command": "co rem sources",
+                "path": str(source_dir / "source.yaml"),
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            },
+        }
+        target = source_dir / "source.yaml"
+        with open(target, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(doc, fh, allow_unicode=True, sort_keys=False)

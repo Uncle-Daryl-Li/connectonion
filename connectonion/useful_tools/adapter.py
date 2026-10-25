@@ -652,7 +652,7 @@ def _parent_name(parent) -> str:
 # ---------------------------------------------------------------------------
 
 
-def granola_notes_to_records(notes: list[dict], profile: str, *, fetched: str | None = None) -> AdapterResult:
+def granola_notes_to_records(notes: list[dict], profile: str, *, fetched: str | None = None, selected_folder_id: str | None = None) -> AdapterResult:
     """Convert raw Granola note dicts to shared-contract records.
 
     Envelope: id = "granola:<profile>:<note_id>", external_id = note id,
@@ -682,20 +682,41 @@ def granola_notes_to_records(notes: list[dict], profile: str, *, fetched: str | 
     stamp = fetched or _now_utc()
     return _collect(
         notes, "granola",
-        _granola_shape_problems,
-        lambda note: _granola_record(note, profile, stamp),
+        lambda note: _granola_shape_problems(note, selected_folder_id),
+        lambda note: _granola_record(note, profile, stamp, selected_folder_id),
     )
 
 
-def _granola_shape_problems(note) -> list[str]:
+def _granola_personal_folder(note: dict, selected_folder_id: str | None) -> dict | None:
+    memberships = note.get("folder_membership")
+    if isinstance(memberships, list):
+        for membership in memberships:
+            if isinstance(membership, dict) and membership.get("id") and membership.get("space_id") is None:
+                if selected_folder_id is None or membership.get("id") == selected_folder_id:
+                    return membership
+        return None
+    folder_id = note.get("folder_id")
+    # Legacy fallback: require space_id is None to match the personal-folder guarantee
+    # enforced by the folder_membership path above.  A note with the correct folder_id
+    # but a non-null space_id is a shared-space note and must not be admitted.
+    if folder_id and note.get("space_id") is None and (selected_folder_id is None or folder_id == selected_folder_id):
+        return {"id": folder_id, "name": note.get("folder_name")}
+    return None
+
+
+def _granola_shape_problems(note, selected_folder_id: str | None = None) -> list[str]:
     if not isinstance(note, dict):
         return ["item is not an object"]
-    if not note.get("folder_id"):
-        return ["space-only notes are not supported in MVP; folder_id is required"]
+    # Defensive check: if the note was deleted between list and detail fetch (race condition),
+    # reject it rather than writing a record for a deleted note.
+    if note.get("deleted_at"):
+        return ["note has been deleted (deleted_at is set)"]
+    if _granola_personal_folder(note, selected_folder_id) is None:
+        return ["space-only note is not in the selected personal folder"]
     return []
 
 
-def _granola_record(note: dict, profile: str, fetched: str) -> dict:
+def _granola_record(note: dict, profile: str, fetched: str, selected_folder_id: str | None = None) -> dict:
     """Map one raw Granola note dict to a shared record envelope.
 
     Privacy: private_notes_* fields and all people/attendee data (including
@@ -703,13 +724,14 @@ def _granola_record(note: dict, profile: str, fetched: str) -> dict:
     excluded from the MVP client-approved field set.
     """
     summary = note.get("summary") or {}
-    # Prefer plain_text; fall back to markdown if plain_text is absent/empty.
-    text = str(summary.get("plain_text") or summary.get("markdown") or "")
+    text = str(note.get("summary_text") or note.get("summary_markdown") or summary.get("plain_text") or summary.get("markdown") or "")
 
     calendar = note.get("calendar_event") or {}
 
+    folder = _granola_personal_folder(note, selected_folder_id) or {}
     raw_extensions = {
-        "folder_id":       str(note.get("folder_id") or ""),
+        "folder_id":       str(folder.get("id") or ""),
+        "folder_name":     str(folder.get("name") or ""),
         "scheduled_start": str(calendar.get("scheduled_start") or ""),
         "scheduled_end":   str(calendar.get("scheduled_end") or ""),
         "summary_kind":    "generated_summary",

@@ -79,12 +79,20 @@ def test_subcommands_are_read_from_every_common_layout():
     argparse_page = "usage: tool [-h] {build,serve} ...\n\npositional arguments:\n  {build,serve}\n"
     rem_page = "co rem — a notebook.\n\nRead\n  list          List pages.\n  show          Print one page.\n"
     table_page = "Show or change settings. Changing validates and never\nstarts a run.\n\nKeys:     model        gpt\n          runner       codex\n"
+    # Rich on Windows renders straight-corner boxes (┌─ … ─┐) instead of
+    # rounded ones (╭─ … ─╮).  The walker must discover subcommands either way.
+    windows_page = ("Usage: co mail [OPTIONS] COMMAND\n\n"
+                    "┌─ Commands ─────────────┐\n"
+                    "│ send   Send one message.  │\n"
+                    "└───────────────────────┘\n"
+                    " Example:  co mail send you@example.com\n")
     assert audit.listed_commands(typer_page) == ["send"]
     assert audit.listed_commands(uv_page) == ["run", "init"]
     assert audit.listed_commands(gh_page) == ["auth", "pr"]
     assert audit.listed_commands(argparse_page) == ["build", "serve"]
     assert audit.listed_commands(rem_page) == ["list", "show"]
     assert audit.listed_commands(table_page) == []
+    assert audit.listed_commands(windows_page) == ["send"]
 
 
 def test_a_word_whose_page_is_its_parents_page_is_not_a_command():

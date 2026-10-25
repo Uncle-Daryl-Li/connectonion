@@ -225,6 +225,24 @@ def test_a_template_agent_py_that_ends_in_host_is_imported_without_serving(proje
     assert connectonion.host.__name__ == "host", "the real host() is back after the import"
 
 
+def test_a_nested_relative_agent_path_is_resolved_before_loading(project, monkeypatch):
+    """The loader's cwd is the Agent directory, not the benchmark root."""
+    agent_file = project / "examples" / "skill-evals" / "agent.py"
+    agent_file.parent.mkdir(parents=True)
+    agent_file.write_text("# The mocked loader only needs a file to exist.\n")
+    seen = []
+
+    def fake_load(path, cwd):
+        seen.append((path, cwd))
+        return object()
+
+    monkeypatch.setattr("connectonion.cli.commands.eval_commands.get_agent_from_file", fake_load)
+
+    runner.load_agent("examples/skill-evals/agent.py")
+
+    assert seen == [(str(agent_file.resolve()), str(agent_file.parent.resolve()))]
+
+
 def test_live_is_off_during_a_run_unless_asked_and_restored_after(project, monkeypatch):
     seen = []
 

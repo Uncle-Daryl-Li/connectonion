@@ -64,6 +64,35 @@ def _assert_record_contract(record: dict, profile: str) -> None:
     assert record["extensions"].get("summary_kind") == "generated_summary"
 
 
+def test_current_api_detail_shape_maps_selected_personal_folder_without_private_data():
+    """Live API discovery: detail uses folder_membership and summary_text."""
+    note = {
+        "id": "not-current-shape",
+        "title": "Synthetic title",
+        "created_at": "2026-10-24T00:00:00Z",
+        "updated_at": "2026-10-24T01:00:00Z",
+        "web_url": "https://granola.ai/notes/not-current-shape",
+        "folder_membership": [{"id": FOLDER_ID, "name": "Personal", "space_id": None}],
+        "space_membership": [],
+        "summary_text": "Allowed generated summary",
+        "summary_markdown": "# Allowed generated summary",
+        "owner": {"name": "Private Owner", "email": "owner@example.test"},
+        "attendees": [{"name": "Private Attendee", "email": "attendee@example.test"}],
+        "private_notes_text": "private",
+        "private_notes_markdown": "private",
+        "transcript": "private transcript",
+        "attachments": [{"id": "attachment"}],
+    }
+    result = granola_notes_to_records([note], PROFILE, selected_folder_id=FOLDER_ID)
+    assert len(result.records) == 1
+    record = result.records[0]
+    assert record["text"] == "Allowed generated summary"
+    assert record["extensions"]["folder_id"] == FOLDER_ID
+    assert record["extensions"]["folder_name"] == "Personal"
+    for forbidden in ("Private Owner", "owner@example.test", "Private Attendee", "attendee@example.test", "private transcript", "attachment"):
+        assert forbidden not in str(record)
+
+
 # ---------------------------------------------------------------------------
 # Privacy — the single most important invariant
 # ---------------------------------------------------------------------------
@@ -413,6 +442,57 @@ class TestExceptionClasses:
     def test_incomplete_read_empty_partial_pages(self):
         err = GranolaIncompleteRead("first request failed", [])
         assert err.partial_pages == []
+
+
+# ---------------------------------------------------------------------------
+# P2 regression: legacy folder fallback must gate on space_id is None
+# ---------------------------------------------------------------------------
+
+
+class TestGranolaPersonalFolderLegacyFallback:
+    """_granola_personal_folder legacy path (no folder_membership key) must also
+    require space_id is None.  Previously only folder_id was checked, allowing a
+    shared-space note with the correct folder_id to pass the personal-folder guard."""
+
+    def test_legacy_note_with_matching_folder_id_and_null_space_id_is_accepted(self):
+        """Note has no folder_membership; folder_id matches; space_id is null → accepted."""
+        from connectonion.useful_tools.adapter import _granola_personal_folder
+        note = {
+            "id": "not-legacy-personal",
+            "folder_id": FOLDER_ID,
+            "space_id": None,
+        }
+        result = _granola_personal_folder(note, selected_folder_id=FOLDER_ID)
+        assert result is not None
+        assert result["id"] == FOLDER_ID
+
+    def test_legacy_note_with_matching_folder_id_but_non_null_space_id_is_rejected(self):
+        """P2 fix: note has no folder_membership; folder_id matches; but space_id is set.
+        Before the fix this note would have been admitted (second-layer bypass).
+        After the fix, space_id != None must cause rejection."""
+        from connectonion.useful_tools.adapter import _granola_personal_folder
+        from granola_fixtures import SPACE_ID
+        note = {
+            "id": "not-legacy-space",
+            "folder_id": FOLDER_ID,
+            "space_id": SPACE_ID,   # shared-space note — must be rejected
+        }
+        result = _granola_personal_folder(note, selected_folder_id=FOLDER_ID)
+        assert result is None
+
+    def test_legacy_note_non_null_space_id_produces_shape_problem(self):
+        """_granola_shape_problems rejects a legacy-shape shared-space note."""
+        from connectonion.useful_tools.adapter import _granola_shape_problems
+        from granola_fixtures import SPACE_ID
+        note = {
+            "id": "not-legacy-space-shape",
+            "folder_id": FOLDER_ID,
+            "space_id": SPACE_ID,
+            "deleted_at": None,
+        }
+        problems = _granola_shape_problems(note, selected_folder_id=FOLDER_ID)
+        assert len(problems) == 1
+        assert "personal" in problems[0].lower() or "space" in problems[0].lower()
 
 
 # ---------------------------------------------------------------------------

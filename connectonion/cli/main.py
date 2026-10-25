@@ -2833,6 +2833,128 @@ def outlook_search(
     handle_outlook_search(query, last=last)
 
 
+# Granola (F13FCAKE-3rd-source): verify key, list folders, import meeting notes.
+granola_app = _typer_app(
+    cls=ImportFeedbackGroup,
+    help="Import personal Granola meeting notes into co rem. GRANOLA_API_KEY must be supplied only as a temporary, non-persistent shell environment variable; unset it after the command.",
+    epilog="Example:  co granola verify",
+    no_args_is_help=True,
+)
+app.add_typer(granola_app, name="granola")
+
+
+@granola_app.command("verify", cls=ImportFeedbackCommand, epilog="Example:  co granola verify --json")
+def _granola_verify(
+    as_json: bool = typer.Option(False, "--json", help="Output verification result as JSON"),
+):
+    """Verify the Granola API key with a minimal read. Read-only."""
+    from .commands.granola_commands import handle_granola_verify
+    handle_granola_verify(as_json=as_json)
+
+
+@granola_app.command("folders", cls=ImportFeedbackCommand, epilog="Example:  co granola folders --json")
+def _granola_folders(
+    as_json: bool = typer.Option(False, "--json", help="Output folder list as JSON"),
+):
+    """List all personal Granola folders accessible with this API key. Read-only."""
+    from .commands.granola_commands import handle_granola_folders
+    handle_granola_folders(as_json=as_json)
+
+
+@granola_app.command(
+    "notes",
+    cls=ImportFeedbackCommand,
+    epilog=(
+        "Example:  co granola notes fld-abc  |  "
+        "co granola notes fld-abc --limit 50  |  "
+        "co granola notes fld-abc --json"
+    ),
+)
+def _granola_notes(
+    folder_id: str = typer.Argument(..., help="Personal folder ID from co granola folders"),
+    limit: int = typer.Option(
+        100,
+        "--limit",
+        min=1,
+        max=1000,
+        help="Maximum notes to list (default: 100, range: 1-1000)",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Output note list as JSON"),
+):
+    """List safe note metadata (id, title, created_at, updated_at) from a personal folder. Read-only.
+
+    Validates the folder is a personal folder, then lists lightweight note stubs.
+    Deleted notes are excluded. Use --note-id with co granola import to import one note.
+    """
+    from .commands.granola_commands import handle_granola_notes
+    handle_granola_notes(folder_id, limit=limit, as_json=as_json)
+
+
+@granola_app.command(
+    "import",
+    cls=ImportFeedbackCommand,
+    epilog=(
+        "Example:  co granola import fld-abc  |  "
+        "co granola import fld-abc --profile work --limit 50  |  "
+        "co granola import fld-abc --export meeting-notes-2026-10-24  |  "
+        "co granola import fld-abc --note-id not_abc123"
+    ),
+)
+def _granola_import(
+    folder_id: str = typer.Argument(..., help="Personal folder ID from co granola folders"),
+    profile: str = typer.Option(
+        "default",
+        "--profile",
+        help="Non-secret user label for the record account (e.g. 'work', 'home-2024')",
+    ),
+    limit: Optional[int] = typer.Option(
+        None,
+        "--limit",
+        min=1,
+        max=1000,
+        show_default=False,
+        help="Maximum notes to import (default: 1000)",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        help="Directory to write source.yaml and records (default: ~/.co/rem/docs/granola)",
+        show_default=False,
+    ),
+    export: Optional[str] = typer.Option(
+        None,
+        "--export",
+        help="One-off import: write exports/<ID>/ (records.jsonl + manifest.json) instead of today's daily file",
+        show_default=False,
+    ),
+    note_id: Optional[str] = typer.Option(
+        None,
+        "--note-id",
+        help="Import exactly one note by ID (from co granola notes). Mutually exclusive with --limit.",
+        show_default=False,
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Output result as JSON"),
+):
+    """Verify credentials, collect folder notes, and import them as co rem records. Writes source.yaml and daily records.
+
+    Full workflow: list_folders -> validate personal folder (space_id=None) -> list_notes ->
+    granola_notes_to_records -> write_source_yaml -> daily/ (ongoing)
+    or exports/<ID>/ with --export (one-off import).
+    With --note-id: scoped lookup, single-note import; --limit is forbidden.
+    On incomplete reads, valid records are retained and complete:false is reported; exits 1.
+    """
+    from .commands.granola_commands import handle_granola_import
+    handle_granola_import(
+        folder_id,
+        profile=profile,
+        limit=limit,
+        output_dir=output,
+        as_json=as_json,
+        export_id=export,
+        note_id=note_id,
+    )
+
+
 # Subscription command group. `co sub` (no args) syncs every subscription.
 # `co sub sync <addr>` syncs one. `list` and `remove` are the secondary verbs.
 sub_app = _typer_app(

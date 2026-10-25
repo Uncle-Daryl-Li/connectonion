@@ -24,30 +24,34 @@ _API_KEY = "grn_unit-test-key-do-not-use"  # never a real key; leading underscor
 # Single-page folder response (default fixture route).
 FOLDERS_PAGE = {
     "folders": [
-        {"id": "fld-fixture", "title": "Team Meetings", "space_id": None},
-        {"id": "fld-other",   "title": "Personal",      "space_id": None},
+        {"id": "fld-fixture", "name": "Team Meetings", "space_id": None},
+        {"id": "fld-other",   "name": "Personal",      "space_id": None},
     ],
     "hasMore": False,
     "cursor":  None,
 }
 
+# A folder that belongs to a shared space (space_id is not None).
+# Used to verify that handle_granola_folders() filters it out.
+FOLDER_IN_SPACE = {"id": "fld-in-space", "name": "Shared Team Space Folder", "space_id": "spc-fixture"}
+
 # Two-page folder scenario — page 1.
 FOLDERS_PAGE_1 = {
-    "folders": [{"id": "fld-fixture", "title": "Team Meetings", "space_id": None}],
+    "folders": [{"id": "fld-fixture", "name": "Team Meetings", "space_id": None}],
     "hasMore": True,
     "cursor":  "cursor_f2",
 }
 
 # Two-page folder scenario — page 2.
 FOLDERS_PAGE_2 = {
-    "folders": [{"id": "fld-other", "title": "Personal", "space_id": None}],
+    "folders": [{"id": "fld-other", "name": "Personal", "space_id": None}],
     "hasMore": False,
     "cursor":  None,
 }
 
 # Repeated folder cursor — signals a broken pagination loop.
 FOLDERS_REPEAT_CURSOR = {
-    "folders": [{"id": "fld-fixture", "title": "Team Meetings", "space_id": None}],
+    "folders": [{"id": "fld-fixture", "name": "Team Meetings", "space_id": None}],
     "hasMore": True,
     "cursor":  "cursor_same",
 }
@@ -205,6 +209,57 @@ ERR_500 = {"error": "InternalServerError", "message": "An unexpected error occur
 def granola_env(monkeypatch):
     """Inject a safe synthetic GRANOLA_API_KEY for every test that imports this fixture."""
     monkeypatch.setenv("GRANOLA_API_KEY", _API_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: note stubs (lightweight metadata, for co granola notes command)
+# ---------------------------------------------------------------------------
+
+# Active note stub — no deleted_at; safe to list in co granola notes.
+NOTE_STUB_1 = {
+    "id": "not_note1",
+    "title": "Weekly Sync",
+    "created_at": "2026-10-20T10:00:00Z",
+    "updated_at": "2026-10-20T11:30:00Z",
+    "deleted_at": None,
+}
+
+# Active note stub — second fixture for multi-stub tests.
+NOTE_STUB_2 = {
+    "id": "not_note2",
+    "title": "1:1 with Bob",
+    "created_at": "2026-10-21T14:00:00Z",
+    "updated_at": "2026-10-21T14:45:00Z",
+    "deleted_at": None,
+}
+
+# Deleted note stub — deleted_at is set; must be filtered out by co granola notes.
+NOTE_STUB_DELETED = {
+    "id": "not_deleted",
+    "title": "Deleted Meeting",
+    "created_at": "2026-10-18T09:00:00Z",
+    "updated_at": "2026-10-18T10:00:00Z",
+    "deleted_at": "2026-10-19T08:00:00Z",
+}
+
+# Full note with deleted_at set — simulates a race condition where a note is
+# deleted between list_notes() and the detail fetch in co granola import.
+# The adapter's _granola_shape_problems() must reject this note.
+NOTE_DELETED_FULL = {
+    "id": "not_race",
+    "title": "Race Condition Note",
+    "created_at": "2026-10-20T10:00:00Z",
+    "updated_at": "2026-10-20T11:30:00Z",
+    "deleted_at": "2026-10-21T00:00:00Z",
+    "web_url": "https://granola.ai/notes/not_race",
+    "folder_id": "fld-fixture",
+    "space_id": None,
+    "calendar_event": None,
+    "people": [],
+    "summary": {"plain_text": "Deleted note.", "markdown": "Deleted note."},
+    "private_notes_text": None,
+    "private_notes_markdown": None,
+}
 
 
 @pytest.fixture

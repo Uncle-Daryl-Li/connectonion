@@ -116,6 +116,12 @@ NEXT = {
     "co onenote source sections": "co onenote source pages --help",
     "co onenote source pages": "co onenote source sync --help",
     "co onenote source sync": "co onenote source pages --help",
+    # Granola handlers choose a next command from the actual result: a verified
+    # key leads to folders, a folder listing names the selected-folder import,
+    # and a completed import leads to co rem sources.
+    "co granola verify": HANDLER,
+    "co granola folders": HANDLER,
+    "co granola import": HANDLER,
     # -- top level --
     "co ai": HANDLER,                 # the answer is the output
     "co approvals": "co approvals --who <address> shows one requester",

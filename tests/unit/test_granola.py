@@ -710,6 +710,17 @@ class TestGetNote:
         assert _API_KEY not in str(note)
 
 
+class TestHydrateNotes:
+    def test_hydrates_list_stubs_to_detail_objects(self, granola_api):
+        stubs = [{"id": "not_note1"}, {"id": "not_note2"}]
+        notes = GranolaClient().hydrate_notes(stubs)
+        assert [note["id"] for note in notes] == ["not_note1", "not_note2"]
+
+    def test_missing_stub_id_is_configuration_error(self, granola_api):
+        with pytest.raises(GranolaConfigError, match="without an id"):
+            GranolaClient().hydrate_notes([{}])
+
+
 # ============================================================================
 # GranolaIncompleteRead — exception contract
 # ============================================================================
