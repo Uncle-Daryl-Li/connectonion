@@ -8,7 +8,7 @@ version = "1.9.3rc59"
 description = "Connect your AI agent to Gmail, a real browser and your files, one command each. The agent CLI harness."
 readme = "README.md"
 license = {text = "Apache-2.0"}
-requires-python = ">=3.11"
+requires-python = ">=3.11.5"
 authors = [
     { name = "ConnectOnion Team", email = "pypi@connectonion.com" }
 ]
@@ -94,7 +94,8 @@ dependencies = [
     "protobuf>=6.33.5",
     "pyasn1>=0.6.5",
     "Pygments>=2.20.0",
-    "soupsieve>=2.8.4",
+    # SoupSieve 4 fixes CVE-2026-126190 and requires Python 3.11.5 or newer.
+    "soupsieve>=4.0.0",
     "urllib3>=2.8.0",
 ]
 
