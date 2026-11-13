@@ -1,5 +1,9 @@
 # Why Granola uses semantic maintenance
 
+The runtime rules live in
+`connectonion/useful_skills/rem-source-granola/SKILL.md`. This file explains
+their rationale and is not loaded into a model turn.
+
 Unstructured notes do not provide Jira's explicit project/reporter/assignee
 identities. Mandatory project binding would move organization work to the user.
 Init inventories only approved snapshots; the existing whole-notebook Maintain
