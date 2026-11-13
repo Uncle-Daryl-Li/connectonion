@@ -876,7 +876,6 @@ def consent_summary(root: Path, *, mail=()) -> dict:
             state = (f"will read {len(chats)} chat(s), both sides, the agent's own replies left out"
                      if source.get("adapter") == "available" else source["adapter"])
         elif source.get("kind") == "granola":
-            selection = (source.get("remote") or {}).get("selection") or {}
             state = ("will read approved generated summaries only" if source.get("consented")
                      else "configured; awaiting source/model approval")
         else:
@@ -886,7 +885,7 @@ def consent_summary(root: Path, *, mail=()) -> dict:
         if source.get("kind") in CHAT_KINDS:
             sources[name]["chats"] = source.get("chats") or []
         if source.get("kind") == "granola":
-            sources[name]["selection"] = selection
+            sources[name]["selection"] = (source.get("remote") or {}).get("selection") or {}
     return {"root": str(root), "sources": sources, "runner": config["runner"], "model": config["model"],
             "model_receives": "the new session messages plus the notebook pages it reads, "
                               + MODEL_ROUTE[config["runner"]],
