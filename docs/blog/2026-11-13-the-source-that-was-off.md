@@ -73,3 +73,50 @@ lesson applies to any optional source: turning a connector off must leave it
 possible to describe its state. That description is part of the consent
 boundary, and the default-disabled path needs its own test before the feature
 is integrated.
+
+## The full CI asked a different question
+
+The focused tests used the dependency lock. The full workflow also installs
+the package with freshly resolved dependencies, as a new user would. That
+exposed a separate failure before the consent code was reached: even
+`co --version` constructs the registered command tree, including Synology's
+shared options. Those options called `TyperOption` directly with a constructor
+argument accepted by the locked Typer 0.20.0 but rejected by Typer 0.29.1.
+Help and browser checks on several platforms consequently failed together.
+
+Pinning an older Typer would conceal the incompatibility from a fresh install.
+Instead, the common options now use normal typed `typer.Option` declarations
+in a small schema command. The installed Typer turns those declarations into
+its own parameter objects. The profile string, boolean flags, and numeric
+timeout keep their meaning without depending on a version-specific constructor.
+The newer environment passed 144 focused parser/browser tests, the locked
+Typer passed 45 Synology tests, and the audit of every CLI help page passed.
+
+The lockfile job raised a different concern: its vulnerability audit rejected
+the existing SoupSieve 2.9.2 dependency. Updating its floor to 4.0.0 and locking
+4.1 cleared the strict audit without an exception or ignored advisory. That
+dependency requires Python 3.11.5, so the package's minimum Python declaration
+now says 3.11.5 as well. This is a compatibility cost for earlier 3.11 patch
+versions, not just a new hash in a lockfile. The lock retains its original
+serialization, with unrelated package versions left alone.
+
+Both failures were useful distinctions. A passing locked test run says what
+that environment did; it does not establish what a fresh installation will do.
+The repair needs both kinds of evidence, with each claim tied to the command
+and environment that actually ran.
+
+The broader run found a smaller documentation mismatch too: Granola's
+rationale file did not use the runtime skill's name or point back to its
+canonical `SKILL.md`. Giving the rationale that name and reference restored
+the existing documentation contract without changing model instructions.
+Two browser tests needed the English locale their assertions assumed, and
+offline missing-CLI tests needed an explicitly absent executable so a desktop
+installation could not unexpectedly supply one. The email range test still
+rejects an oversized request before any backend call, while accepting the
+new Typer's wording for the same upper bound.
+
+With those conditions explicit and the same synthetic credential setup used
+by CI, the final macOS offline run passed 19,494 tests with 350 skipped. The
+separate help audit, strict lockfile audit, and installed-wheel version/help
+checks passed as well. These results cover the local Python 3.12 environment;
+the remote Python and OS matrices remain separate evidence.
