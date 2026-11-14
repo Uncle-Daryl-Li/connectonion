@@ -387,7 +387,8 @@ def snapshot(root: Path, local: bool = False, *, today: bool = False) -> dict:
     organisation_obligations(records, data['today_queue'])
     from .service import notebook_today
     rollups(records, notebook_today(root))
-    return _today_data(data) if today else data
+    from .source_links import public_projection
+    return public_projection(_today_data(data) if today else data)
 
 
 def _today_text(text: str) -> str:
