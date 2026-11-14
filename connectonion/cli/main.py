@@ -2989,7 +2989,7 @@ app.add_typer(mcp_app, name="mcp")
 
 # OneNote (#1887): the notebooks `co auth microsoft` grants since 1.8.9.
 onenote_app = _typer_app(
-    help="Your OneNote pages. Bare co onenote shows recent pages; ls shows notebooks. source imports selected pages read-only. create writes a new page. Next: co onenote source --help",
+    help="Your OneNote pages. With no subcommand, show recent pages; ls lists notebooks. source imports selected pages read-only. create writes a new page. Next: co onenote source --help",
     epilog='Example:  co onenote ls && co onenote pages 2 && co onenote read 1',
     invoke_without_command=True,
 )

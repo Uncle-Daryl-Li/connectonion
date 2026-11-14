@@ -48,7 +48,7 @@ python -m pytest \
 uv build
 ```
 
-Result: **1,366 passed, 1 skipped**, 96.05 seconds. The skipped test aggregates
+Initial focused result: **1,366 passed, 1 skipped**, 96.05 seconds. The skipped test aggregates
 separate CI help-audit shards; this unsharded run audited the complete CLI tree
 itself. Development dependency sync and wheel/sdist build succeeded. Read-only
 `git diff --no-index --check` compared each changed file with the pinned archive
@@ -60,6 +60,27 @@ were test doubles. The repository's real-home/process leak guards remained
 enabled. Early forward-port/help/test-harness failures were corrected; the final
 relevant suite has no remaining failure. This is not a claim that every repository
 test, real provider, operating system or model was tested locally.
+
+## CI integration follow-up
+
+The first full GitHub run caught two introduced CLI integration omissions outside
+that initial focused command: five OneNote source leaves lacked next-step table
+entries, and a root-help sentence was parsed as a nonexistent command by the tip
+sweep. The correction registers each leaf as HANDLER (the existing handler already
+prints the contextual next step) and describes bare invocation without embedding
+command-shaped prose. No test or gate was disabled.
+
+```sh
+python -m pytest tests/unit/test_every_command_has_a_next_step.py tests/unit/test_cli_tips_name_real_commands.py tests/unit/test_onenote_source_commands.py tests/unit/test_onenote_remediation.py -q --tb=short
+python -m pytest tests/unit/test_cli_help_contract.py -q --tb=short
+```
+
+Follow-up results: **1,928 passed** in 40.21 seconds; complete help audit **3 passed,
+1 skipped** in 47.39 seconds. The skip is the CI-shard aggregation check described
+above. A separate AI reviewer rechecked these exact registry/help changes and
+reported no findings. These follow-up results supplement the original focused
+service/Reader/source verification; they are not a new run of every repository
+test. The subsequent GitHub head run supplies the cross-version full-suite result.
 
 ## Live Microsoft acceptance
 
